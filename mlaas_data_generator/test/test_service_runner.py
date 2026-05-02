@@ -321,6 +321,8 @@ def test_service_split_sample_seed_changes_subset_for_same_strategy():
             "hf_task": "sequence_classification",
         }
     )._resolve_service_split(x, y, meta)
+    assert first["distribution_map"]["train"] != second["distribution_map"]["train"]
+    assert not np.array_equal(first["x_train"], second["x_train"])
 
 
 def test_run_manifest_detects_cuda_worker_slots(monkeypatch):
@@ -340,9 +342,6 @@ def test_run_manifest_auto_gpu_affinity_only_for_auto_like_devices():
     assert run_manifest_cli._entry_supports_auto_gpu_affinity({"device": "cuda"}) is True
     assert run_manifest_cli._entry_supports_auto_gpu_affinity({"device": "cpu"}) is False
     assert run_manifest_cli._entry_supports_auto_gpu_affinity({"device": "cuda:1"}) is False
-
-    assert first["distribution_map"]["train"] != second["distribution_map"]["train"]
-    assert not np.array_equal(first["x_train"], second["x_train"])
 
 
 def test_service_split_derives_distinct_seed_when_manifest_has_no_sample_seed():

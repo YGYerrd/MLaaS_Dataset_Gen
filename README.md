@@ -304,6 +304,23 @@ For first runs on a new computer, reduce risk by keeping `max_samples` low, usin
 
 For GPU runs, leave `device` blank or set it to `auto` unless you need to force a device. PyTorch exposes ROCm devices through the `torch.cuda` API, so the runner will still resolve a supported AMD ROCm GPU as `cuda`.
 
+On multi-GPU Linux machines, this project uses GPUs most effectively by running multiple manifest rows in parallel, with one worker process pinned to one GPU. Because each manifest row is an independent service, this is more reliable than trying to split one row across multiple GPUs.
+
+For a 2-GPU NVIDIA Linux VM, use:
+
+```bash
+python -m mlaas_data_generator.cli.main run-manifest \
+  --file outputs/service_manifest.xlsx \
+  --sheet services \
+  --db outputs/services.db \
+  --workers 2 \
+  --no-grouped-hf
+```
+
+`--workers 2` starts two row-level worker processes. Each worker is pinned to a single visible GPU with `CUDA_VISIBLE_DEVICES`, so two eligible rows can run at the same time across GPU 0 and GPU 1.
+
+Use `--no-grouped-hf` when you want maximum dual-GPU utilization. The grouped HF mode intentionally reuses prepared models and datasets inside one process, which is good for cache reuse but limits row-level GPU parallelism.
+
 CSV manifests can include a row with `service_id=defaults`. XLSX manifests can include a `defaults` sheet.
 
 ## Validate A Manifest
@@ -333,6 +350,29 @@ python -m mlaas_data_generator.cli.main run-manifest \
   --file outputs/service_manifest.xlsx \
   --sheet services \
   --db outputs/services.db
+```
+
+For the 2-GPU Linux VM shown above, prefer:
+
+```bash
+python -m mlaas_data_generator.cli.main run-manifest \
+  --file outputs/service_manifest.xlsx \
+  --sheet services \
+  --db outputs/services.db \
+  --workers 2 \
+  --no-grouped-hf
+```
+
+To confirm both GPUs are active while the run is in progress:
+
+```bash
+watch -n 1 nvidia-smi
+```
+
+Or capture a compact view:
+
+```bash
+nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total --format=csv -l 1
 ```
 
 The run writes:
