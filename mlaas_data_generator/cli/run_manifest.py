@@ -4,6 +4,7 @@ import argparse
 import concurrent.futures
 import importlib
 import json
+import multiprocessing
 import os
 import traceback
 import uuid
@@ -788,9 +789,11 @@ def _execute_entry_worker(payload: dict[str, Any]) -> dict[str, Any]:
 
 def _execute_entries_with_gpu_affinity(entries: list[ManifestEntry], gpu_slots: list[int]) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
+    mp_context = multiprocessing.get_context("spawn")
     executors = [
         concurrent.futures.ProcessPoolExecutor(
             max_workers=1,
+            mp_context=mp_context,
             initializer=_worker_initializer,
             initargs=(gpu_id,),
         )
@@ -910,9 +913,11 @@ def _execute_hf_group_worker(payload: list[dict[str, Any]]) -> list[dict[str, An
 
 def _execute_hf_groups_with_gpu_affinity(model_groups: list[list[ManifestEntry]], gpu_slots: list[int]) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
+    mp_context = multiprocessing.get_context("spawn")
     executors = [
         concurrent.futures.ProcessPoolExecutor(
             max_workers=1,
+            mp_context=mp_context,
             initializer=_worker_initializer,
             initargs=(gpu_id,),
         )
