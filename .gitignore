@@ -1,7 +1,6 @@
 .venv/
 __pycache__/
 weights/
-mlaas_data_generator/config.py
 run_config.json
 service_data.csv
 service_data.xlsx
