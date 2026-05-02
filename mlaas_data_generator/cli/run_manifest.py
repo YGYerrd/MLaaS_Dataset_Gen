@@ -777,6 +777,28 @@ def _worker_entry_payload(entry: ManifestEntry) -> dict[str, Any]:
     }
 
 
+def _db_path_for_gpu(db_path: Any, gpu_id: int) -> str:
+    raw = str(db_path or CONFIG.get("db_path") or "").strip()
+    if not raw:
+        return raw
+    path = Path(raw)
+    suffix = "".join(path.suffixes)
+    stem = path.name[: -len(suffix)] if suffix else path.name
+    gpu_name = f"{stem}.gpu{int(gpu_id)}{suffix}"
+    return str(path.with_name(gpu_name))
+
+
+def _entry_with_gpu_db_path(entry: ManifestEntry, gpu_id: int) -> ManifestEntry:
+    resolved = dict(entry.resolved)
+    resolved["db_path"] = _db_path_for_gpu(resolved.get("db_path"), gpu_id)
+    return ManifestEntry(
+        idx=int(entry.idx),
+        ordinal=int(entry.ordinal),
+        resolved=resolved,
+        validation=entry.validation,
+    )
+
+
 def _execute_entry_worker(payload: dict[str, Any]) -> dict[str, Any]:
     entry = ManifestEntry(
         idx=int(payload["idx"]),
@@ -802,9 +824,11 @@ def _execute_entries_with_gpu_affinity(entries: list[ManifestEntry], gpu_slots: 
     future_map: dict[concurrent.futures.Future, ManifestEntry] = {}
     try:
         for index, entry in enumerate(entries):
+            gpu_id = gpu_slots[index % len(gpu_slots)]
+            gpu_entry = _entry_with_gpu_db_path(entry, gpu_id)
             executor = executors[index % len(executors)]
-            future = executor.submit(_execute_entry_worker, _worker_entry_payload(entry))
-            future_map[future] = entry
+            future = executor.submit(_execute_entry_worker, _worker_entry_payload(gpu_entry))
+            future_map[future] = gpu_entry
         for future in concurrent.futures.as_completed(future_map):
             entry = future_map[future]
             try:
@@ -848,7 +872,6 @@ def _execute_entry_row_local(entry: ManifestEntry) -> dict[str, Any]:
             manifest_group_id=resolved.get("manifest_group_id"),
             failure_stage="runtime_exception",
             error_message=str(exc),
-            resolved=resolved,
             exc=exc,
         )
         print(f"Service failed for row {entry.idx}: {exc}")
@@ -926,15 +949,17 @@ def _execute_hf_groups_with_gpu_affinity(model_groups: list[list[ManifestEntry]]
     future_map: dict[concurrent.futures.Future, list[ManifestEntry]] = {}
     try:
         for index, model_entries in enumerate(model_groups):
-            first = model_entries[0].resolved
+            gpu_id = gpu_slots[index % len(gpu_slots)]
+            gpu_entries = [_entry_with_gpu_db_path(entry, gpu_id) for entry in model_entries]
+            first = gpu_entries[0].resolved
             print(
                 "\nGrouped HF model: "
                 f"model={first.get('hf_model_id')} task={first.get('hf_task')} "
-                f"rows={len(model_entries)} assigned_gpu={gpu_slots[index % len(gpu_slots)]}"
+                f"rows={len(gpu_entries)} assigned_gpu={gpu_id} db={first.get('db_path')}"
             )
             executor = executors[index % len(executors)]
-            future = executor.submit(_execute_hf_group_worker, _worker_group_payload(model_entries))
-            future_map[future] = model_entries
+            future = executor.submit(_execute_hf_group_worker, _worker_group_payload(gpu_entries))
+            future_map[future] = gpu_entries
         for future in concurrent.futures.as_completed(future_map):
             model_entries = future_map[future]
             try:

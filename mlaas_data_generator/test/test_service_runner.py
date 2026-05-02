@@ -344,6 +344,25 @@ def test_run_manifest_auto_gpu_affinity_only_for_auto_like_devices():
     assert run_manifest_cli._entry_supports_auto_gpu_affinity({"device": "cuda:1"}) is False
 
 
+def test_run_manifest_builds_per_gpu_db_paths():
+    assert run_manifest_cli._db_path_for_gpu("outputs/services.db", 0).endswith("outputs\\services.gpu0.db")
+    assert run_manifest_cli._db_path_for_gpu("outputs/services.sqlite.db", 1).endswith("outputs\\services.gpu1.sqlite.db")
+
+
+def test_run_manifest_rewrites_entry_db_path_for_gpu():
+    entry = run_manifest_cli.ManifestEntry(
+        idx=1,
+        ordinal=1,
+        resolved={"service_id": "svc", "db_path": "outputs/services.db"},
+        validation=run_manifest_cli.RowValidation(True),
+    )
+
+    gpu_entry = run_manifest_cli._entry_with_gpu_db_path(entry, 1)
+
+    assert gpu_entry.resolved["db_path"].endswith("outputs\\services.gpu1.db")
+    assert entry.resolved["db_path"] == "outputs/services.db"
+
+
 def test_grouped_hf_parallelizes_model_groups(monkeypatch):
     group_calls = []
 

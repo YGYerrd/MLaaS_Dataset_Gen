@@ -318,6 +318,8 @@ python -m mlaas_data_generator.cli.main run-manifest \
 
 `--workers 2` starts two GPU-pinned worker processes. On grouped HF runs, different HF groups can run on different GPUs. On row-local runs, independent rows can run on different GPUs.
 
+When GPU-parallel worker processes are used, each GPU writes to its own SQLite database file to avoid concurrent writes into the same SQLite database. For example, `--db outputs/services.db --workers 2` will produce files such as `outputs/services.gpu0.db` and `outputs/services.gpu1.db`.
+
 Use `--no-grouped-hf` only when you want the most aggressive row-level parallelism and are willing to trade away grouped model/dataset reuse. Keeping grouped HF enabled is usually the better default when many rows share the same HF model.
 
 CSV manifests can include a row with `service_id=defaults`. XLSX manifests can include a `defaults` sheet.
@@ -389,6 +391,7 @@ The run writes:
 | Path | Contents |
 | --- | --- |
 | `outputs/services.db` | SQLite database containing service records and metrics. |
+| `outputs/services.gpu0.db`, `outputs/services.gpu1.db`, ... | Per-GPU SQLite databases created automatically during GPU-parallel runs. |
 | `outputs/service_manifest_results.csv` | Per-row success/failure summary. |
 | `outputs/service_failures.log` | Detailed validation or runtime failures. |
 
