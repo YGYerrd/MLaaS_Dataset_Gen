@@ -858,14 +858,92 @@ def _execute_entries_grouped_hf(entries: list[ManifestEntry], *, workers: int = 
     results: list[dict[str, Any]] = []
     if local_entries:
         results.extend(_execute_entries_row_local(local_entries, workers=workers))
+    model_groups = []
     for _, model_entries in _group_entries(hf_entries, _hf_model_group_key):
         model_entries = sorted(model_entries, key=_entry_group_sort_key)
-        first = model_entries[0].resolved
-        print(
-            "\nGrouped HF model: "
-            f"model={first.get('hf_model_id')} task={first.get('hf_task')} rows={len(model_entries)}"
+        model_groups.append(model_entries)
+    results.extend(_execute_hf_model_groups(model_groups, workers=workers))
+    return results
+
+
+def _execute_hf_model_groups(model_groups: list[list[ManifestEntry]], *, workers: int = 1) -> list[dict[str, Any]]:
+    if not model_groups:
+        return []
+
+    worker_count = _resolve_parallel_worker_count(workers)
+    gpu_slots = _detect_cuda_device_ids()[:worker_count]
+    if worker_count <= 1 or len(gpu_slots) <= 1 or len(model_groups) <= 1:
+        results: list[dict[str, Any]] = []
+        for model_entries in model_groups:
+            first = model_entries[0].resolved
+            print(
+                "\nGrouped HF model: "
+                f"model={first.get('hf_model_id')} task={first.get('hf_task')} rows={len(model_entries)}"
+            )
+            results.extend(_execute_hf_model_group(model_entries))
+        return results
+
+    print(
+        "Parallel grouped HF execution enabled: "
+        f"workers={len(gpu_slots)} visible_gpus={','.join(str(gpu) for gpu in gpu_slots)} "
+        f"groups={len(model_groups)}"
+    )
+    return _execute_hf_groups_with_gpu_affinity(model_groups, gpu_slots)
+
+
+def _worker_group_payload(entries: list[ManifestEntry]) -> list[dict[str, Any]]:
+    return [_worker_entry_payload(entry) for entry in entries]
+
+
+def _execute_hf_group_worker(payload: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    entries = [
+        ManifestEntry(
+            idx=int(item["idx"]),
+            ordinal=int(item.get("ordinal", 0)),
+            resolved=dict(item.get("resolved") or {}),
+            validation=RowValidation(True),
         )
-        results.extend(_execute_hf_model_group(model_entries))
+        for item in payload
+    ]
+    return _execute_hf_model_group(entries)
+
+
+def _execute_hf_groups_with_gpu_affinity(model_groups: list[list[ManifestEntry]], gpu_slots: list[int]) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    executors = [
+        concurrent.futures.ProcessPoolExecutor(
+            max_workers=1,
+            initializer=_worker_initializer,
+            initargs=(gpu_id,),
+        )
+        for gpu_id in gpu_slots
+    ]
+    future_map: dict[concurrent.futures.Future, list[ManifestEntry]] = {}
+    try:
+        for index, model_entries in enumerate(model_groups):
+            first = model_entries[0].resolved
+            print(
+                "\nGrouped HF model: "
+                f"model={first.get('hf_model_id')} task={first.get('hf_task')} "
+                f"rows={len(model_entries)} assigned_gpu={gpu_slots[index % len(gpu_slots)]}"
+            )
+            executor = executors[index % len(executors)]
+            future = executor.submit(_execute_hf_group_worker, _worker_group_payload(model_entries))
+            future_map[future] = model_entries
+        for future in concurrent.futures.as_completed(future_map):
+            model_entries = future_map[future]
+            try:
+                results.extend(future.result())
+            except Exception as exc:  # noqa: BLE001
+                first = model_entries[0].resolved
+                print(
+                    "Parallel grouped HF worker failed; retrying in main process: "
+                    f"model={first.get('hf_model_id')} task={first.get('hf_task')} error={exc}"
+                )
+                results.extend(_execute_hf_model_group(model_entries))
+    finally:
+        for executor in executors:
+            executor.shutdown(wait=True)
     return results
 
 

@@ -344,6 +344,40 @@ def test_run_manifest_auto_gpu_affinity_only_for_auto_like_devices():
     assert run_manifest_cli._entry_supports_auto_gpu_affinity({"device": "cuda:1"}) is False
 
 
+def test_grouped_hf_parallelizes_model_groups(monkeypatch):
+    group_calls = []
+
+    def fake_parallel(model_groups, gpu_slots):
+        group_calls.append((len(model_groups), len(gpu_slots)))
+        return [{"service_id": "svc_grouped", "row_index": 0, "manifest_group_id": "g", "case_name": "c", "status": "success", "error_message": "", "resolved_config_json": "{}"}]
+
+    monkeypatch.setattr(run_manifest_cli, "_execute_hf_groups_with_gpu_affinity", fake_parallel)
+    monkeypatch.setattr(run_manifest_cli, "_detect_cuda_device_ids", lambda: [0, 1])
+
+    entries = [
+        run_manifest_cli.ManifestEntry(
+            idx=i,
+            ordinal=i,
+            resolved={
+                "service_id": f"svc_{i}",
+                "dataset": "hf",
+                "model_type": "hf",
+                "hf_model_id": f"model_{i % 2}",
+                "hf_task": "sequence_classification",
+                "device": "auto",
+                "dataset_args": {"dataset_name": f"data_{i}"},
+            },
+            validation=run_manifest_cli.RowValidation(True),
+        )
+        for i in range(2)
+    ]
+
+    results = run_manifest_cli._execute_entries_grouped_hf(entries, workers=2)
+
+    assert len(results) == 1
+    assert group_calls == [(2, 2)]
+
+
 def test_service_split_derives_distinct_seed_when_manifest_has_no_sample_seed():
     x = np.arange(400).reshape(400, 1)
     y = np.repeat(np.arange(4), 100)

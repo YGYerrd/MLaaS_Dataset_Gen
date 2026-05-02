@@ -304,7 +304,7 @@ For first runs on a new computer, reduce risk by keeping `max_samples` low, usin
 
 For GPU runs, leave `device` blank or set it to `auto` unless you need to force a device. PyTorch exposes ROCm devices through the `torch.cuda` API, so the runner will still resolve a supported AMD ROCm GPU as `cuda`.
 
-On multi-GPU Linux machines, this project uses GPUs most effectively by running multiple manifest rows in parallel, with one worker process pinned to one GPU. Because each manifest row is an independent service, this is more reliable than trying to split one row across multiple GPUs.
+On multi-GPU Linux machines, this project uses GPUs by pinning worker processes to individual GPUs. With grouped HF execution enabled, different Hugging Face model groups can be scheduled onto different GPUs while still reusing prepared models and datasets inside each group.
 
 For a 2-GPU NVIDIA Linux VM, use:
 
@@ -313,13 +313,12 @@ python -m mlaas_data_generator.cli.main run-manifest \
   --file outputs/service_manifest.xlsx \
   --sheet services \
   --db outputs/services.db \
-  --workers 2 \
-  --no-grouped-hf
+  --workers 2
 ```
 
-`--workers 2` starts two row-level worker processes. Each worker is pinned to a single visible GPU with `CUDA_VISIBLE_DEVICES`, so two eligible rows can run at the same time across GPU 0 and GPU 1.
+`--workers 2` starts two GPU-pinned worker processes. On grouped HF runs, different HF groups can run on different GPUs. On row-local runs, independent rows can run on different GPUs.
 
-Use `--no-grouped-hf` when you want maximum dual-GPU utilization. The grouped HF mode intentionally reuses prepared models and datasets inside one process, which is good for cache reuse but limits row-level GPU parallelism.
+Use `--no-grouped-hf` only when you want the most aggressive row-level parallelism and are willing to trade away grouped model/dataset reuse. Keeping grouped HF enabled is usually the better default when many rows share the same HF model.
 
 CSV manifests can include a row with `service_id=defaults`. XLSX manifests can include a `defaults` sheet.
 
@@ -352,7 +351,17 @@ python -m mlaas_data_generator.cli.main run-manifest \
   --db outputs/services.db
 ```
 
-For the 2-GPU Linux VM shown above, prefer:
+For the 2-GPU Linux VM shown above, a good default is:
+
+```bash
+python -m mlaas_data_generator.cli.main run-manifest \
+  --file outputs/service_manifest.xlsx \
+  --sheet services \
+  --db outputs/services.db \
+  --workers 2
+```
+
+If you explicitly want to maximize row-level spreading instead of grouped reuse, use:
 
 ```bash
 python -m mlaas_data_generator.cli.main run-manifest \
