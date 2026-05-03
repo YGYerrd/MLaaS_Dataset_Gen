@@ -79,6 +79,20 @@ def _install_fake_transformers():
     sys.modules["transformers"] = types.SimpleNamespace(AutoTokenizer=FakeTokenizer)
 
 
+def _install_fake_transformers_with_decoder_config(*, is_decoder):
+    hf_cache._TOKENIZER_CACHE.clear()
+
+    class FakeAutoConfig:
+        @staticmethod
+        def from_pretrained(*args, **kwargs):
+            return types.SimpleNamespace(is_encoder_decoder=False, is_decoder=bool(is_decoder))
+
+    sys.modules["transformers"] = types.SimpleNamespace(
+        AutoTokenizer=FakeTokenizer,
+        AutoConfig=FakeAutoConfig,
+    )
+
+
 def test_sequence_dynamic_padding_metadata():
     _install_fake_transformers()
     train, test, meta = preprocess_hf(
@@ -127,3 +141,16 @@ def test_similarity_dynamic_padding_metadata():
     assert train[0]["input_ids"].shape[1] <= 14
     assert meta["padding_mode"] == "dynamic"
     assert meta["dynamic_padding"] is True
+
+
+def test_cached_tokenizer_left_pads_decoder_only_models_even_outside_generation_task():
+    _install_fake_transformers_with_decoder_config(is_decoder=True)
+
+    tokenizer, _, _ = hf_cache.get_cached_tokenizer(
+        hf_model_id="dummy/model",
+        task="sequence_classification",
+        device="cpu",
+        transformers_module=sys.modules["transformers"],
+    )
+
+    assert tokenizer.padding_side == "left"

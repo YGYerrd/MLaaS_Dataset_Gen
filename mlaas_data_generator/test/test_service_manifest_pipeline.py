@@ -54,6 +54,65 @@ def test_manifest_resource_tier_caps_model_and_workload_size():
     assert df["max_length"].dropna().max() <= 96
 
 
+def test_manifest_smoketest_expands_to_all_pairs_with_minimum_sample_budgets():
+    baseline = build_hf_manifest(
+        task_keys=["text_classification"],
+        models_per_task=1,
+        datasets_per_model=1,
+        training_regimes=["finetune_transfer"],
+        resource_tier="light",
+        seed=123,
+    )
+    smoke = build_hf_manifest(
+        task_keys=["text_classification"],
+        models_per_task=1,
+        datasets_per_model=1,
+        training_regimes=["finetune_transfer"],
+        resource_tier="smoketest",
+        seed=123,
+    )
+
+    assert not smoke.empty
+    assert set(smoke["resource_tier"]) == {"smoketest"}
+    assert set(smoke["training_regime"]) == {"finetune_transfer"}
+    assert smoke["max_samples"].max() <= 8
+    assert smoke["sample_size"].dropna().max() <= 7
+    assert len(smoke) > len(baseline)
+    smoke_pairs = set(zip(smoke["hf_model_id"], smoke["dataset_name"], smoke["dataset_config"], strict=False))
+    assert len(smoke_pairs) == len(smoke)
+    baseline_pairs = set(zip(baseline["hf_model_id"], baseline["dataset_name"], baseline["dataset_config"], strict=False))
+    assert baseline_pairs.issubset(smoke_pairs)
+
+
+def test_run_manifest_validation_accepts_smoketest_resource_tier():
+    row = pd.Series(
+        {
+            "service_id": "svc_smoketest",
+            "enabled": True,
+            "dataset": "hf",
+            "model_type": "hf_finetune",
+            "task_type": "classification",
+            "hf_task": "sequence_classification",
+            "hf_model_id": "distilbert-base-uncased",
+            "dataset_name": "glue",
+            "dataset_config": "sst2",
+            "train_split": "train",
+            "test_split": "validation",
+            "benchmark_split": "validation",
+            "text_column": "sentence",
+            "label_column": "label",
+            "training_regime": "finetune_transfer",
+            "resource_tier": "smoketest",
+            "training_epochs": 1,
+            "batch_size": 4,
+            "precision_type": "fp16",
+        }
+    )
+
+    validation = _validate_row(_resolve_row(row, {}))
+    assert validation.ok, validation.error
+
+
 def test_manifest_knob_variants_are_task_aware_and_distinct():
     df = build_hf_manifest(
         task_keys=["text_classification"],
@@ -73,7 +132,7 @@ def test_manifest_knob_variants_are_task_aware_and_distinct():
     assert len(set(df["sample_seed"])) == len(df)
     assert len(set(df["warmup_ratio"])) > 1
     assert len(set(df["gradient_accumulation_steps"])) > 1
-    assert set(df["precision_type"]).issubset({"fp16", "bf16"})
+    assert set(df["precision_type"]) == {"fp16"}
     assert set(df["split_strategy"]).issubset({"iid", "dirichlet"})
     assert df["skew_axis"].notna().all()
     for payload in df["service_config"]:
@@ -100,7 +159,7 @@ def test_manifest_mixed_precision_distribution_targets_runtime_regime_band():
 
     ratio = float(df["mixed_precision"].mean())
     assert 0.70 <= ratio <= 0.80
-    assert set(df.loc[df["mixed_precision"], "precision_type"]).issubset({"fp16", "bf16"})
+    assert set(df.loc[df["mixed_precision"], "precision_type"]) == {"fp16"}
 
 
 def test_manifest_fill_mask_knob_variants_include_mlm_probability():
@@ -135,6 +194,28 @@ def test_manifest_inference_uses_explicit_dataset_matches():
     assert set(df["training_regime"]) == {"inference_only"}
     assert set(df["dataset_name"]) == {"detection-datasets/coco"}
     assert set(df["learning_rate"].dropna()) == set()
+
+
+def test_manifest_text2text_inference_retiers_slow_summarization_models():
+    df = build_hf_manifest(
+        task_keys=["text2text_generation"],
+        models_per_task=10,
+        datasets_per_model=10,
+        training_regimes=["inference_only"],
+        resource_tier="medium",
+        seed=123,
+    )
+
+    assert not df.empty
+    t5_base = df[df["hf_model_id"] == "t5-base"]
+    t5_small = df[df["hf_model_id"] == "t5-small"]
+
+    assert not t5_base.empty
+    assert not t5_small.empty
+    assert set(t5_base["max_eval_time_s"]) == {240}
+    assert set(t5_small["max_eval_time_s"]) == {120}
+    assert t5_base["max_samples"].max() <= 384
+    assert t5_small["max_samples"].max() >= t5_base["max_samples"].max()
 
 
 def test_manifest_service_ids_are_deterministic():
@@ -575,6 +656,41 @@ def test_manifest_builder_excludes_known_bad_paths():
                 "hf_task": "image_classification",
                 "hf_model_id": "microsoft/resnet-50",
                 "image_column": "img",
+                "label_column": "label",
+                "training_regime": "finetune_transfer",
+                "batch_size": 8,
+            },
+            "miopenStatusUnknownError",
+        ),
+        (
+            {
+                "service_id": "svc_blocked_mobilenet_pet",
+                "dataset": "hf",
+                "dataset_name": "timm/oxford-iiit-pet",
+                "model_type": "hf_finetune",
+                "task_type": "classification",
+                "task": "image_classification",
+                "hf_task": "image_classification",
+                "hf_model_id": "google/mobilenet_v2_1.0_224",
+                "image_column": "image",
+                "label_column": "label",
+                "training_regime": "finetune_transfer",
+                "batch_size": 8,
+            },
+            "miopenStatusUnknownError",
+        ),
+        (
+            {
+                "service_id": "svc_blocked_mobilenet_fashion_mnist",
+                "dataset": "hf",
+                "dataset_name": "zalando-datasets/fashion_mnist",
+                "dataset_config": "default",
+                "model_type": "hf_finetune",
+                "task_type": "classification",
+                "task": "image_classification",
+                "hf_task": "image_classification",
+                "hf_model_id": "google/mobilenet_v2_1.0_224",
+                "image_column": "image",
                 "label_column": "label",
                 "training_regime": "finetune_transfer",
                 "batch_size": 8,

@@ -44,8 +44,10 @@ class SQLiteWriter:
         self.conn.execute("PRAGMA foreign_keys = ON;")
         sql = resources.files(__package__).joinpath("schemaV2.sql").read_text(encoding="utf-8")
         self.conn.executescript(sql)
-        self.conn.execute("PRAGMA journal_mode = WAL;")
-        self.conn.execute("PRAGMA synchronous = NORMAL;")
+        # Each GPU worker writes to its own DB file, so WAL adds portability risk
+        # without providing useful concurrency benefits here.
+        self.conn.execute("PRAGMA journal_mode = DELETE;")
+        self.conn.execute("PRAGMA synchronous = FULL;")
         self.conn.commit()
 
     def finish(self) -> None:

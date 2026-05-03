@@ -36,3 +36,16 @@ def test_hf_manifest_parser_accepts_split_task_keys_and_training_regimes() -> No
         "finetune_transfer",
         "inference_only",
     ]
+
+
+def test_hf_manifest_parser_accepts_smoketest_resource_tier() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "hf-manifest",
+            "--resource-tier",
+            "smoketest",
+        ]
+    )
+
+    assert args.resource_tier == "smoketest"

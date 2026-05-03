@@ -13,6 +13,27 @@ def _cache_key(hf_model_id, task, device):
     return (str(hf_model_id), str(task or "").strip().lower(), str(device))
 
 
+def _should_left_pad_tokenizer(*, hf_model_id, task, transformers_module):
+    task_name = str(task or "").strip().lower()
+    if task_name == "causal_lm_generation":
+        return True
+
+    auto_config = getattr(transformers_module, "AutoConfig", None)
+    if auto_config is None or not hasattr(auto_config, "from_pretrained"):
+        return False
+
+    try:
+        config = auto_config.from_pretrained(hf_model_id)
+    except Exception:
+        return False
+
+    if bool(getattr(config, "is_encoder_decoder", False)):
+        return False
+    if bool(getattr(config, "is_decoder", False)):
+        return True
+    return False
+
+
 def get_cached_tokenizer(*, hf_model_id, task, device, transformers_module):
     """
     Returns (tokenizer, load_s, cache_hit).
@@ -28,8 +49,11 @@ def get_cached_tokenizer(*, hf_model_id, task, device, transformers_module):
 
     if getattr(tok, "pad_token_id", None) is None and getattr(tok, "eos_token_id", None) is not None:
         tok.pad_token = tok.eos_token
-    task_name = str(task or "").strip().lower()
-    if task_name == "causal_lm_generation":
+    if _should_left_pad_tokenizer(
+        hf_model_id=hf_model_id,
+        task=task,
+        transformers_module=transformers_module,
+    ):
         tok.padding_side = "left"
 
     load_s = float(time.time() - t0)

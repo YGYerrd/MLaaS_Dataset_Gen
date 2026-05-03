@@ -165,7 +165,7 @@ DATASET_ARG_COLUMNS = {
 
 REQUIRED_COLUMNS = {"dataset", "model_type", "task_type"}
 BLANK_STRINGS = {"", "na", "n/a", "nan", "null", "none", "not applicable", "not_applicable"}
-RESOURCE_TIER_VALUES = {"light", "medium", "heavy", "stress_test"}
+RESOURCE_TIER_VALUES = {"smoketest", "light", "medium", "heavy", "stress_test"}
 
 COLUMN_ALIASES = {
     "manifest group id": "manifest_group_id",
@@ -564,7 +564,7 @@ def _validate_row(resolved: dict[str, Any]) -> RowValidation:
         return RowValidation(False, "training_regime must be one of finetune_transfer, inference_only, or generic")
     resource_tier = str(resolved.get("resource_tier") or "").strip().lower()
     if resource_tier and resource_tier not in RESOURCE_TIER_VALUES:
-        return RowValidation(False, "resource_tier must be one of light, medium, heavy, or stress_test")
+        return RowValidation(False, "resource_tier must be one of smoketest, light, medium, heavy, or stress_test")
     if int(resolved.get("training_epochs", 1) or 1) <= 0 and training_regime != "inference_only":
         return RowValidation(False, "training_epochs must be > 0 for trainable services")
     if int(resolved.get("batch_size", 0) or 0) <= 0:

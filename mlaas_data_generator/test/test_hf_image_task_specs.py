@@ -221,6 +221,26 @@ def test_object_detection_batch_metric_statistics_from_outputs_emits_torchmetric
     assert payload["preds"][0]["boxes"].shape == (1, 4)
 
 
+def test_object_detection_batch_metric_statistics_from_outputs_casts_bf16_tensors_before_numpy():
+    spec = ObjectDetectionSpec(score_threshold=0.05)
+    labels_t = [
+        {
+            "class_labels": torch.tensor([1], dtype=torch.long),
+            "boxes": torch.tensor([[0.5, 0.5, 0.4, 0.4]], dtype=torch.float32),
+        }
+    ]
+
+    class _Outputs:
+        logits = torch.tensor([[[0.1, 5.0, -4.0]]], dtype=torch.bfloat16)
+        pred_boxes = torch.tensor([[[0.5, 0.5, 0.4, 0.4]]], dtype=torch.bfloat16)
+
+    stats = spec.batch_metric_statistics_from_outputs(torch, _Outputs(), labels_t, {"score_threshold": 0.05})
+    payload = stats["__map_batch__"]
+    assert np.isclose(payload["metric_instance_count"], 1.0)
+    assert payload["preds"][0]["boxes"].dtype == torch.float32
+    assert payload["preds"][0]["scores"].dtype == torch.float32
+
+
 def test_object_detection_batch_metric_statistics_keeps_low_confidence_predictions_for_ap_ranking():
     spec = ObjectDetectionSpec(score_threshold=0.05)
     labels_t = [

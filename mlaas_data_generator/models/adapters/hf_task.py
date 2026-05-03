@@ -42,6 +42,30 @@ def _load_auto_model_with_safetensor_fallback(transformers, model_id, auto_model
     raise AttributeError(f"transformers is missing AutoModel classes: {', '.join(missing)}")
 
 
+def _load_hf_config_if_available(transformers, model_id):
+    AutoConfig = getattr(transformers, "AutoConfig", None)
+    if AutoConfig is None or not hasattr(AutoConfig, "from_pretrained"):
+        return None
+    try:
+        return AutoConfig.from_pretrained(model_id)
+    except Exception:
+        return None
+
+
+def _infer_vqa_model_family(config, model_id):
+    model_type = str(getattr(config, "model_type", "") or "").strip().lower()
+    config_name = type(config).__name__.strip().lower() if config is not None else ""
+    model_name = str(model_id or "").strip().lower()
+    hint = " ".join(part for part in (model_type, config_name, model_name) if part)
+    if "vilt" in hint:
+        return "vilt"
+    if "git" in hint:
+        return "git"
+    if "blip" in hint:
+        return "blip"
+    return ""
+
+
 _TEXT_METRIC_TOKEN_RE = re.compile(r"\w+|[^\w\s]", re.UNICODE)
 
 
@@ -167,6 +191,21 @@ def _decode_token_id_batch(tokenizer, values, *, ignore_index=-100):
         return None
 
 
+def _tensor_to_numpy(value, *, dtype=None):
+    if hasattr(value, "detach"):
+        value = value.detach()
+    tensor_dtype = str(getattr(value, "dtype", "")).lower()
+    if "bfloat16" in tensor_dtype and hasattr(value, "float"):
+        value = value.float()
+    if hasattr(value, "cpu"):
+        value = value.cpu()
+    if hasattr(value, "numpy"):
+        arr = value.numpy()
+    else:
+        arr = np.asarray(value)
+    return np.asarray(arr, dtype=dtype) if dtype is not None else np.asarray(arr)
+
+
 def _strip_trailing_eos_token(tokenizer, token_ids):
     eos_id = getattr(tokenizer, "eos_token_id", None)
     trimmed = list(token_ids)
@@ -179,7 +218,7 @@ def _pearson_correlation(y_true, y_pred):
     if y_true.size <= 1 or y_pred.size <= 1:
         return np.nan
     if np.allclose(y_true, y_true[0]) or np.allclose(y_pred, y_pred[0]):
-        return np.nan
+        return 0.0
     try:
         return float(np.corrcoef(y_true, y_pred)[0, 1])
     except Exception:
@@ -602,9 +641,9 @@ class TokenClassificationSpec(HFTaskSpec):
         try:
             import torch
             if isinstance(y_true, torch.Tensor):
-                y_true = y_true.detach().cpu().numpy()
+                y_true = _tensor_to_numpy(y_true)
             if isinstance(y_pred, torch.Tensor):
-                y_pred = y_pred.detach().cpu().numpy()
+                y_pred = _tensor_to_numpy(y_pred)
         except Exception:
             pass
 
@@ -700,8 +739,8 @@ class ImageClassificationSpec(HFTaskSpec):
         total = int(labels_t.shape[0])
         stats = {"top1_correct": top1_correct, "top5_correct": topk_correct, "total": total}
 
-        labels_np = labels_t.detach().cpu().numpy().reshape(-1)
-        preds_np = top1.detach().cpu().numpy().reshape(-1)
+        labels_np = _tensor_to_numpy(labels_t).reshape(-1)
+        preds_np = _tensor_to_numpy(top1).reshape(-1)
         for label in np.unique(np.concatenate([labels_np, preds_np], axis=0)):
             label_key = str(int(label))
             true_mask = labels_np == label
@@ -867,7 +906,7 @@ class ObjectDetectionSpec(HFTaskSpec):
 
         try:
             if hasattr(raw_size, "detach"):
-                size_arr = raw_size.detach().cpu().numpy().reshape(-1)
+                size_arr = _tensor_to_numpy(raw_size).reshape(-1)
             else:
                 size_arr = np.asarray(raw_size, dtype=np.int64).reshape(-1)
             if size_arr.size >= 2 and int(size_arr[0]) > 0 and int(size_arr[1]) > 0:
@@ -1207,15 +1246,15 @@ class ObjectDetectionSpec(HFTaskSpec):
             t_boxes = target.get("boxes")
             t_labels = target.get("labels")
             if hasattr(p_boxes, "detach"):
-                p_boxes = p_boxes.detach().cpu().numpy()
+                p_boxes = _tensor_to_numpy(p_boxes)
             if hasattr(p_scores, "detach"):
-                p_scores = p_scores.detach().cpu().numpy()
+                p_scores = _tensor_to_numpy(p_scores)
             if hasattr(p_labels, "detach"):
-                p_labels = p_labels.detach().cpu().numpy()
+                p_labels = _tensor_to_numpy(p_labels)
             if hasattr(t_boxes, "detach"):
-                t_boxes = t_boxes.detach().cpu().numpy()
+                t_boxes = _tensor_to_numpy(t_boxes)
             if hasattr(t_labels, "detach"):
-                t_labels = t_labels.detach().cpu().numpy()
+                t_labels = _tensor_to_numpy(t_labels)
 
             p_boxes, p_labels = self._sanitize_metric_boxes_labels(p_boxes, p_labels)
             t_boxes, t_labels = self._sanitize_metric_boxes_labels(t_boxes, t_labels)
@@ -1251,8 +1290,8 @@ class ObjectDetectionSpec(HFTaskSpec):
         if labels_t is None or outputs is None or not hasattr(outputs, "pred_boxes") or not hasattr(outputs, "logits"):
             return None
 
-        probs = torch.softmax(outputs.logits, dim=-1).detach().cpu().numpy()
-        boxes = outputs.pred_boxes.detach().cpu().numpy()
+        probs = _tensor_to_numpy(torch.softmax(outputs.logits, dim=-1), dtype=np.float32)
+        boxes = _tensor_to_numpy(outputs.pred_boxes, dtype=np.float32)
         valid_set = set(int(v) for v in self._model_valid_class_ids) if self._model_valid_class_ids else None
 
         post_processed = None
@@ -1277,18 +1316,18 @@ class ObjectDetectionSpec(HFTaskSpec):
 
         for bidx, gt in enumerate(labels_t):
             image_h, image_w = self._extract_orig_size_from_label_tensor(gt, fallback_h=1, fallback_w=1)
-            gt_boxes = gt["boxes"].detach().cpu().numpy()
+            gt_boxes = _tensor_to_numpy(gt["boxes"], dtype=np.float32)
             gt_boxes = self._cxcywh_to_xyxy(gt_boxes)
             gt_boxes[:, [0, 2]] *= max(float(image_w), 1e-9)
             gt_boxes[:, [1, 3]] *= max(float(image_h), 1e-9)
-            gt_classes = gt["class_labels"].detach().cpu().numpy()
+            gt_classes = _tensor_to_numpy(gt["class_labels"], dtype=np.int64)
             metric_instance_count += float(len(gt_classes))
 
             if post_processed is not None and bidx < len(post_processed):
                 pred = post_processed[bidx]
-                p_scores = pred["scores"].detach().cpu().numpy()
-                p_cls = pred["labels"].detach().cpu().numpy()
-                p_boxes = pred["boxes"].detach().cpu().numpy()
+                p_scores = _tensor_to_numpy(pred["scores"], dtype=np.float32)
+                p_cls = _tensor_to_numpy(pred["labels"], dtype=np.int64)
+                p_boxes = _tensor_to_numpy(pred["boxes"], dtype=np.float32)
             else:
                 p_scores = probs[bidx, :, :-1].max(axis=-1)
                 p_cls = probs[bidx, :, :-1].argmax(axis=-1)
@@ -1533,8 +1572,8 @@ class ImageSegmentationSpec(HFTaskSpec):
         if pred.numel() == 0:
             return {"metric_instance_count": 0.0}
         stats = self._segmentation_class_statistics(
-            pred.detach().cpu().numpy(),
-            tgt.detach().cpu().numpy(),
+            _tensor_to_numpy(pred),
+            _tensor_to_numpy(tgt),
         )
         stats["metric_instance_count"] = 1.0
         return stats
@@ -2278,8 +2317,8 @@ class TextImageRetrievalSpec(HFTaskSpec):
         txt = getattr(outputs, "text_embeds", None)
         if img is not None and txt is not None:
             return {
-                "image_embeds": img.detach().cpu().numpy(),
-                "text_embeds": txt.detach().cpu().numpy(),
+                "image_embeds": _tensor_to_numpy(img, dtype=np.float32),
+                "text_embeds": _tensor_to_numpy(txt, dtype=np.float32),
             }
 
         try:
@@ -2384,11 +2423,17 @@ class VQASpec(HFTaskSpec):
 
     def build_model(self, transformers, model_id, num_labels):
         mode = self._label_mode()
+        config = _load_hf_config_if_available(transformers, model_id)
+        family = _infer_vqa_model_family(config, model_id)
         if mode == "classification":
             kwargs = {}
             if num_labels is not None:
                 kwargs["num_labels"] = int(num_labels)
                 kwargs["ignore_mismatched_sizes"] = True
+            if family in {"git", "blip"}:
+                raise ValueError(
+                    f"VQA label_format={self.label_format!r} is incompatible with generative VQA architecture family '{family}'"
+                )
             model, self.weight_format = _load_auto_model_with_safetensor_fallback(
                 transformers,
                 model_id,
@@ -2398,6 +2443,43 @@ class VQASpec(HFTaskSpec):
             return model
 
         if mode == "generation":
+            if family == "vilt":
+                raise ValueError(
+                    f"VQA label_format={self.label_format!r} is incompatible with classification-only VQA architecture family 'vilt'"
+                )
+            auto_model_names = (
+                ("GitForCausalLM", "AutoModelForCausalLM")
+                if family == "git"
+                else (
+                    "AutoModelForVision2Seq",
+                    "AutoModelForImageTextToText",
+                    "BlipForQuestionAnswering",
+                    "GitForCausalLM",
+                    "AutoModelForCausalLM",
+                )
+            )
+            model, self.weight_format = _load_auto_model_with_safetensor_fallback(
+                transformers,
+                model_id,
+                auto_model_names,
+            )
+            return model
+
+        if family == "vilt":
+            model, self.weight_format = _load_auto_model_with_safetensor_fallback(
+                transformers,
+                model_id,
+                ("AutoModelForVisualQuestionAnswering",),
+            )
+            return model
+        if family == "git":
+            model, self.weight_format = _load_auto_model_with_safetensor_fallback(
+                transformers,
+                model_id,
+                ("GitForCausalLM", "AutoModelForCausalLM"),
+            )
+            return model
+        if family == "blip":
             model, self.weight_format = _load_auto_model_with_safetensor_fallback(
                 transformers,
                 model_id,
@@ -2405,26 +2487,14 @@ class VQASpec(HFTaskSpec):
                     "AutoModelForVision2Seq",
                     "AutoModelForImageTextToText",
                     "BlipForQuestionAnswering",
-                    "GitForCausalLM",
-                    "AutoModelForCausalLM",
-                    "AutoModelForVisualQuestionAnswering",
                 ),
             )
             return model
 
-        model, self.weight_format = _load_auto_model_with_safetensor_fallback(
-            transformers,
-            model_id,
-            (
-                "AutoModelForVisualQuestionAnswering",
-                "AutoModelForVision2Seq",
-                "AutoModelForImageTextToText",
-                "BlipForQuestionAnswering",
-                "GitForCausalLM",
-                "AutoModelForCausalLM",
-            ),
+        raise ValueError(
+            "Unable to determine a supported VQA loader for model "
+            f"{model_id!r}; supported families are ViLT, BLIP, and GIT"
         )
-        return model
 
     def encode_batch(self, tokenizer, xb, yb, max_length, torch, device, ignore_index=-100, inference_only=False):
         if not isinstance(xb, dict):

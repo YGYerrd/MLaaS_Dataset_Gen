@@ -559,6 +559,60 @@ def test_hf_multimodal_vqa_answers_and_variable_image_shapes(monkeypatch):
     assert meta["label_column"] == "answers"
 
 
+def test_hf_multimodal_vqa_stacks_ragged_singleton_pixel_batches_without_size_metadata(monkeypatch):
+    train = DummyDS([
+        {
+            "image": np.ones((8, 6, 3), dtype=np.uint8),
+            "question": "what?",
+            "answer": "cat",
+        },
+        {
+            "image": np.ones((5, 9, 3), dtype=np.uint8),
+            "question": "where?",
+            "answer": "home",
+        },
+    ])
+    test = DummyDS([
+        {
+            "image": np.ones((7, 4, 3), dtype=np.uint8),
+            "question": "what color?",
+            "answer": "blue",
+        },
+    ])
+
+    class DummyTokenizer:
+        def __call__(self, text, **kwargs):
+            return {"input_ids": [1, 2, 3, 0], "attention_mask": [1, 1, 1, 0]}
+
+    class RaggedImageProcessor:
+        def __call__(self, image, **kwargs):
+            chw = np.transpose(np.asarray(image, dtype=np.float32), (2, 0, 1))
+            return {"pixel_values": np.expand_dims(chw, axis=0)}
+
+    fake_tr = types.SimpleNamespace(
+        AutoTokenizer=types.SimpleNamespace(from_pretrained=lambda *a, **k: DummyTokenizer()),
+        AutoImageProcessor=types.SimpleNamespace(from_pretrained=lambda *a, **k: RaggedImageProcessor()),
+    )
+    monkeypatch.setitem(sys.modules, "transformers", fake_tr)
+
+    (x_train, y_train), (x_test, y_test), meta = preprocess_hf_multimodal(
+        (train, None),
+        (test, None),
+        {},
+        hf_model_id="dummy/model",
+        hf_task="visual_question_answering",
+        label_column="answer",
+    )
+
+    assert x_train["pixel_values"].shape[0] == 2
+    assert x_train["pixel_values"].shape[1] == 3
+    assert len({tuple(arr.shape) for arr in x_train["pixel_values"]}) == 1
+    assert len({tuple(arr.shape) for arr in x_test["pixel_values"]}) == 1
+    assert y_train.tolist() == ["cat", "home"]
+    assert y_test.tolist() == ["blue"]
+    assert meta["label_column"] == "answer"
+
+
 def test_hf_multimodal_vqa_classification_labels_from_model_vocab(monkeypatch):
     train = DummyDS([
         {"image": np.ones((8, 8, 3), dtype=np.uint8), "question": "what?", "answer": "cat"},

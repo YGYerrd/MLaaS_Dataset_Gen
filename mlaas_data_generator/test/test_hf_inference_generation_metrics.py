@@ -347,6 +347,46 @@ def test_hfcore_eval_inference_only_generation_uses_teacher_forced_labels_for_me
     assert core.tokenizer.padding_side == "left"
 
 
+def test_hfcore_batch_iter_trims_common_text_padding_per_batch():
+    core = HFCore.__new__(HFCore)
+    core.batch_size = 2
+    core.label_pad_value = -100
+
+    xs = {
+        "input_ids": np.asarray([[11, 12, 0, 0], [21, 22, 23, 0]], dtype=np.int64),
+        "attention_mask": np.asarray([[1, 1, 0, 0], [1, 1, 1, 0]], dtype=np.int64),
+        "token_type_ids": np.asarray([[0, 0, 0, 0], [0, 0, 0, 0]], dtype=np.int64),
+    }
+    ys = np.asarray([[31, 32, -100, -100], [41, 42, 43, -100]], dtype=np.int64)
+
+    xb, yb = next(core._batch_iter(xs, ys))
+
+    assert xb["input_ids"].shape == (2, 3)
+    assert xb["attention_mask"].shape == (2, 3)
+    assert xb["token_type_ids"].shape == (2, 3)
+    assert yb.shape == (2, 3)
+    assert xb["input_ids"].tolist() == [[11, 12, 0], [21, 22, 23]]
+    assert yb.tolist() == [[31, 32, -100], [41, 42, 43]]
+
+
+def test_hfcore_batch_iter_trims_common_left_padding_per_batch():
+    core = HFCore.__new__(HFCore)
+    core.batch_size = 2
+    core.label_pad_value = -100
+
+    xs = {
+        "input_ids": np.asarray([[0, 0, 11, 12], [0, 21, 22, 23]], dtype=np.int64),
+        "attention_mask": np.asarray([[0, 0, 1, 1], [0, 1, 1, 1]], dtype=np.int64),
+    }
+
+    xb, _ = next(core._batch_iter(xs, None))
+
+    assert xb["input_ids"].shape == (2, 3)
+    assert xb["attention_mask"].shape == (2, 3)
+    assert xb["input_ids"].tolist() == [[0, 11, 12], [21, 22, 23]]
+    assert xb["attention_mask"].tolist() == [[0, 1, 1], [1, 1, 1]]
+
+
 def test_service_perturbation_probe_left_pads_decoder_only_generation():
     core = _make_generation_probe_core()
     adapter = type("Adapter", (), {"core": core})()

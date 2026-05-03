@@ -3,6 +3,7 @@ import pytest
 
 from mlaas_data_generator.models.adapters.hf_task import (
     ImageCaptioningSpec,
+    SentenceSimilaritySpec,
     TextImageRetrievalSpec,
     VQASpec,
 )
@@ -74,6 +75,19 @@ def test_retrieval_loss_is_symmetric_contrastive_and_backwardable():
     loss.backward()
     assert logits.grad is not None
     assert torch.isfinite(logits.grad).all()
+
+
+def test_sentence_similarity_regression_metrics_use_zero_for_constant_predictions():
+    spec = SentenceSimilaritySpec(is_regression=True)
+    y_true = np.array([0.0, 0.3, 0.7, 1.0], dtype="float32")
+    y_pred = np.array([0.5, 0.5, 0.5, 0.5], dtype="float32")
+
+    out = spec.metrics(y_true, y_pred, y_extra={"is_regression": True})
+
+    assert out["primary"] == pytest.approx(0.0)
+    assert out["secondary"] == pytest.approx(0.0)
+    assert out["named_metrics"]["pearson"] == pytest.approx(0.0)
+    assert out["named_metrics"]["spearman"] == pytest.approx(0.0)
 
 
 def test_vqa_metrics_exact_match_with_normalization():
@@ -326,3 +340,92 @@ def test_hfcore_vqa_inference_keeps_text_answers_for_metrics():
     assert np.isclose(secondary, 1.0)
     assert np.isclose(qos["exact_match"], 1.0)
     assert np.isclose(qos["answer_token_accuracy"], 1.0)
+
+
+def test_vqa_build_model_routes_answer_text_git_models_to_generative_loader():
+    class DummyConfig:
+        model_type = "git"
+
+    class GitForCausalLM:
+        called = 0
+
+        @classmethod
+        def from_pretrained(cls, model_id, **kwargs):
+            cls.called += 1
+            return {"loader": "git", "model_id": model_id}
+
+    class AutoConfig:
+        @staticmethod
+        def from_pretrained(model_id):
+            return DummyConfig()
+
+    TransformersStub = type(
+        "TransformersStub",
+        (),
+        {
+            "AutoConfig": AutoConfig,
+            "GitForCausalLM": GitForCausalLM,
+        },
+    )
+
+    spec = VQASpec(label_format="answer_text")
+    model = spec.build_model(TransformersStub, "microsoft/git-base-vqav2", num_labels=None)
+
+    assert model["loader"] == "git"
+    assert GitForCausalLM.called == 1
+
+
+def test_vqa_build_model_rejects_classification_labels_for_git_family():
+    class DummyConfig:
+        model_type = "git"
+
+    class AutoConfig:
+        @staticmethod
+        def from_pretrained(model_id):
+            return DummyConfig()
+
+    TransformersStub = type(
+        "TransformersStub",
+        (),
+        {
+            "AutoConfig": AutoConfig,
+        },
+    )
+
+    spec = VQASpec(label_format="vqa_class_index")
+
+    with pytest.raises(ValueError, match="generative VQA architecture family 'git'"):
+        spec.build_model(TransformersStub, "microsoft/git-base-vqav2", num_labels=2)
+
+
+def test_vqa_build_model_routes_answer_text_vilt_models_to_classification_loader():
+    class DummyConfig:
+        model_type = "vilt"
+
+    class AutoConfig:
+        @staticmethod
+        def from_pretrained(model_id):
+            return DummyConfig()
+
+    class AutoModelForVisualQuestionAnswering:
+        called = 0
+
+        @classmethod
+        def from_pretrained(cls, model_id, **kwargs):
+            cls.called += 1
+            return {"loader": "vilt", "model_id": model_id}
+
+    TransformersStub = type(
+        "TransformersStub",
+        (),
+        {
+            "AutoConfig": AutoConfig,
+            "AutoModelForVisualQuestionAnswering": AutoModelForVisualQuestionAnswering,
+        },
+    )
+
+    spec = VQASpec(label_format="answer_text")
+    model = spec.build_model(TransformersStub, "dandelin/vilt-b32-finetuned-vqa", num_labels=None)
+
+    assert model["loader"] == "vilt"
+    assert AutoModelForVisualQuestionAnswering.called == 1

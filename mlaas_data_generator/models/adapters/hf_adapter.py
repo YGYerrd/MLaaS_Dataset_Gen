@@ -203,21 +203,7 @@ class TransformersTextClassifierAdapter:
                 if task == "text_image_retrieval":
                     return transformers.AutoModel.from_pretrained(model_id)
                 if task == "visual_question_answering":
-                    for auto_model_name in (
-                        "AutoModelForVisualQuestionAnswering",
-                        "AutoModelForVision2Seq",
-                        "AutoModelForImageTextToText",
-                        "BlipForQuestionAnswering",
-                        "GitForCausalLM",
-                        "AutoModelForCausalLM",
-                    ):
-                        AutoModel = getattr(transformers, auto_model_name, None)
-                        if AutoModel is not None:
-                            try:
-                                return AutoModel.from_pretrained(model_id)
-                            except Exception:
-                                continue
-                    return transformers.AutoModelForVisualQuestionAnswering.from_pretrained(model_id)
+                    return spec.build_model(transformers, model_id, None)
                 return transformers.AutoModelForSequenceClassification.from_pretrained(model_id)
 
             core.model, core.model_load_s, core.model_cache_hit = get_cached_model(

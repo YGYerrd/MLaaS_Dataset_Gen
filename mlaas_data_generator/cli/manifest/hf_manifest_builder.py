@@ -69,6 +69,7 @@ MANIFEST_PROFILES: dict[str, ManifestProfile] = {
 }
 
 RESOURCE_TIERS: dict[str, ResourceTierSpec] = {
+    "smoketest": ResourceTierSpec("smoketest", rank=0, default_avg_sample_size=32, timeout_s=900, max_train_time_s=45, max_eval_time_s=60),
     "light": ResourceTierSpec("light", rank=0, default_avg_sample_size=128, timeout_s=900, max_train_time_s=45, max_eval_time_s=60),
     "medium": ResourceTierSpec("medium", rank=1, default_avg_sample_size=768, timeout_s=1800, max_train_time_s=120, max_eval_time_s=120),
     "heavy": ResourceTierSpec("heavy", rank=2, default_avg_sample_size=1600, timeout_s=3600, max_train_time_s=300, max_eval_time_s=240),
@@ -90,6 +91,9 @@ PROFILE_DEFAULT_RESOURCE_TIERS = {
 }
 
 RESOURCE_TIER_ALIASES = {
+    "smoke": "smoketest",
+    "smoke_test": "smoketest",
+    "smoke-test": "smoketest",
     "stress": "stress_test",
     "stress-test": "stress_test",
     "stresstest": "stress_test",
@@ -317,6 +321,20 @@ def _resource_tier_rank(tier_name: str | None) -> int:
     name = RESOURCE_TIER_ALIASES.get(str(tier_name or "medium").strip().lower(), str(tier_name or "medium").strip().lower())
     spec = RESOURCE_TIERS.get(name)
     return spec.rank if spec else RESOURCE_TIERS["medium"].rank
+
+
+def _resource_tier_by_rank(rank: int) -> ResourceTierSpec:
+    clamped = max(0, min(int(rank), max(spec.rank for spec in RESOURCE_TIERS.values())))
+    ranked = sorted(RESOURCE_TIERS.values(), key=lambda spec: (spec.rank, spec.default_avg_sample_size))
+    selected = None
+    for spec in ranked:
+        if spec.rank == clamped:
+            selected = spec
+    return selected or RESOURCE_TIERS["medium"]
+
+
+def _is_smoketest_tier(resource_tier: ResourceTierSpec) -> bool:
+    return resource_tier.name == "smoketest"
 
 
 def _as_float(value: Any) -> float | None:
@@ -572,6 +590,32 @@ def _resource_tier_for_dataset(dataset_spec: dict[str, Any], task_key: str) -> s
     return "stress_test"
 
 
+def _model_aware_runtime_tier(
+    *,
+    task_key: str,
+    model: dict[str, Any],
+    dataset_spec: dict[str, Any],
+    training_regime: str,
+    resource_tier: ResourceTierSpec,
+) -> ResourceTierSpec:
+    effective_rank = int(resource_tier.rank)
+    family = str(model.get("family") or "").strip().lower()
+    model_id = str(model.get("hf_model_id") or "").strip().lower()
+    params_m = _estimated_model_params_m(model) or 0.0
+
+    if training_regime == "inference_only" and task_key == "text2text_generation":
+        if family == "led" or model_id == "allenai/led-base-16384":
+            effective_rank = max(effective_rank, RESOURCE_TIERS["heavy"].rank)
+        elif family == "mt5":
+            effective_rank = max(effective_rank, RESOURCE_TIERS["heavy"].rank)
+        elif family == "t5" and (params_m >= 180.0 or model_id in {"t5-base", "google/flan-t5-base"}):
+            effective_rank = max(effective_rank, RESOURCE_TIERS["heavy"].rank)
+        elif family == "bart" and params_m >= 250.0:
+            effective_rank = max(effective_rank, RESOURCE_TIERS["heavy"].rank)
+
+    return _resource_tier_by_rank(effective_rank)
+
+
 def _target_sample_size(
     *,
     profile: ManifestProfile,
@@ -587,6 +631,16 @@ def _target_sample_size(
 
 
 def _max_samples(dataset_spec: dict[str, Any], target_sample_size: int, resource_tier: ResourceTierSpec, task_key: str) -> int:
+    if _is_smoketest_tier(resource_tier):
+        smoke_mins = {
+            "object_detection": 32,
+            "image_segmentation": 32,
+            "image_captioning": 16,
+            "text_image_retrieval": 16,
+            "visual_question_answering": 16,
+        }
+        dataset_cap = _as_int(dataset_spec.get("max_samples")) or target_sample_size
+        return max(1, min(int(dataset_cap), int(smoke_mins.get(task_key, 8))))
     task_caps = {
         "object_detection": (48, 120, 240, 480),
         "image_segmentation": (48, 96, 192, 384),
@@ -600,6 +654,32 @@ def _max_samples(dataset_spec: dict[str, Any], target_sample_size: int, resource
     dataset_cap = _as_int(dataset_spec.get("max_samples")) or target_sample_size
     requested = min(int(target_sample_size), int(tier_cap))
     return max(1, min(int(dataset_cap), requested))
+
+
+def _model_aware_max_samples(
+    *,
+    dataset_spec: dict[str, Any],
+    model: dict[str, Any],
+    target_sample_size: int,
+    resource_tier: ResourceTierSpec,
+    task_key: str,
+    training_regime: str,
+) -> int:
+    base = _max_samples(dataset_spec, target_sample_size, resource_tier, task_key)
+    if training_regime != "inference_only" or task_key != "text2text_generation":
+        return base
+
+    family = str(model.get("family") or "").strip().lower()
+    model_id = str(model.get("hf_model_id") or "").strip().lower()
+    if model_id in {"t5-base", "google/flan-t5-base"}:
+        return min(base, 384)
+    if family in {"t5", "mt5"}:
+        return min(base, 512)
+    if family == "led" or model_id == "allenai/led-base-16384":
+        return min(base, 320)
+    if family == "bart" and (_estimated_model_params_m(model) or 0.0) >= 250.0:
+        return min(base, 512)
+    return base
 
 
 def _max_length(dataset_spec: dict[str, Any], model: dict[str, Any], resource_tier: ResourceTierSpec, task_key: str) -> int | None:
@@ -864,8 +944,8 @@ def _precision_knobs_for_variant(knob_variant: int) -> tuple[bool, str]:
     enabled = int(knob_variant) % 4 != 3
     if not enabled:
         return False, "fp16"
-    precision_type = "bf16" if int(knob_variant) % 3 != 2 else "fp16"
-    return True, precision_type
+    # ROCm runs in this project have been materially more stable with fp16 than bf16.
+    return True, "fp16"
 
 
 def _task_specific_inference_model(task_key: str, model: dict[str, Any]) -> bool:
@@ -982,7 +1062,7 @@ def _sort_models_for_tier(
         if not any(_quality_allows_model_regime(model, regime) for regime in selected_training_regimes):
             continue
         model_tier = _resource_tier_for_model(model)
-        if _resource_tier_rank(model_tier) > resource_tier.rank:
+        if not _is_smoketest_tier(resource_tier) and _resource_tier_rank(model_tier) > resource_tier.rank:
             continue
         copied = dict(model)
         copied["_model_resource_tier"] = model_tier
@@ -1041,6 +1121,15 @@ def _sort_datasets_for_tier(
         copied["_selection_jitter"] = rng.random()
         eligible.append(copied)
 
+    if _is_smoketest_tier(resource_tier):
+        return sorted(
+            eligible,
+            key=lambda item: (
+                _dataset_cost_score(item, task_key),
+                item["_selection_jitter"],
+            ),
+        )
+
     within_tier = [item for item in eligible if _resource_tier_rank(str(item.get("_dataset_resource_tier"))) <= resource_tier.rank]
     source = within_tier or eligible
     target_rank = min(
@@ -1072,25 +1161,39 @@ def _row_from_registry(
     seed: int,
 ) -> dict[str, Any]:
     defaults = _training_regime_defaults(training_regime)
+    runtime_tier = _model_aware_runtime_tier(
+        task_key=task_key,
+        model=model,
+        dataset_spec=dataset_spec,
+        training_regime=training_regime,
+        resource_tier=resource_tier,
+    )
     knobs = _training_knobs_for_variant(
         task_key=task_key,
         model=model,
         training_regime=training_regime,
         knob_variant=knob_variant,
-        resource_tier=resource_tier,
+        resource_tier=runtime_tier,
     )
-    max_length = _max_length(dataset_spec, model, resource_tier, task_key)
+    max_length = _max_length(dataset_spec, model, runtime_tier, task_key)
     source_max_length = dataset_spec.get("source_max_length")
     target_max_length = dataset_spec.get("target_max_length")
     if task_key == "text2text_generation" and max_length is not None:
         source_max_length = source_max_length or max_length
-        target_max_length = target_max_length or min(max_length, 96 if resource_tier.rank <= 1 else 128)
+        target_max_length = target_max_length or min(max_length, 96 if runtime_tier.rank <= 1 else 128)
     fit_quality_score = _fit_quality_score(task_key, model, dataset_spec, training_regime)
     model_resource_tier = str(model.get("_model_resource_tier") or _resource_tier_for_model(model))
     dataset_resource_tier = str(dataset_spec.get("_dataset_resource_tier") or _resource_tier_for_dataset(dataset_spec, task_key))
     estimated_params_m = model.get("_estimated_params_m") or _estimated_model_params_m(model)
     estimated_params_count = None if estimated_params_m is None else int(float(estimated_params_m) * 1_000_000)
-    max_samples = _max_samples(dataset_spec, target_sample_size, resource_tier, task_key)
+    max_samples = _model_aware_max_samples(
+        dataset_spec=dataset_spec,
+        model=model,
+        target_sample_size=target_sample_size,
+        resource_tier=resource_tier,
+        task_key=task_key,
+        training_regime=training_regime,
+    )
     sample_size = (
         None
         if training_regime == "inference_only"
@@ -1147,9 +1250,9 @@ def _row_from_registry(
         "sample_size": sample_size,
         "max_samples": max_samples,
         "max_length": max_length,
-        "timeout_s": resource_tier.timeout_s,
-        "max_train_time_s": resource_tier.max_train_time_s,
-        "max_eval_time_s": resource_tier.max_eval_time_s,
+        "timeout_s": runtime_tier.timeout_s,
+        "max_train_time_s": runtime_tier.max_train_time_s,
+        "max_eval_time_s": runtime_tier.max_eval_time_s,
         "device": "auto",
         "mixed_precision": knobs["mixed_precision"],
         "precision_type": knobs["precision_type"],
@@ -1391,13 +1494,14 @@ def build_hf_manifest(
     rng = random.Random(seed)
     profile = _resolve_manifest_profile(manifest_profile)
     resolved_resource_tier, resource_tier_explicit = _resolve_resource_tier(resource_tier, profile)
+    smoketest = _is_smoketest_tier(resolved_resource_tier)
     target_sample_size = _target_sample_size(
         profile=profile,
         resource_tier=resolved_resource_tier,
         resource_tier_explicit=resource_tier_explicit,
         avg_sample_size=avg_sample_size,
     )
-    requested_task_keys = task_keys or list(TASK_SPECS) + sorted(GENERIC_MANIFEST_TASK_KEYS)
+    requested_task_keys = task_keys or (list(TASK_SPECS) if smoketest else list(TASK_SPECS) + sorted(GENERIC_MANIFEST_TASK_KEYS))
     selected_training_regimes = training_regimes or ["finetune_transfer"]
     selected_training_regimes = [str(item).strip().lower() for item in selected_training_regimes if str(item).strip()]
 
@@ -1416,7 +1520,8 @@ def build_hf_manifest(
         )
         if max_models_per_family:
             models = _cap_models_per_family(models, int(max_models_per_family))
-        for model in models[: _normalise_positive_int(models_per_task)]:
+        model_limit = len(models) if smoketest else _normalise_positive_int(models_per_task)
+        for model in models[:model_limit]:
             for training_regime in selected_training_regimes:
                 if not _quality_allows_model_regime(model, training_regime):
                     continue
@@ -1438,7 +1543,8 @@ def build_hf_manifest(
                     resource_tier=resolved_resource_tier,
                     rng=rng,
                 )
-                for dataset in datasets[: _normalise_positive_int(datasets_per_model)]:
+                dataset_limit = len(datasets) if smoketest else _normalise_positive_int(datasets_per_model)
+                for dataset in datasets[:dataset_limit]:
                     for dataset_variant in range(_normalise_positive_int(dataset_variants_per_pair)):
                         for split_variant in range(_normalise_positive_int(split_variants_per_pair)):
                             effective_knob_variants = (
@@ -1524,7 +1630,7 @@ def main() -> None:
     parser.add_argument("--knob-variants-per-pair", type=int, default=1)
     parser.add_argument("--total-services", type=int)
     parser.add_argument("--manifest-profile", choices=sorted(MANIFEST_PROFILES), default="balanced")
-    parser.add_argument("--resource-tier", choices=sorted(RESOURCE_TIERS), help="Workload budget: light, medium, heavy, or stress_test. Defaults from --manifest-profile.")
+    parser.add_argument("--resource-tier", choices=sorted(RESOURCE_TIERS), help="Workload budget: smoketest, light, medium, heavy, or stress_test. Defaults from --manifest-profile.")
     parser.add_argument("--avg-sample-size", type=int)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()

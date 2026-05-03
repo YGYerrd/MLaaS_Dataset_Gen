@@ -111,6 +111,21 @@ class HFCore:
         return True
 
     @staticmethod
+    def _tensor_to_numpy(value, *, dtype=None):
+        if hasattr(value, "detach"):
+            value = value.detach()
+        tensor_dtype = str(getattr(value, "dtype", "")).lower()
+        if "bfloat16" in tensor_dtype and hasattr(value, "float"):
+            value = value.float()
+        if hasattr(value, "cpu"):
+            value = value.cpu()
+        if hasattr(value, "numpy"):
+            arr = value.numpy()
+        else:
+            arr = np.asarray(value)
+        return np.asarray(arr, dtype=dtype) if dtype is not None else np.asarray(arr)
+
+    @staticmethod
     def _normalize_precision_type(value):
         text = str(value or "fp16").strip().lower()
         return "bf16" if text == "bf16" else "fp16"
@@ -438,6 +453,8 @@ class HFCore:
             for i in range(0, n, bs):
                 xb = {k: v[i:i + bs] for k, v in xs.items()}
                 yb = None if ys is None else ys[i:i + bs]
+                xb = self._trim_batch_sequence_padding(xb)
+                yb = self._trim_label_padding(yb)
                 yield xb, yb
             return
 
@@ -447,23 +464,69 @@ class HFCore:
             yb = None if ys is None else ys[i:i + bs]
             yield xb, yb
 
+    @staticmethod
+    def _active_column_span(mask, *, inactive_value=0):
+        if not isinstance(mask, np.ndarray) or mask.ndim != 2 or mask.shape[1] == 0:
+            return None
+        active_cols = np.any(mask != inactive_value, axis=0)
+        active_idx = np.flatnonzero(active_cols)
+        if active_idx.size == 0:
+            return None
+        return int(active_idx[0]), int(active_idx[-1]) + 1
+
+    def _trim_batch_sequence_padding(self, xb):
+        if not isinstance(xb, dict):
+            return xb
+        attention_mask = xb.get("attention_mask")
+        span = self._active_column_span(attention_mask, inactive_value=0)
+        if span is None:
+            return xb
+        start, end = span
+        width = int(np.asarray(attention_mask).shape[1])
+        if start == 0 and end == width:
+            return xb
+
+        trimmed = {}
+        for key, value in xb.items():
+            if (
+                isinstance(value, np.ndarray)
+                and value.ndim >= 2
+                and value.shape[0] == attention_mask.shape[0]
+                and value.shape[1] == attention_mask.shape[1]
+            ):
+                trimmed[key] = value[:, start:end]
+            else:
+                trimmed[key] = value
+        return trimmed
+
+    def _trim_label_padding(self, yb):
+        if not isinstance(yb, np.ndarray) or yb.ndim < 2 or yb.shape[1] == 0:
+            return yb
+        span = self._active_column_span(yb, inactive_value=self.label_pad_value)
+        if span is None:
+            return yb
+        start, end = span
+        if start == 0 and end == int(yb.shape[1]):
+            return yb
+        return yb[:, start:end]
+
     def _labels_to_numpy(self, labels_t):
         if labels_t is None:
             return None
         if hasattr(labels_t, "detach"):
-            return labels_t.detach().cpu().numpy()
+            return self._tensor_to_numpy(labels_t)
         if isinstance(labels_t, (list, tuple)):
             converted = []
             for item in labels_t:
                 if isinstance(item, dict):
                     converted.append(
                         {
-                            k: (v.detach().cpu().numpy() if hasattr(v, "detach") else np.asarray(v))
+                            k: (self._tensor_to_numpy(v) if hasattr(v, "detach") else np.asarray(v))
                             for k, v in item.items()
                         }
                     )
                 else:
-                    converted.append(item.detach().cpu().numpy() if hasattr(item, "detach") else np.asarray(item))
+                    converted.append(self._tensor_to_numpy(item) if hasattr(item, "detach") else np.asarray(item))
             return np.asarray(converted, dtype=object)
         return np.asarray(labels_t)
 
@@ -660,7 +723,7 @@ class HFCore:
         sd = self.model.state_dict()
         out = {}
         for k, v in sd.items():
-            out[k] = v.detach().cpu().numpy()
+            out[k] = self._tensor_to_numpy(v)
         return out
 
     def set_weights(self, weights_dict):
@@ -1085,7 +1148,7 @@ class HFCore:
                     if not first_batch_logged:
                         print("[HFCore.eval] first batch forward ends")
                     if hasattr(pred_t, "detach"):
-                        preds_all.append(pred_t.detach().cpu().numpy())
+                        preds_all.append(self._tensor_to_numpy(pred_t))
                     else:
                         preds_all.append(np.asarray(pred_t, dtype=object))
 
@@ -1135,7 +1198,7 @@ class HFCore:
                     if not first_batch_logged:
                         print("[HFCore.eval] first batch forward ends")
                     if hasattr(pred_t, "detach"):
-                        preds_all.append(pred_t.detach().cpu().numpy())
+                        preds_all.append(self._tensor_to_numpy(pred_t))
                     else:
                         preds_all.append(np.asarray(pred_t, dtype=object))
                     

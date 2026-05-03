@@ -125,6 +125,46 @@ def _resize_chw_float32(chw, target_hw):
     return np.stack(channels, axis=0).astype(np.float32, copy=False)
 
 
+def _normalize_multimodal_pixel_array(pixel_values, *, target_hw=None):
+    arr = np.asarray(pixel_values, dtype=np.float32)
+    while arr.ndim > 3 and arr.shape[0] == 1:
+        arr = arr[0]
+    if arr.ndim == 3 and arr.shape[0] != 3 and arr.shape[-1] == 3:
+        arr = np.transpose(arr, (2, 0, 1))
+    if arr.ndim != 3 or arr.shape[0] != 3:
+        raise ValueError(
+            f"Multimodal image encoding must produce CHW with 3 channels, got shape={arr.shape}"
+        )
+    return _resize_chw_float32(arr, target_hw).astype(np.float32, copy=False)
+
+
+def _stack_multimodal_pixel_values(pixel_values, *, target_hw=None):
+    if not pixel_values:
+        return np.zeros((0, 3, 0, 0), dtype=np.float32)
+
+    resolved_target_hw = target_hw
+    if resolved_target_hw is None:
+        shape_counts = Counter(
+            tuple(np.asarray(pix, dtype=np.float32).shape[-2:])
+            for pix in pixel_values
+            if np.asarray(pix).ndim >= 3
+        )
+        if shape_counts:
+            resolved_target_hw = shape_counts.most_common(1)[0][0]
+
+    normalized = [
+        _normalize_multimodal_pixel_array(pix, target_hw=resolved_target_hw)
+        for pix in pixel_values
+    ]
+    shapes = {tuple(arr.shape) for arr in normalized}
+    if len(shapes) != 1:
+        raise ValueError(
+            "Multimodal pixel stack remains ragged after normalization: "
+            + ", ".join(str(shape) for shape in sorted(shapes))
+        )
+    return np.stack(normalized, axis=0).astype(np.float32, copy=False)
+
+
 def _pick_answer_text(values):
     cleaned = [str(v).strip() for v in values if v is not None and str(v).strip()]
     if not cleaned:
@@ -458,22 +498,13 @@ def _encode_split(
 
             ids = np.asarray(text_enc["input_ids"], dtype=np.int64)
             mask = np.asarray(text_enc["attention_mask"], dtype=np.int64)
-            pix = np.asarray(image_enc.get("pixel_values", image_enc), dtype=np.float32)
+            pix = image_enc.get("pixel_values", image_enc)
 
             if ids.ndim == 2:
                 ids = ids[0]
             if mask.ndim == 2:
                 mask = mask[0]
-            while pix.ndim > 3 and pix.shape[0] == 1:
-                pix = pix[0]
-            if pix.ndim == 3 and pix.shape[0] != 3 and pix.shape[-1] == 3:
-                pix = np.transpose(pix, (2, 0, 1))
-
-            if pix.ndim != 3 or pix.shape[0] != 3:
-                raise ValueError(
-                    f"Multimodal image encoding must produce CHW with 3 channels, got shape={pix.shape}"
-                )
-            pix = _resize_chw_float32(pix, image_target_hw)
+            pix = _normalize_multimodal_pixel_array(pix, target_hw=image_target_hw)
 
             row_label = None
             if hf_task == "image_captioning":
@@ -525,7 +556,7 @@ def _encode_split(
     x = {
         "input_ids": np.asarray(input_ids, dtype=np.int64),
         "attention_mask": np.asarray(attention_masks, dtype=np.int64),
-        "pixel_values": np.asarray(pixel_values, dtype=np.float32),
+        "pixel_values": _stack_multimodal_pixel_values(pixel_values, target_hw=image_target_hw),
     }
     if hf_task == "text_image_retrieval":
         x["caption_lengths"] = np.asarray(caption_lengths, dtype=np.int64)
