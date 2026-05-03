@@ -10,7 +10,7 @@ DEFAULT_MANIFEST_PATH = BASE_OUTPUT_DIR / "service_manifest.xlsx"
 MANIFEST_RESULTS_PATH = BASE_OUTPUT_DIR / "service_manifest_results.csv"
 FAILURE_LOG_PATH = BASE_OUTPUT_DIR / "service_failures.log"
 
-SQL_DB_PATH = Path(os.getenv("MLAAS_SQL_DB_PATH") or os.getenv("MLAAS_DB_PATH") or BASE_OUTPUT_DIR / "services.db")
+SQL_DB_PATH = Path(os.getenv("MLAAS_SQL_DB_PATH") or os.getenv("MLAAS_DB_PATH") or BASE_OUTPUT_DIR / "servicesTest.db")
 
 CONFIG = {
     "db_path": str(SQL_DB_PATH),
@@ -23,6 +23,8 @@ CONFIG = {
     "momentum": 0.0,
     "warmup_ratio": 0.0,
     "gradient_accumulation_steps": 1,
+    "mixed_precision": False,
+    "precision_type": "fp16",
     "sample_seed": None,
     "hidden_layers": [64],
     "activation": "relu",

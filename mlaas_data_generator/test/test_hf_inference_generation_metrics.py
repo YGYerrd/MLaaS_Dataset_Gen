@@ -76,15 +76,38 @@ class AlwaysOverflowTokenizer(DummyTokenizer):
         raise OverflowError("out of range integral type conversion attempted")
 
 
+class EosPromptTokenizer(DummyTokenizer):
+    def __call__(self, texts=None, text_target=None, truncation=True, padding=False, max_length=8, add_special_tokens=True, **kwargs):
+        seqs = text_target if text_target is not None else texts
+        if isinstance(seqs, str):
+            seqs = [seqs]
+        ids = []
+        masks = []
+        for idx, _ in enumerate(seqs):
+            token_ids = [10 + idx, 20 + idx]
+            if text_target is None and add_special_tokens:
+                token_ids.append(self.eos_token_id)
+            ids.append(token_ids[: int(max_length)])
+            masks.append([1] * len(ids[-1]))
+        out = {"input_ids": ids}
+        if kwargs.get("return_attention_mask", True):
+            out["attention_mask"] = masks
+        return out
+
+
 class DummyGenerationModel:
     def __init__(self):
         self.forward_calls = 0
-        self.config = type("Cfg", (), {"is_encoder_decoder": False})()
+        self.generate_use_cache_values = []
+        self.gradient_checkpointing_disable_calls = 0
+        self.gradient_checkpointing_enable_calls = 0
+        self.config = type("Cfg", (), {"is_encoder_decoder": False, "use_cache": False})()
 
     def eval(self):
         return self
 
     def generate(self, **kwargs):
+        self.generate_use_cache_values.append(bool(getattr(self.config, "use_cache", None)))
         batch = kwargs["input_ids"].numpy()
         generated = []
         for row in batch:
@@ -93,6 +116,12 @@ class DummyGenerationModel:
         max_len = max(len(row) for row in generated)
         padded = [row + [0] * (max_len - len(row)) for row in generated]
         return FakeTensor(np.asarray(padded, dtype=np.int64))
+
+    def gradient_checkpointing_disable(self):
+        self.gradient_checkpointing_disable_calls += 1
+
+    def gradient_checkpointing_enable(self):
+        self.gradient_checkpointing_enable_calls += 1
 
     def __call__(self, **kwargs):
         self.forward_calls += 1
@@ -247,6 +276,7 @@ def _make_generation_probe_core():
     core.model_load_s = 0.0
     core.tokenizer_cache_hit = True
     core.model_cache_hit = True
+    core.gradient_checkpointing_enabled = True
     return core
 
 
@@ -293,6 +323,7 @@ def test_hfcore_eval_inference_only_generation_uses_teacher_forced_labels_for_me
     core.model_load_s = 0.0
     core.tokenizer_cache_hit = True
     core.model_cache_hit = True
+    core.gradient_checkpointing_enabled = True
 
     xs = {
         "input_ids": np.asarray([[5, 6], [7, 8]], dtype=np.int64),
@@ -308,6 +339,11 @@ def test_hfcore_eval_inference_only_generation_uses_teacher_forced_labels_for_me
     assert qos["eval_supervised_token_count"] == 4
     assert qos["tokens_total"] == 4
     assert core.model.forward_calls == 1
+    assert core.model.generate_use_cache_values == [True]
+    assert core.model.gradient_checkpointing_disable_calls == 1
+    assert core.model.gradient_checkpointing_enable_calls == 1
+    assert core.model.config.use_cache is False
+    assert core.gradient_checkpointing_enabled is True
     assert core.tokenizer.padding_side == "left"
 
 
@@ -517,6 +553,50 @@ def test_causal_lm_encode_batch_left_pads_dict_labels_with_inputs():
     assert labels_t.numpy().tolist() == [[-100, -100, 10, 11], [-100, 20, 21, 22]]
 
 
+def test_causal_lm_inference_only_prompt_extraction_keeps_left_padding_for_mixed_prompt_lengths():
+    spec = CausalLMGenerationSpec()
+    fake_torch = FakeTorch()
+    tok = DummyTokenizer()
+    xb = {
+        "input_ids": np.asarray([[11, 21, 22, 99], [31, 32, 41, 99]], dtype=np.int64),
+        "attention_mask": np.asarray([[1, 1, 1, 1], [1, 1, 1, 1]], dtype=np.int64),
+    }
+    yb = np.asarray([[-100, 21, 22, 99], [-100, -100, 41, 99]], dtype=np.int64)
+
+    enc, labels_t, _ = spec.encode_batch(
+        tok,
+        xb,
+        yb,
+        max_length=4,
+        torch=fake_torch,
+        device="cpu",
+        inference_only=True,
+    )
+
+    assert enc["input_ids"].numpy().tolist() == [[0, 11], [31, 32]]
+    assert enc["attention_mask"].numpy().tolist() == [[0, 1], [1, 1]]
+    assert labels_t.numpy().tolist() == yb.tolist()
+
+
+def test_causal_lm_encode_batch_strips_trailing_prompt_eos_before_appending_target():
+    spec = CausalLMGenerationSpec()
+    fake_torch = FakeTorch()
+    tok = EosPromptTokenizer()
+
+    enc, labels_t, _ = spec.encode_batch(
+        tok,
+        ["prompt one"],
+        ["target one"],
+        max_length=8,
+        torch=fake_torch,
+        device="cpu",
+        inference_only=False,
+    )
+
+    assert enc["input_ids"].numpy().tolist() == [[10, 20, 10, 20, 99, 0, 0, 0]]
+    assert labels_t.numpy().tolist() == [[-100, -100, 10, 20, 99, -100, -100, -100]]
+
+
 def test_hfcore_eval_inference_only_non_generation_uses_label_stats_for_metrics():
     core = HFCore.__new__(HFCore)
     core.torch = FakeTorch()
@@ -645,3 +725,69 @@ def test_hfcore_eval_clip_retrieval_r5_uses_full_eval_candidate_pool():
     assert np.isclose(secondary, 5 / 6)
     assert np.isclose(qos["r@5"], 5 / 6)
     assert np.isclose(qos["metric_stat_candidate_count"], 6.0)
+
+
+def test_hfcore_configure_precision_mode_disables_mixed_precision_on_cpu():
+    core = HFCore.__new__(HFCore)
+    core.torch = type("Torch", (), {"float16": object(), "bfloat16": object(), "cuda": type("Cuda", (), {"is_bf16_supported": staticmethod(lambda: True)})()})()
+    core.device = "cpu"
+    core.mixed_precision = True
+    core.precision_type = "bf16"
+    core._configure_precision_mode()
+
+    assert core.autocast_enabled is False
+    assert core.effective_mixed_precision is False
+    assert core.effective_precision_type == "fp32"
+    assert core.precision_fallback_reason == "mixed_precision_requires_cuda"
+
+
+def test_hfcore_configure_precision_mode_enables_bf16_on_supported_cuda():
+    class TorchStub:
+        float16 = object()
+        bfloat16 = object()
+        class cuda:
+            @staticmethod
+            def is_bf16_supported():
+                return True
+        class amp:
+            @staticmethod
+            def GradScaler(device_type):
+                raise AssertionError("bf16 should not create a GradScaler")
+
+    core = HFCore.__new__(HFCore)
+    core.torch = TorchStub()
+    core.device = "cuda"
+    core.mixed_precision = True
+    core.precision_type = "bf16"
+    core._configure_precision_mode()
+
+    assert core.autocast_enabled is True
+    assert core.effective_mixed_precision is True
+    assert core.effective_precision_type == "bf16"
+    assert core.grad_scaler is None
+
+
+def test_hfcore_precision_runtime_falls_back_to_fp32():
+    core = HFCore.__new__(HFCore)
+    core.autocast_enabled = True
+    core.requested_precision_type = "bf16"
+    core.effective_mixed_precision = True
+    core.effective_precision_type = "bf16"
+    core.grad_scaler = object()
+    core.precision_fallback_reason = None
+    core._make_autocast_context = contextlib.nullcontext
+
+    calls = {"count": 0}
+
+    def flaky_forward():
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise RuntimeError("bfloat16 unsupported kernel")
+        return "ok"
+
+    assert core._run_with_precision_context(flaky_forward) == "ok"
+    assert calls["count"] == 2
+    assert core.autocast_enabled is False
+    assert core.effective_mixed_precision is False
+    assert core.effective_precision_type == "fp32"
+    assert core.precision_fallback_reason == "runtime_unsupported_bf16"

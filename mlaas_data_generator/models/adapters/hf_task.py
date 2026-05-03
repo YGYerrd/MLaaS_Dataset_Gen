@@ -167,6 +167,14 @@ def _decode_token_id_batch(tokenizer, values, *, ignore_index=-100):
         return None
 
 
+def _strip_trailing_eos_token(tokenizer, token_ids):
+    eos_id = getattr(tokenizer, "eos_token_id", None)
+    trimmed = list(token_ids)
+    if eos_id is not None and trimmed and int(trimmed[-1]) == int(eos_id):
+        trimmed = trimmed[:-1]
+    return trimmed
+
+
 def _pearson_correlation(y_true, y_pred):
     if y_true.size <= 1 or y_pred.size <= 1:
         return np.nan
@@ -1800,6 +1808,7 @@ class CausalLMGenerationSpec(HFTaskSpec):
         if isinstance(xb, dict):
             batch = {k: v for k, v in xb.items() if k in {"input_ids", "attention_mask", "token_type_ids"}}
             labels_np = None if yb is None else np.asarray(yb)
+            prompt_only_left_padded = False
             if inference_only and labels_np is not None and "input_ids" in batch and "attention_mask" in batch:
                 input_ids = np.asarray(batch["input_ids"])
                 attention_mask = np.asarray(batch["attention_mask"])
@@ -1835,14 +1844,16 @@ class CausalLMGenerationSpec(HFTaskSpec):
                         padded_mask.append(([0] * pad_len) + list(row_mask))
                     batch["input_ids"] = np.asarray(padded_ids, dtype=input_ids.dtype)
                     batch["attention_mask"] = np.asarray(padded_mask, dtype=attention_mask.dtype)
+                    prompt_only_left_padded = True
             if "input_ids" in batch and "attention_mask" in batch:
-                if labels_np is not None and labels_np.shape == np.asarray(batch["input_ids"]).shape:
+                if (not prompt_only_left_padded) and labels_np is not None and labels_np.shape == np.asarray(batch["input_ids"]).shape:
                     labels_np = self._left_pad_labels(labels_np, batch["attention_mask"], ignore_index)
-                batch["input_ids"], batch["attention_mask"] = self._left_pad_batch(
-                    tokenizer,
-                    batch["input_ids"],
-                    batch["attention_mask"],
-                )
+                if not prompt_only_left_padded:
+                    batch["input_ids"], batch["attention_mask"] = self._left_pad_batch(
+                        tokenizer,
+                        batch["input_ids"],
+                        batch["attention_mask"],
+                    )
             enc = {k: _to_torch_tensor(torch, v, dtype=torch.long, device=device) for k, v in batch.items()}
             labels_t = None if labels_np is None else _to_torch_tensor(torch, labels_np, dtype=torch.long, device=device)
             return enc, labels_t, {"ignore_index": int(ignore_index)}
@@ -1860,8 +1871,9 @@ class CausalLMGenerationSpec(HFTaskSpec):
 
         batch_ids, batch_masks, batch_labels = [], [], []
         for p_ids, t_ids in zip(prompt_tokens["input_ids"], target_tokens["input_ids"]):
-            full_ids = (p_ids + t_ids + [eos_id])[: int(max_length)]
-            full_labels = ([-100] * len(p_ids) + t_ids + [eos_id])[: int(max_length)]
+            prompt_ids = _strip_trailing_eos_token(tokenizer, p_ids)
+            full_ids = (prompt_ids + list(t_ids) + [eos_id])[: int(max_length)]
+            full_labels = ([-100] * len(prompt_ids) + list(t_ids) + [eos_id])[: int(max_length)]
             pad_len = int(max_length) - len(full_ids)
             batch_ids.append(full_ids + [pad_id] * pad_len)
             batch_masks.append([1] * len(full_ids) + [0] * pad_len)

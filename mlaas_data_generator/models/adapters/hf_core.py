@@ -24,6 +24,7 @@ class HFCore:
         batch_size=16,
         device=None,
         mixed_precision=None,
+        precision_type="fp16",
         task_spec=None,
         label_pad_value=-100,
         generation_config=None,
@@ -49,7 +50,10 @@ class HFCore:
         self.max_length_adjusted = False
         self.batch_size = int(batch_size)
         self.label_pad_value = int(label_pad_value)
-        self.mixed_precision = mixed_precision
+        self.mixed_precision = bool(mixed_precision)
+        self.precision_type = self._normalize_precision_type(precision_type)
+        self.requested_mixed_precision = bool(mixed_precision)
+        self.requested_precision_type = self.precision_type
 
         self.device = self._resolve_device(device)
 
@@ -76,6 +80,9 @@ class HFCore:
         self.autocast_enabled = False
         self.autocast_dtype = None
         self.grad_scaler = None
+        self.effective_mixed_precision = False
+        self.effective_precision_type = "fp32"
+        self.precision_fallback_reason = None
         self.gradient_checkpointing_enabled = False
         needs_num_labels = bool(getattr(self.task_spec, "requires_num_labels", True))
         if num_labels is not None or not needs_num_labels:
@@ -101,14 +108,70 @@ class HFCore:
             return False
         if self.mixed_precision is False:
             return False
-        return self._task_name() in {
-            "image_classification",
-            "image_detection",
-            "image_segmentation",
-            "image_captioning",
-            "text_image_retrieval",
-            "visual_question_answering",
-        }
+        return True
+
+    @staticmethod
+    def _normalize_precision_type(value):
+        text = str(value or "fp16").strip().lower()
+        return "bf16" if text == "bf16" else "fp16"
+
+    def _cuda_bf16_supported(self):
+        cuda = getattr(self.torch, "cuda", None)
+        probe = getattr(cuda, "is_bf16_supported", None)
+        if callable(probe):
+            try:
+                return bool(probe())
+            except Exception:
+                return False
+        return False
+
+    def _disable_mixed_precision(self, reason):
+        self.autocast_enabled = False
+        self.autocast_dtype = None
+        self.grad_scaler = None
+        self.effective_mixed_precision = False
+        self.effective_precision_type = "fp32"
+        self.precision_fallback_reason = str(reason) if reason else None
+
+    def _configure_precision_mode(self):
+        self.requested_mixed_precision = bool(self.mixed_precision)
+        self.requested_precision_type = self._normalize_precision_type(getattr(self, "precision_type", "fp16"))
+        self.precision_type = self.requested_precision_type
+        self._disable_mixed_precision(None)
+        if not self._should_enable_mixed_precision():
+            if self.requested_mixed_precision and self._device_type() != "cuda":
+                self.precision_fallback_reason = "mixed_precision_requires_cuda"
+            return
+
+        dtype_name = self.requested_precision_type
+        if dtype_name == "bf16":
+            dtype = getattr(self.torch, "bfloat16", None)
+            if dtype is None or not self._cuda_bf16_supported():
+                self._disable_mixed_precision("bf16_unsupported_fallback_fp32")
+                return
+        else:
+            dtype = getattr(self.torch, "float16", None)
+            if dtype is None:
+                self._disable_mixed_precision("fp16_unsupported_fallback_fp32")
+                return
+
+        self.autocast_dtype = dtype
+        self.autocast_enabled = True
+        self.effective_mixed_precision = True
+        self.effective_precision_type = dtype_name
+        if dtype_name == "fp16":
+            try:
+                self.grad_scaler = self.torch.amp.GradScaler("cuda")
+            except Exception:
+                try:
+                    self.grad_scaler = self.torch.cuda.amp.GradScaler()
+                except Exception:
+                    self.grad_scaler = None
+
+    def _precision_retryable_exception(self, exc):
+        text = f"{type(exc).__name__}: {exc}".lower()
+        markers = ("bfloat16", "float16", "half", "autocast", "amp", "unsupported", "not implemented", "dtype")
+        return any(marker in text for marker in markers)
 
     def _should_enable_gradient_checkpointing(self):
         return self._task_name() in {
@@ -126,9 +189,21 @@ class HFCore:
             return contextlib.nullcontext()
         torch = self.torch
         try:
-            return torch.autocast(device_type="cuda", dtype=getattr(self, "autocast_dtype", None))
+            return torch.autocast(device_type="cuda", dtype=getattr(self, "autocast_dtype", None), enabled=True)
         except Exception:
             return contextlib.nullcontext()
+
+    def _run_with_precision_context(self, fn):
+        if not getattr(self, "autocast_enabled", False):
+            return fn()
+        try:
+            with self._make_autocast_context():
+                return fn()
+        except Exception as exc:
+            if not self._precision_retryable_exception(exc):
+                raise
+            self._disable_mixed_precision(f"runtime_unsupported_{self.requested_precision_type}")
+            return fn()
 
     def _configure_memory_optimizations(self):
         if self.model is None:
@@ -155,17 +230,50 @@ class HFCore:
             except Exception:
                 self.gradient_checkpointing_enabled = False
 
-        if self._should_enable_mixed_precision():
-            self.autocast_dtype = getattr(self.torch, "float16", None)
-            self.autocast_enabled = self.autocast_dtype is not None
-            if self.autocast_enabled:
+        self._configure_precision_mode()
+
+    @contextlib.contextmanager
+    def _generation_inference_mode(self):
+        model = getattr(self, "model", None)
+        if model is None:
+            yield
+            return
+
+        cfg = getattr(model, "config", None)
+        prev_use_cache = None
+        had_use_cache = False
+        if cfg is not None and hasattr(cfg, "use_cache"):
+            had_use_cache = True
+            prev_use_cache = getattr(cfg, "use_cache", None)
+            try:
+                cfg.use_cache = True
+            except Exception:
+                had_use_cache = False
+
+        grad_ckpt_disable_called = False
+        grad_ckpt_prev = bool(getattr(self, "gradient_checkpointing_enabled", False))
+        if grad_ckpt_prev and hasattr(model, "gradient_checkpointing_disable"):
+            try:
+                model.gradient_checkpointing_disable()
+                self.gradient_checkpointing_enabled = False
+                grad_ckpt_disable_called = True
+            except Exception:
+                grad_ckpt_disable_called = False
+
+        try:
+            yield
+        finally:
+            if had_use_cache:
                 try:
-                    self.grad_scaler = self.torch.amp.GradScaler("cuda")
+                    cfg.use_cache = prev_use_cache
                 except Exception:
-                    try:
-                        self.grad_scaler = self.torch.cuda.amp.GradScaler()
-                    except Exception:
-                        self.grad_scaler = None
+                    pass
+            if grad_ckpt_disable_called and hasattr(model, "gradient_checkpointing_enable"):
+                try:
+                    model.gradient_checkpointing_enable()
+                    self.gradient_checkpointing_enabled = grad_ckpt_prev
+                except Exception:
+                    pass
 
     def _release_step_memory(self):
         if self._device_type() != "cuda":
@@ -182,6 +290,11 @@ class HFCore:
             "cold_start_time": float(self.tokenizer_load_s + self.model_load_s),
             "tokenizer_cache_hit": bool(self.tokenizer_cache_hit),
             "model_cache_hit": bool(self.model_cache_hit),
+            "mixed_precision_requested": bool(getattr(self, "requested_mixed_precision", False)),
+            "precision_type_requested": str(getattr(self, "requested_precision_type", "fp16")),
+            "mixed_precision_effective": bool(getattr(self, "effective_mixed_precision", False)),
+            "precision_type_effective": str(getattr(self, "effective_precision_type", "fp32")),
+            "precision_fallback_reason": getattr(self, "precision_fallback_reason", None),
         }
 
     @staticmethod
@@ -720,10 +833,12 @@ class HFCore:
                 if not first_batch_logged:
                     print("[HFCore.finetune] model forward starts")
                 try:
-                    with self._make_autocast_context():
+                    def _forward():
                         outputs = self.model(**model_inputs)
                         logits = self._extract_logits(outputs)
-                        loss = self.task_spec.extract_loss(torch, outputs, logits, labels_t, extra)
+                        return outputs, logits, self.task_spec.extract_loss(torch, outputs, logits, labels_t, extra)
+
+                    outputs, logits, loss = self._run_with_precision_context(_forward)
                 except Exception as exc:
                     if not first_batch_logged:
                         print(
@@ -955,14 +1070,18 @@ class HFCore:
                     self._ensure_left_padding_for_decoder_only_generation()
                     if not first_batch_logged:
                         print("[HFCore.eval] model forward starts")
-                    with self._make_autocast_context():
-                        pred_t = self.task_spec.generate_predictions(
-                            self.model,
-                            enc,
-                            self.tokenizer,
-                            torch,
-                            self.generation_config,
-                        )
+                    with self._generation_inference_mode():
+                        def _generate():
+                            pred_t = self.task_spec.generate_predictions(
+                                self.model,
+                                enc,
+                                self.tokenizer,
+                                torch,
+                                self.generation_config,
+                            )
+                            return pred_t
+
+                        pred_t = self._run_with_precision_context(_generate)
                     if not first_batch_logged:
                         print("[HFCore.eval] first batch forward ends")
                     if hasattr(pred_t, "detach"):
@@ -977,9 +1096,12 @@ class HFCore:
                             labels_t=teacher_labels_t,
                             inference_only=False,
                         )
-                        with self._make_autocast_context():
+                        def _teacher_forward():
                             outputs = self.model(**teacher_inputs)
                             logits = self._extract_logits(outputs)
+                            return outputs, logits
+
+                        outputs, logits = self._run_with_precision_context(_teacher_forward)
                         stat = self.task_spec.batch_metric_statistics(torch, logits, teacher_labels_t, teacher_extra)
                         if stat:
                             stats_accum = self._accumulate_metric_statistics(stats_accum, stat)
@@ -1003,10 +1125,13 @@ class HFCore:
                     model_inputs = self.task_spec.build_forward_inputs(enc, labels_t=labels_t, inference_only=bool(inference_only))
                     if not first_batch_logged:
                         print("[HFCore.eval] model forward starts")
-                    with self._make_autocast_context():
+                    def _eval_forward():
                         outputs = self.model(**model_inputs)
                         logits = self._extract_logits(outputs)
                         pred_t = self.task_spec.preds_from_logits(torch, logits, extra)
+                        return outputs, logits, pred_t
+
+                    outputs, logits, pred_t = self._run_with_precision_context(_eval_forward)
                     if not first_batch_logged:
                         print("[HFCore.eval] first batch forward ends")
                     if hasattr(pred_t, "detach"):

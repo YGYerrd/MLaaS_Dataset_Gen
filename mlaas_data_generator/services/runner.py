@@ -257,6 +257,8 @@ class ServiceRunner:
         runtime_total_s = time.perf_counter() - service_start
         perf_metrics = _performance_alias_metrics(
             eval_qos=eval_qos,
+            train_metrics=train_metrics,
+            training_regime=training_regime,
             train_runtime_s=train_runtime_s,
             eval_runtime_s=eval_runtime_s,
             runtime_total_s=runtime_total_s,
@@ -317,6 +319,8 @@ class ServiceRunner:
             "learning_rate": _metric(_to_float(self.config.get("learning_rate")), "metadata", None, "neutral"),
             "epochs": _metric(_safe_int(self.config.get("training_epochs", self.config.get("epochs"))), "metadata", None, "neutral"),
             "device": _metric(resolved_device, "metadata"),
+            "mixed_precision": _metric(bool(self.config.get("mixed_precision")), "metadata"),
+            "precision_type": _metric(str(self.config.get("precision_type") or "fp16").strip().lower(), "metadata"),
             "gpu_requested_cpu_fallback_flag": _metric(bool(gpu_fallback_warning), "reliability", direction="lower_better"),
         }
         if gpu_fallback_warning:
@@ -604,6 +608,8 @@ class ServiceRunner:
             "learning rate": self.config.get("learning_rate"),
             "epochs": self.config.get("training_epochs", self.config.get("epochs")),
             "device": resolved_device,
+            "mixed_precision": self.config.get("mixed_precision"),
+            "precision_type": self.config.get("precision_type"),
             "save_weights": _config_bool(self.config.get("save_weights"), False),
             "explainability_enabled": _config_bool(
                 self.config.get("enable_perturbation_metrics", self.config.get("explainability_enabled")),
@@ -631,6 +637,7 @@ class ServiceRunner:
             max_length=self.config.get("max_length"),
             device=_device_arg_for_model(self.config.get("device")),
             mixed_precision=self.config.get("mixed_precision"),
+            precision_type=self.config.get("precision_type"),
             batch_size=int(self.config.get("batch_size", 16) or 16),
             task_tag=self.config.get("task_tag"),
             clustering_k=self.config.get("clustering_k"),
@@ -784,6 +791,22 @@ def _apply_runtime_knobs_to_model(model: Any, config: Mapping[str, Any]) -> None
         if max_length is not None and hasattr(candidate, "max_length"):
             try:
                 setattr(candidate, "max_length", int(max_length))
+            except Exception:
+                pass
+        if hasattr(candidate, "mixed_precision"):
+            try:
+                setattr(candidate, "mixed_precision", bool(config.get("mixed_precision")))
+            except Exception:
+                pass
+        if hasattr(candidate, "precision_type"):
+            try:
+                setattr(candidate, "precision_type", str(config.get("precision_type") or "fp16").strip().lower())
+            except Exception:
+                pass
+        reconfigure = getattr(candidate, "_configure_precision_mode", None)
+        if callable(reconfigure):
+            try:
+                reconfigure()
             except Exception:
                 pass
 
@@ -1234,6 +1257,8 @@ def _hf_metadata_metrics(metadata: Mapping[str, Any]) -> dict[str, Any]:
 def _performance_alias_metrics(
     *,
     eval_qos: Mapping[str, Any],
+    train_metrics: Mapping[str, Any],
+    training_regime: str,
     train_runtime_s: float,
     eval_runtime_s: float,
     runtime_total_s: float,
@@ -1262,6 +1287,12 @@ def _performance_alias_metrics(
     throughput = _first_number(eval_qos, "throughput", "throughput_samples_s", "throughput_eps", "eval_throughput_eps", "examples_per_second")
     if throughput is None and benchmark_samples > 0 and eval_runtime_s > 0:
         throughput = float(benchmark_samples) / float(eval_runtime_s)
+    avg_batch_time_ms = _first_number(
+        train_metrics if str(training_regime).strip().lower() not in {"inference_only", "inference"} else eval_qos,
+        "train_step_latency_ms_mean",
+        "eval_latency_ms_mean",
+        "inference_latency_ms_mean",
+    )
 
     compute_time_s = float(train_runtime_s or 0.0) + float(eval_runtime_s or 0.0)
     return {
@@ -1271,6 +1302,7 @@ def _performance_alias_metrics(
         "inference_latency_s_p95": _metric(tail_latency, "latency", "s", "lower_better"),
         "throughput": _metric(throughput, "runtime", "samples/s", "higher_better"),
         "throughput_samples_s": _metric(throughput, "runtime", "samples/s", "higher_better"),
+        "avg_batch_time_ms": _metric(avg_batch_time_ms, "runtime", "ms", "lower_better"),
         "compute_time_s": _metric(compute_time_s, "runtime", "s", "lower_better"),
         "runtime_s": _metric(runtime_total_s, "runtime", "s", "lower_better"),
     }
@@ -1379,6 +1411,7 @@ def _service_config(config: Mapping[str, Any]) -> dict[str, Any]:
         "max_length",
         "device",
         "mixed_precision",
+        "precision_type",
         "num_workers",
         "timeout_s",
         "max_train_time_s",
@@ -1491,6 +1524,7 @@ def _resource_metrics(*, runtime_total_s, workload_runtime_s, train_metrics, eva
         "gpu_utilization": _metric(usage.gpu_utilization, "resource", "percent", "lower_better"),
         "gpu_memory_used_mb": _metric(usage.gpu_memory_used_mb, "resource", "MB", "lower_better"),
         "peak_vram_mb": _metric(usage.peak_vram_mb, "resource", "MB", "lower_better"),
+        "peak_gpu_memory_mb": _metric(usage.peak_vram_mb, "resource", "MB", "lower_better"),
         "avg_vram_mb": _metric(usage.avg_vram_mb, "resource", "MB", "lower_better"),
         "peak_host_ram_mb": _metric(usage.peak_host_ram_mb, "resource", "MB", "lower_better"),
         "avg_host_ram_mb": _metric(usage.avg_host_ram_mb, "resource", "MB", "lower_better"),

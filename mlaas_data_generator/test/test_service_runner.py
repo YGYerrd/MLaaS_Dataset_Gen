@@ -397,6 +397,20 @@ def test_grouped_hf_parallelizes_model_groups(monkeypatch):
     assert group_calls == [(2, 2)]
 
 
+def test_hf_group_keys_include_precision_type():
+    first = {
+        "hf_model_id": "model",
+        "hf_task": "sequence_classification",
+        "model_type": "hf",
+        "device": "auto",
+        "mixed_precision": True,
+        "precision_type": "fp16",
+        "dataset_args": {},
+    }
+    second = dict(first, precision_type="bf16")
+    assert run_manifest_cli._hf_model_group_key(first) != run_manifest_cli._hf_model_group_key(second)
+
+
 def test_service_split_derives_distinct_seed_when_manifest_has_no_sample_seed():
     x = np.arange(400).reshape(400, 1)
     y = np.repeat(np.arange(4), 100)

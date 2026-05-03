@@ -73,6 +73,7 @@ def test_manifest_knob_variants_are_task_aware_and_distinct():
     assert len(set(df["sample_seed"])) == len(df)
     assert len(set(df["warmup_ratio"])) > 1
     assert len(set(df["gradient_accumulation_steps"])) > 1
+    assert set(df["precision_type"]).issubset({"fp16", "bf16"})
     assert set(df["split_strategy"]).issubset({"iid", "dirichlet"})
     assert df["skew_axis"].notna().all()
     for payload in df["service_config"]:
@@ -82,7 +83,24 @@ def test_manifest_knob_variants_are_task_aware_and_distinct():
         assert "sample_seed" in config
         assert "warmup_ratio" in config
         assert "gradient_accumulation_steps" in config
+        assert "precision_type" in config
         assert "skew_axis" in config
+
+
+def test_manifest_mixed_precision_distribution_targets_runtime_regime_band():
+    df = build_hf_manifest(
+        task_keys=["text_classification"],
+        models_per_task=1,
+        datasets_per_model=1,
+        training_regimes=["finetune_transfer"],
+        resource_tier="medium",
+        knob_variants_per_pair=20,
+        seed=123,
+    )
+
+    ratio = float(df["mixed_precision"].mean())
+    assert 0.70 <= ratio <= 0.80
+    assert set(df.loc[df["mixed_precision"], "precision_type"]).issubset({"fp16", "bf16"})
 
 
 def test_manifest_fill_mask_knob_variants_include_mlm_probability():
@@ -286,6 +304,56 @@ def test_grouped_hf_failure_does_not_poison_next_service(monkeypatch, tmp_path):
     assert TransformersGroupedModel.fit_start_weights == [0.0, 0.0]
 
 
+def test_run_manifest_progress_counts_grouped_rows(monkeypatch, tmp_path):
+    manifest = tmp_path / "manifest.csv"
+    db_path = tmp_path / "services.db"
+    pd.DataFrame(_grouped_manifest_rows(db_path)).to_csv(manifest, index=False)
+
+    class FakeProgress:
+        last = None
+
+        def __init__(self, total):
+            self.total = total
+            self.records = []
+            self.starts = []
+            self.clears = []
+            self.finished = False
+            FakeProgress.last = self
+
+        def start(self, worker_label, description):
+            self.starts.append((worker_label, description))
+
+        def clear(self, worker_label):
+            self.clears.append(worker_label)
+
+        def record(self, status):
+            self.records.append(status)
+
+        def finish(self):
+            self.finished = True
+
+    def fake_load_dataset(name, **kwargs):
+        x = {"input_ids": np.arange(8).reshape(4, 2), "attention_mask": np.ones((4, 2), dtype="int64")}
+        y = np.asarray([0, 1, 0, 1])
+        meta = {"input_shape": (2,), "num_classes": 2, "task_type": "classification", "hf_task": "sequence_classification", "dataset_family": "hf"}
+        return (x, y), (x, y), meta
+
+    monkeypatch.setattr(run_manifest_module, "ManifestProgressTracker", FakeProgress)
+    monkeypatch.setattr(run_manifest_module, "_ensure_manifest_preflight", lambda enabled_df: None)
+    monkeypatch.setattr(service_runner_module, "load_dataset", fake_load_dataset)
+    monkeypatch.setattr(service_runner_module, "create_model", lambda **kwargs: TransformersGroupedModel())
+    monkeypatch.setattr(service_runner_module, "capture_hardware_snapshot", lambda: {"platform": "test"})
+    monkeypatch.setattr(service_runner_module, "_service_perturbation_metrics", lambda *args, **kwargs: ({}, None))
+
+    run_manifest(str(manifest), db_path=str(db_path), workers=1)
+
+    tracker = FakeProgress.last
+    assert tracker is not None
+    assert tracker.total == 2
+    assert tracker.records == ["success", "success"]
+    assert tracker.finished is True
+
+
 def test_resolved_manifest_row_gets_deterministic_service_id():
     row = pd.Series(
         {
@@ -302,6 +370,29 @@ def test_resolved_manifest_row_gets_deterministic_service_id():
     )
     resolved = _resolve_row(row, {})
     assert resolved["service_id"].startswith("classification_")
+    assert _validate_row(resolved).ok
+
+
+def test_resolved_manifest_row_forces_mixed_precision_off_on_cpu():
+    row = pd.Series(
+        {
+            "dataset": "hf",
+            "model_type": "hf",
+            "task_type": "classification",
+            "hf_task": "sequence_classification",
+            "hf_model_id": "distilbert-base-uncased",
+            "dataset_name": "glue",
+            "dataset_config": "sst2",
+            "training_regime": "inference_only",
+            "batch_size": 4,
+            "device": "cpu",
+            "mixed_precision": True,
+            "precision_type": "bf16",
+        }
+    )
+    resolved = _resolve_row(row, {})
+    assert resolved["mixed_precision"] is False
+    assert resolved["precision_type"] == "fp16"
     assert _validate_row(resolved).ok
 
 

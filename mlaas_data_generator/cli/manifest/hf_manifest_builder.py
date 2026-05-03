@@ -148,6 +148,7 @@ MANIFEST_COLUMNS = [
     "max_eval_time_s",
     "device",
     "mixed_precision",
+    "precision_type",
     "save_weights",
     "num_workers",
     "text_column",
@@ -381,6 +382,7 @@ def _service_config(row: dict[str, Any]) -> str:
         "max_eval_time_s": row.get("max_eval_time_s"),
         "device": row.get("device"),
         "mixed_precision": row.get("mixed_precision"),
+        "precision_type": row.get("precision_type"),
         "save_weights": row.get("save_weights"),
         "enable_perturbation_metrics": row.get("enable_perturbation_metrics"),
         "perturbation_sample_count": row.get("perturbation_sample_count"),
@@ -802,6 +804,7 @@ def _training_knobs_for_variant(
 ) -> dict[str, Any]:
     batch_sizes = _batch_sizes_for(task_key, model, resource_tier)
     split_strategy, distribution_param, skew_axis, skew_axis_config = _split_knobs_for_variant(task_key, knob_variant, resource_tier)
+    mixed_precision, precision_type = _precision_knobs_for_variant(knob_variant)
     if training_regime == "inference_only":
         return {
             "training_epochs": 0,
@@ -818,6 +821,8 @@ def _training_knobs_for_variant(
             "skew_axis_config": skew_axis_config,
             "distribution_type": split_strategy,
             "distribution_param": distribution_param,
+            "mixed_precision": mixed_precision,
+            "precision_type": precision_type,
         }
 
     learning_rates = _learning_rates_for(task_key, model, resource_tier)
@@ -850,7 +855,17 @@ def _training_knobs_for_variant(
         "skew_axis_config": skew_axis_config,
         "distribution_type": split_strategy,
         "distribution_param": distribution_param,
+        "mixed_precision": mixed_precision,
+        "precision_type": precision_type,
     }
+
+
+def _precision_knobs_for_variant(knob_variant: int) -> tuple[bool, str]:
+    enabled = int(knob_variant) % 4 != 3
+    if not enabled:
+        return False, "fp16"
+    precision_type = "bf16" if int(knob_variant) % 3 != 2 else "fp16"
+    return True, precision_type
 
 
 def _task_specific_inference_model(task_key: str, model: dict[str, Any]) -> bool:
@@ -1136,7 +1151,8 @@ def _row_from_registry(
         "max_train_time_s": resource_tier.max_train_time_s,
         "max_eval_time_s": resource_tier.max_eval_time_s,
         "device": "auto",
-        "mixed_precision": False,
+        "mixed_precision": knobs["mixed_precision"],
+        "precision_type": knobs["precision_type"],
         "save_weights": False,
         "num_workers": 0,
         "text_column": dataset_spec.get("text_column"),
@@ -1316,6 +1332,7 @@ def _row_from_generic_case(
         "max_train_time_s": resource_tier.max_train_time_s,
         "max_eval_time_s": resource_tier.max_eval_time_s,
         "mixed_precision": False,
+        "precision_type": "fp16",
         "num_workers": 0,
         "service_source": "generic_registry",
         "model_role": "service",

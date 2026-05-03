@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import math
 import time
@@ -1095,15 +1096,18 @@ def _predict_hf_probe(adapter, x_sample, y_sample=None, *, task_family=None, hf_
         )
         if bool(getattr(core.task_spec, "supports_generation", False)):
             ensure_left_padding = getattr(core, "_ensure_left_padding_for_decoder_only_generation", None)
+            generation_inference_mode = getattr(core, "_generation_inference_mode", None)
             if callable(ensure_left_padding):
                 ensure_left_padding()
-            pred_t = core.task_spec.generate_predictions(
-                core.model,
-                enc,
-                core.tokenizer,
-                torch,
-                core.generation_config,
-            )
+            generation_context = generation_inference_mode() if callable(generation_inference_mode) else contextlib.nullcontext()
+            with generation_context:
+                pred_t = core.task_spec.generate_predictions(
+                    core.model,
+                    enc,
+                    core.tokenizer,
+                    torch,
+                    core.generation_config,
+                )
             confidence = np.nan
             if labels_t is not None:
                 try:

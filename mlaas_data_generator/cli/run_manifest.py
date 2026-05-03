@@ -6,6 +6,9 @@ import importlib
 import json
 import multiprocessing
 import os
+import queue
+import shutil
+import sys
 import traceback
 import uuid
 from dataclasses import dataclass
@@ -31,6 +34,8 @@ BASE_DEFAULTS: dict[str, Any] = {
     "batch_size": 16,
     "learning_rate": 0.001,
     "optimizer": "adam",
+    "mixed_precision": False,
+    "precision_type": "fp16",
     "seed": 42,
     "dataset_variant": 0,
     "split_variant": 0,
@@ -93,7 +98,7 @@ FLOAT_COLUMNS = {
     "realism_score",
     "perturbation_random_strength",
 }
-ENUM_COLUMNS = {"training_regime", "resource_tier", "optimizer", "device", "model_type", "hf_task", "task_type", "modality", "split_strategy", "distribution_type", "skew_axis"}
+ENUM_COLUMNS = {"training_regime", "resource_tier", "optimizer", "device", "model_type", "hf_task", "task_type", "modality", "split_strategy", "distribution_type", "skew_axis", "precision_type"}
 JSON_COLUMNS = {"column_mapping", "service_config", "custom_distributions", "skew_axis_config"}
 
 DATASET_ARG_COLUMNS = {
@@ -207,6 +212,7 @@ COLUMN_ALIASES = {
     "skew axis config": "skew_axis_config",
     "custom distributions": "custom_distributions",
     "save weights": "save_weights",
+    "precision type": "precision_type",
 }
 
 FEDERATED_COLUMNS = {
@@ -247,6 +253,90 @@ class ManifestEntry:
     validation: RowValidation
 
 
+@dataclass
+class ManifestProgressTracker:
+    total: int
+    completed: int = 0
+    succeeded: int = 0
+    failed: int = 0
+    _running: dict[str, str] | None = None
+    _initialized: bool = False
+    _lines_rendered: int = 0
+
+    def __post_init__(self) -> None:
+        if self._running is None:
+            self._running = {}
+
+    def start(self, worker_label: str, description: str) -> None:
+        self._running[worker_label] = description
+        self.render()
+
+    def clear(self, worker_label: str) -> None:
+        if worker_label in self._running:
+            self._running.pop(worker_label, None)
+            self.render()
+
+    def record(self, status: str) -> None:
+        self.completed += 1
+        if str(status).strip().lower() == "success":
+            self.succeeded += 1
+        else:
+            self.failed += 1
+        self.render()
+
+    def render(self) -> None:
+        if not sys.stdout.isatty():
+            queued = max(self.total - self.completed - len(self._running), 0)
+            print(
+                "Manifest progress: "
+                f"{self.completed}/{self.total} complete | "
+                f"running={len(self._running)} queued={queued} "
+                f"success={self.succeeded} failed={self.failed}"
+            )
+            return
+
+        lines = self._build_lines()
+        if not self._initialized:
+            sys.stdout.write("\n" * len(lines))
+            self._initialized = True
+            self._lines_rendered = len(lines)
+        sys.stdout.write(f"\x1b[{self._lines_rendered}A")
+        for line in lines:
+            sys.stdout.write("\x1b[2K")
+            sys.stdout.write(line + "\n")
+        extra = self._lines_rendered - len(lines)
+        for _ in range(max(0, extra)):
+            sys.stdout.write("\x1b[2K\n")
+        self._lines_rendered = len(lines)
+        sys.stdout.flush()
+
+    def finish(self) -> None:
+        self.render()
+        if sys.stdout.isatty():
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+
+    def _build_lines(self) -> list[str]:
+        running_count = len(self._running)
+        queued = max(self.total - self.completed - running_count, 0)
+        width = shutil.get_terminal_size((120, 20)).columns
+        percent = 100.0 if self.total <= 0 else (self.completed / self.total) * 100.0
+        header = (
+            "Manifest progress "
+            f"[{self.completed}/{self.total} {percent:5.1f}%] "
+            f"running={running_count} queued={queued} "
+            f"success={self.succeeded} failed={self.failed}"
+        )
+        running_items = " | ".join(f"{label}:{desc}" for label, desc in sorted(self._running.items())) or "idle"
+        running_line = f"Workers: {running_items}"
+        return [header[:width], running_line[:width]]
+
+
+_ACTIVE_MANIFEST_PROGRESS: ManifestProgressTracker | None = None
+_WORKER_PROGRESS_QUEUE: Any = None
+_WORKER_LABEL = "main"
+
+
 def _is_blank(value: Any) -> bool:
     if value is None:
         return True
@@ -260,6 +350,75 @@ def _is_blank(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in BLANK_STRINGS
     return False
+
+
+def _worker_label_for_gpu(gpu_id: int | None) -> str:
+    return "cpu" if gpu_id is None else f"gpu{int(gpu_id)}"
+
+
+def _describe_entry(entry: ManifestEntry) -> str:
+    resolved = entry.resolved
+    total = int(resolved.get("_manifest_total") or entry.ordinal)
+    return f"row {entry.ordinal}/{total} {resolved.get('service_id')}"
+
+
+def _describe_group(entries: list[ManifestEntry]) -> str:
+    first = entries[0].resolved
+    return (
+        f"{len(entries)} rows "
+        f"{first.get('hf_model_id') or first.get('model_type')} "
+        f"{first.get('dataset_name') or ''}"
+    ).strip()
+
+
+def _manifest_progress() -> ManifestProgressTracker | None:
+    return _ACTIVE_MANIFEST_PROGRESS
+
+
+def _manifest_progress_start(worker_label: str, description: str) -> None:
+    tracker = _manifest_progress()
+    if tracker is not None:
+        tracker.start(worker_label, description)
+
+
+def _manifest_progress_clear(worker_label: str) -> None:
+    tracker = _manifest_progress()
+    if tracker is not None:
+        tracker.clear(worker_label)
+
+
+def _record_manifest_progress_result(result: dict[str, Any]) -> None:
+    if _WORKER_PROGRESS_QUEUE is not None:
+        try:
+            _WORKER_PROGRESS_QUEUE.put(
+                {
+                    "event": "result",
+                    "worker_label": _WORKER_LABEL,
+                    "status": result.get("status"),
+                }
+            )
+        except Exception:
+            pass
+        return
+
+    tracker = _manifest_progress()
+    if tracker is not None:
+        tracker.record(str(result.get("status") or "failed"))
+
+
+def _drain_progress_queue(progress_queue: Any) -> None:
+    tracker = _manifest_progress()
+    if tracker is None or progress_queue is None:
+        return
+    while True:
+        try:
+            event = progress_queue.get_nowait()
+        except queue.Empty:
+            return
+        except Exception:
+            return
+        if event.get("event") == "result":
+            tracker.record(str(event.get("status") or "failed"))
 
 
 def _normalize_value(value: Any) -> Any:
@@ -361,6 +520,10 @@ def _resolve_row(row: pd.Series, manifest_defaults: dict[str, Any]) -> dict[str,
         resolved["test_split"] = resolved["benchmark_split"]
     if resolved.get("test_split") and not resolved.get("benchmark_split"):
         resolved["benchmark_split"] = resolved["test_split"]
+    resolved["precision_type"] = _normalize_precision_type(resolved.get("precision_type"))
+    if str(_normalize_requested_device(resolved.get("device"))).strip().lower() == "cpu":
+        resolved["mixed_precision"] = False
+        resolved["precision_type"] = "fp16"
     if _is_blank(resolved.get("service_id")):
         resolved["service_id"] = resolve_service_id(resolved)
     resolved["dataset_args"] = _build_dataset_args(resolved)
@@ -406,6 +569,9 @@ def _validate_row(resolved: dict[str, Any]) -> RowValidation:
         return RowValidation(False, "training_epochs must be > 0 for trainable services")
     if int(resolved.get("batch_size", 0) or 0) <= 0:
         return RowValidation(False, "batch_size must be > 0")
+    precision_type = _normalize_precision_type(resolved.get("precision_type"))
+    if precision_type not in {"fp16", "bf16"}:
+        return RowValidation(False, "precision_type must be one of fp16 or bf16")
     task_family = canonical_task_family(resolved.get("task_type"), resolved.get("hf_task"))
     vision_error = _validate_vision_row_requirements(resolved, task_family=task_family, training_regime=training_regime)
     if vision_error:
@@ -568,6 +734,7 @@ def run_manifest(
     grouped_hf: bool = True,
     workers: int = 1,
 ) -> Path:
+    global _ACTIVE_MANIFEST_PROGRESS
     manifest_path = Path(file)
     load_hf_token_from_file()
     print(f"Loading manifest file: {manifest_path}")
@@ -580,123 +747,138 @@ def run_manifest(
 
     manifest_group_id = str(uuid.uuid4())
     results: list[dict[str, Any]] = []
+    _ACTIVE_MANIFEST_PROGRESS = ManifestProgressTracker(total=len(enabled_df))
 
-    if not dry_run:
-        try:
-            _ensure_manifest_preflight(enabled_df)
-        except ManifestPreflightError as exc:
-            resolved = {
-                "db_path": db_path or CONFIG.get("db_path"),
-                "manifest_group_id": manifest_group_id,
-                "manifest_path": str(manifest_path),
-                "sheet": sheet,
-            }
-            results.append(
-                {
-                    "service_id": "",
-                    "row_index": None,
+    try:
+        if not dry_run:
+            try:
+                _ensure_manifest_preflight(enabled_df)
+            except ManifestPreflightError as exc:
+                resolved = {
+                    "db_path": db_path or CONFIG.get("db_path"),
                     "manifest_group_id": manifest_group_id,
-                    "case_name": "__manifest_preflight__",
-                    "status": "failed",
-                    "error_message": str(exc),
-                    "resolved_config_json": json.dumps(resolved, default=str),
+                    "manifest_path": str(manifest_path),
+                    "sheet": sheet,
                 }
-            )
-            _write_failure_log(
-                FAILURE_LOG_PATH,
-                row_index=None,
-                service_id=None,
-                case_name="__manifest_preflight__",
-                manifest_group_id=manifest_group_id,
-                failure_stage="manifest_preflight",
-                error_message=str(exc),
-                resolved=resolved,
-                exc=exc,
-            )
-            _write_failure_db(
-                resolved,
-                row_index=None,
-                service_id=None,
-                case_name="__manifest_preflight__",
-                manifest_group_id=manifest_group_id,
-                failure_stage="manifest_preflight",
-                error_message=str(exc),
-                exc=exc,
-            )
-            output_path = MANIFEST_RESULTS_PATH
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            pd.DataFrame(results).to_csv(output_path, index=False)
-            print(f"Manifest preflight failed: {exc}")
-            print(f"Wrote results: {output_path}")
-            return output_path
-
-    entries: list[ManifestEntry] = []
-    for i, (idx, row) in enumerate(enabled_df.iterrows(), start=1):
-        resolved = _resolve_row(row, manifest_defaults)
-        resolved["row_index"] = int(idx)
-        if db_path is not None:
-            resolved["db_path"] = db_path
-        if _is_blank(resolved.get("manifest_group_id")):
-            resolved["manifest_group_id"] = manifest_group_id
-        entries.append(ManifestEntry(idx=int(idx), ordinal=i, resolved=resolved, validation=_validate_row(resolved)))
-
-    valid_entries: list[ManifestEntry] = []
-    for entry in entries:
-        resolved = entry.resolved
-        service_id = resolved["service_id"]
-        print(f"\nService {entry.ordinal}/{len(enabled_df)}: {service_id}")
-        print(
-            f"dataset={resolved.get('dataset')} "
-            f"task={resolved.get('task_type')} "
-            f"model={resolved.get('model_type')} "
-            f"training_regime={resolved.get('training_regime')} "
-            f"db={resolved.get('db_path')}"
-        )
-
-        if not entry.validation.ok:
-            results.append(_result_row(resolved, entry.idx, "failed", entry.validation.error, service_id=service_id))
-            _write_failure_log(
-                FAILURE_LOG_PATH,
-                row_index=entry.idx,
-                service_id=service_id,
-                case_name=resolved.get("case_name"),
-                manifest_group_id=resolved.get("manifest_group_id"),
-                failure_stage="validation_failed",
-                error_message=entry.validation.error,
-                resolved=resolved,
-            )
-            if not dry_run:
+                results.append(
+                    {
+                        "service_id": "",
+                        "row_index": None,
+                        "manifest_group_id": manifest_group_id,
+                        "case_name": "__manifest_preflight__",
+                        "status": "failed",
+                        "error_message": str(exc),
+                        "resolved_config_json": json.dumps(resolved, default=str),
+                    }
+                )
+                _write_failure_log(
+                    FAILURE_LOG_PATH,
+                    row_index=None,
+                    service_id=None,
+                    case_name="__manifest_preflight__",
+                    manifest_group_id=manifest_group_id,
+                    failure_stage="manifest_preflight",
+                    error_message=str(exc),
+                    resolved=resolved,
+                    exc=exc,
+                )
                 _write_failure_db(
                     resolved,
+                    row_index=None,
+                    service_id=None,
+                    case_name="__manifest_preflight__",
+                    manifest_group_id=manifest_group_id,
+                    failure_stage="manifest_preflight",
+                    error_message=str(exc),
+                    exc=exc,
+                )
+                output_path = MANIFEST_RESULTS_PATH
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                pd.DataFrame(results).to_csv(output_path, index=False)
+                print(f"Manifest preflight failed: {exc}")
+                print(f"Wrote results: {output_path}")
+                return output_path
+
+        entries: list[ManifestEntry] = []
+        for i, (idx, row) in enumerate(enabled_df.iterrows(), start=1):
+            resolved = _resolve_row(row, manifest_defaults)
+            resolved["row_index"] = int(idx)
+            resolved["_manifest_total"] = len(enabled_df)
+            if db_path is not None:
+                resolved["db_path"] = db_path
+            if _is_blank(resolved.get("manifest_group_id")):
+                resolved["manifest_group_id"] = manifest_group_id
+            entries.append(ManifestEntry(idx=int(idx), ordinal=i, resolved=resolved, validation=_validate_row(resolved)))
+
+        valid_entries: list[ManifestEntry] = []
+        for entry in entries:
+            resolved = entry.resolved
+            service_id = resolved["service_id"]
+            print(f"\nService {entry.ordinal}/{len(enabled_df)}: {service_id}")
+            print(
+                f"dataset={resolved.get('dataset')} "
+                f"task={resolved.get('task_type')} "
+                f"model={resolved.get('model_type')} "
+                f"training_regime={resolved.get('training_regime')} "
+                f"db={resolved.get('db_path')}"
+            )
+
+            if not entry.validation.ok:
+                _manifest_progress_start("main", f"validate row {entry.ordinal}/{len(enabled_df)}")
+                result = _result_row(resolved, entry.idx, "failed", entry.validation.error, service_id=service_id)
+                results.append(result)
+                _record_manifest_progress_result(result)
+                _manifest_progress_clear("main")
+                _write_failure_log(
+                    FAILURE_LOG_PATH,
                     row_index=entry.idx,
                     service_id=service_id,
                     case_name=resolved.get("case_name"),
                     manifest_group_id=resolved.get("manifest_group_id"),
                     failure_stage="validation_failed",
                     error_message=entry.validation.error,
+                    resolved=resolved,
                 )
-            print(f"Skipping row {entry.idx}: {entry.validation.error}")
-            continue
+                if not dry_run:
+                    _write_failure_db(
+                        resolved,
+                        row_index=entry.idx,
+                        service_id=service_id,
+                        case_name=resolved.get("case_name"),
+                        manifest_group_id=resolved.get("manifest_group_id"),
+                        failure_stage="validation_failed",
+                        error_message=entry.validation.error,
+                    )
+                print(f"Skipping row {entry.idx}: {entry.validation.error}")
+                continue
 
-        if dry_run:
-            print(json.dumps(resolved, indent=2, default=str))
-            results.append(_result_row(resolved, entry.idx, "success", "", service_id=service_id))
-            continue
+            if dry_run:
+                _manifest_progress_start("main", f"dry-run row {entry.ordinal}/{len(enabled_df)}")
+                print(json.dumps(resolved, indent=2, default=str))
+                result = _result_row(resolved, entry.idx, "success", "", service_id=service_id)
+                results.append(result)
+                _record_manifest_progress_result(result)
+                _manifest_progress_clear("main")
+                continue
 
-        valid_entries.append(entry)
+            valid_entries.append(entry)
 
-    if not dry_run:
-        results.extend(
-            _execute_entries_grouped_hf(valid_entries, workers=workers)
-            if grouped_hf
-            else _execute_entries_row_local(valid_entries, workers=workers)
-        )
+        if not dry_run:
+            results.extend(
+                _execute_entries_grouped_hf(valid_entries, workers=workers)
+                if grouped_hf
+                else _execute_entries_row_local(valid_entries, workers=workers)
+            )
 
-    output_path = MANIFEST_RESULTS_PATH
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(_sort_result_rows(results)).to_csv(output_path, index=False)
-    print(f"Wrote results: {output_path}")
-    return output_path
+        output_path = MANIFEST_RESULTS_PATH
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(_sort_result_rows(results)).to_csv(output_path, index=False)
+        print(f"Wrote results: {output_path}")
+        return output_path
+    finally:
+        if _ACTIVE_MANIFEST_PROGRESS is not None:
+            _ACTIVE_MANIFEST_PROGRESS.finish()
+        _ACTIVE_MANIFEST_PROGRESS = None
 
 
 def _execute_entries_row_local(entries: list[ManifestEntry], *, workers: int = 1) -> list[dict[str, Any]]:
@@ -704,7 +886,9 @@ def _execute_entries_row_local(entries: list[ManifestEntry], *, workers: int = 1
     if worker_count <= 1 or len(entries) <= 1:
         results: list[dict[str, Any]] = []
         for entry in entries:
+            _manifest_progress_start("main", _describe_entry(entry))
             results.append(_execute_entry_row_local(entry))
+            _manifest_progress_clear("main")
         return results
 
     gpu_slots = _detect_cuda_device_ids()[:worker_count]
@@ -714,7 +898,9 @@ def _execute_entries_row_local(entries: list[ManifestEntry], *, workers: int = 1
     if not gpu_slots or len(auto_gpu_entries) <= 1:
         results = []
         for entry in entries:
+            _manifest_progress_start("main", _describe_entry(entry))
             results.append(_execute_entry_row_local(entry))
+            _manifest_progress_clear("main")
         return results
 
     print(
@@ -724,7 +910,9 @@ def _execute_entries_row_local(entries: list[ManifestEntry], *, workers: int = 1
     )
     results = _execute_entries_with_gpu_affinity(auto_gpu_entries, gpu_slots)
     for entry in fixed_entries:
+        _manifest_progress_start("main", _describe_entry(entry))
         results.append(_execute_entry_row_local(entry))
+        _manifest_progress_clear("main")
     return results
 
 
@@ -764,9 +952,12 @@ def _entry_supports_auto_gpu_affinity(resolved: dict[str, Any]) -> bool:
     return requested in {"auto", "gpu", "auto_gpu", "cuda_auto", "cuda"}
 
 
-def _worker_initializer(cuda_visible_devices: int | None) -> None:
+def _worker_initializer(cuda_visible_devices: int | None, progress_queue: Any = None) -> None:
+    global _WORKER_PROGRESS_QUEUE, _WORKER_LABEL
     if cuda_visible_devices is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(cuda_visible_devices)
+    _WORKER_PROGRESS_QUEUE = progress_queue
+    _WORKER_LABEL = _worker_label_for_gpu(cuda_visible_devices)
 
 
 def _worker_entry_payload(entry: ManifestEntry) -> dict[str, Any]:
@@ -812,33 +1003,61 @@ def _execute_entry_worker(payload: dict[str, Any]) -> dict[str, Any]:
 def _execute_entries_with_gpu_affinity(entries: list[ManifestEntry], gpu_slots: list[int]) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     mp_context = multiprocessing.get_context("spawn")
+    manager = multiprocessing.Manager()
+    progress_queue = manager.Queue()
     executors = [
         concurrent.futures.ProcessPoolExecutor(
             max_workers=1,
             mp_context=mp_context,
             initializer=_worker_initializer,
-            initargs=(gpu_id,),
+            initargs=(gpu_id, progress_queue),
         )
         for gpu_id in gpu_slots
     ]
-    future_map: dict[concurrent.futures.Future, ManifestEntry] = {}
+    pending_entries = list(entries)
+    future_map: dict[concurrent.futures.Future, tuple[ManifestEntry, int]] = {}
     try:
-        for index, entry in enumerate(entries):
-            gpu_id = gpu_slots[index % len(gpu_slots)]
+        for executor, gpu_id in zip(executors, gpu_slots, strict=False):
+            if not pending_entries:
+                break
+            entry = pending_entries.pop(0)
             gpu_entry = _entry_with_gpu_db_path(entry, gpu_id)
-            executor = executors[index % len(executors)]
+            _manifest_progress_start(_worker_label_for_gpu(gpu_id), _describe_entry(gpu_entry))
             future = executor.submit(_execute_entry_worker, _worker_entry_payload(gpu_entry))
-            future_map[future] = gpu_entry
-        for future in concurrent.futures.as_completed(future_map):
-            entry = future_map[future]
-            try:
-                results.append(future.result())
-            except Exception as exc:  # noqa: BLE001
-                results.append(_execute_entry_row_local(entry))
-                print(f"Parallel worker failed for row {entry.idx}; retried in main process: {exc}")
+            future_map[future] = (gpu_entry, gpu_id)
+        while future_map:
+            done, _ = concurrent.futures.wait(
+                list(future_map),
+                timeout=0.2,
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            _drain_progress_queue(progress_queue)
+            if not done:
+                continue
+            for future in done:
+                entry, gpu_id = future_map.pop(future)
+                worker_label = _worker_label_for_gpu(gpu_id)
+                try:
+                    results.append(future.result())
+                except Exception as exc:  # noqa: BLE001
+                    _manifest_progress_clear(worker_label)
+                    _manifest_progress_start("main", _describe_entry(entry))
+                    results.append(_execute_entry_row_local(entry))
+                    _manifest_progress_clear("main")
+                    print(f"Parallel worker failed for row {entry.idx}; retried in main process: {exc}")
+                else:
+                    _manifest_progress_clear(worker_label)
+                if pending_entries:
+                    next_entry = pending_entries.pop(0)
+                    gpu_entry = _entry_with_gpu_db_path(next_entry, gpu_id)
+                    _manifest_progress_start(worker_label, _describe_entry(gpu_entry))
+                    next_future = executors[gpu_slots.index(gpu_id)].submit(_execute_entry_worker, _worker_entry_payload(gpu_entry))
+                    future_map[next_future] = (gpu_entry, gpu_id)
+        _drain_progress_queue(progress_queue)
     finally:
         for executor in executors:
             executor.shutdown(wait=True)
+        manager.shutdown()
     return results
 
 
@@ -851,7 +1070,9 @@ def _execute_entry_row_local(entry: ManifestEntry) -> dict[str, Any]:
         error = summary.error or ""
         if status != "success":
             print(f"Service failed for row {entry.idx}: {error}")
-        return _result_row(resolved, entry.idx, status, error, service_id=summary.service_id)
+        result = _result_row(resolved, entry.idx, status, error, service_id=summary.service_id)
+        _record_manifest_progress_result(result)
+        return result
     except Exception as exc:  # noqa: BLE001
         _write_failure_log(
             FAILURE_LOG_PATH,
@@ -875,7 +1096,9 @@ def _execute_entry_row_local(entry: ManifestEntry) -> dict[str, Any]:
             exc=exc,
         )
         print(f"Service failed for row {entry.idx}: {exc}")
-        return _result_row(resolved, entry.idx, "failed", str(exc), service_id=service_id)
+        result = _result_row(resolved, entry.idx, "failed", str(exc), service_id=service_id)
+        _record_manifest_progress_result(result)
+        return result
 
 
 def _execute_entries_grouped_hf(entries: list[ManifestEntry], *, workers: int = 1) -> list[dict[str, Any]]:
@@ -906,7 +1129,9 @@ def _execute_hf_model_groups(model_groups: list[list[ManifestEntry]], *, workers
                 "\nGrouped HF model: "
                 f"model={first.get('hf_model_id')} task={first.get('hf_task')} rows={len(model_entries)}"
             )
+            _manifest_progress_start("main", _describe_group(model_entries))
             results.extend(_execute_hf_model_group(model_entries))
+            _manifest_progress_clear("main")
         return results
 
     print(
@@ -937,19 +1162,25 @@ def _execute_hf_group_worker(payload: list[dict[str, Any]]) -> list[dict[str, An
 def _execute_hf_groups_with_gpu_affinity(model_groups: list[list[ManifestEntry]], gpu_slots: list[int]) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     mp_context = multiprocessing.get_context("spawn")
+    manager = multiprocessing.Manager()
+    progress_queue = manager.Queue()
     executors = [
         concurrent.futures.ProcessPoolExecutor(
             max_workers=1,
             mp_context=mp_context,
             initializer=_worker_initializer,
-            initargs=(gpu_id,),
+            initargs=(gpu_id, progress_queue),
         )
         for gpu_id in gpu_slots
     ]
-    future_map: dict[concurrent.futures.Future, list[ManifestEntry]] = {}
+    executor_map = {gpu_id: executors[index] for index, gpu_id in enumerate(gpu_slots)}
+    pending_groups = list(model_groups)
+    future_map: dict[concurrent.futures.Future, tuple[list[ManifestEntry], int]] = {}
     try:
-        for index, model_entries in enumerate(model_groups):
-            gpu_id = gpu_slots[index % len(gpu_slots)]
+        for gpu_id in gpu_slots:
+            if not pending_groups:
+                break
+            model_entries = pending_groups.pop(0)
             gpu_entries = [_entry_with_gpu_db_path(entry, gpu_id) for entry in model_entries]
             first = gpu_entries[0].resolved
             print(
@@ -957,23 +1188,52 @@ def _execute_hf_groups_with_gpu_affinity(model_groups: list[list[ManifestEntry]]
                 f"model={first.get('hf_model_id')} task={first.get('hf_task')} "
                 f"rows={len(gpu_entries)} assigned_gpu={gpu_id} db={first.get('db_path')}"
             )
-            executor = executors[index % len(executors)]
-            future = executor.submit(_execute_hf_group_worker, _worker_group_payload(gpu_entries))
-            future_map[future] = gpu_entries
-        for future in concurrent.futures.as_completed(future_map):
-            model_entries = future_map[future]
-            try:
-                results.extend(future.result())
-            except Exception as exc:  # noqa: BLE001
-                first = model_entries[0].resolved
-                print(
-                    "Parallel grouped HF worker failed; retrying in main process: "
-                    f"model={first.get('hf_model_id')} task={first.get('hf_task')} error={exc}"
-                )
-                results.extend(_execute_hf_model_group(model_entries))
+            _manifest_progress_start(_worker_label_for_gpu(gpu_id), _describe_group(gpu_entries))
+            future = executor_map[gpu_id].submit(_execute_hf_group_worker, _worker_group_payload(gpu_entries))
+            future_map[future] = (gpu_entries, gpu_id)
+        while future_map:
+            done, _ = concurrent.futures.wait(
+                list(future_map),
+                timeout=0.2,
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            _drain_progress_queue(progress_queue)
+            if not done:
+                continue
+            for future in done:
+                model_entries, gpu_id = future_map.pop(future)
+                worker_label = _worker_label_for_gpu(gpu_id)
+                try:
+                    results.extend(future.result())
+                except Exception as exc:  # noqa: BLE001
+                    _manifest_progress_clear(worker_label)
+                    _manifest_progress_start("main", _describe_group(model_entries))
+                    first = model_entries[0].resolved
+                    print(
+                        "Parallel grouped HF worker failed; retrying in main process: "
+                        f"model={first.get('hf_model_id')} task={first.get('hf_task')} error={exc}"
+                    )
+                    results.extend(_execute_hf_model_group(model_entries))
+                    _manifest_progress_clear("main")
+                else:
+                    _manifest_progress_clear(worker_label)
+                if pending_groups:
+                    next_group = pending_groups.pop(0)
+                    gpu_entries = [_entry_with_gpu_db_path(entry, gpu_id) for entry in next_group]
+                    first = gpu_entries[0].resolved
+                    print(
+                        "\nGrouped HF model: "
+                        f"model={first.get('hf_model_id')} task={first.get('hf_task')} "
+                        f"rows={len(gpu_entries)} assigned_gpu={gpu_id} db={first.get('db_path')}"
+                    )
+                    _manifest_progress_start(worker_label, _describe_group(gpu_entries))
+                    next_future = executor_map[gpu_id].submit(_execute_hf_group_worker, _worker_group_payload(gpu_entries))
+                    future_map[next_future] = (gpu_entries, gpu_id)
+        _drain_progress_queue(progress_queue)
     finally:
         for executor in executors:
             executor.shutdown(wait=True)
+        manager.shutdown()
     return results
 
 
@@ -1025,7 +1285,9 @@ def _execute_hf_model_group(entries: list[ManifestEntry]) -> list[dict[str, Any]
             error = summary.error or ""
             if status != "success":
                 print(f"Service failed for row {entry.idx}: {error}")
-            results.append(_result_row(entry.resolved, entry.idx, status, error, service_id=summary.service_id))
+            result = _result_row(entry.resolved, entry.idx, status, error, service_id=summary.service_id)
+            results.append(result)
+            _record_manifest_progress_result(result)
     return results
 
 
@@ -1069,6 +1331,7 @@ def _hf_model_group_key(resolved: dict[str, Any]) -> str:
             "model_type": resolved.get("model_type"),
             "device": resolved.get("device"),
             "mixed_precision": resolved.get("mixed_precision"),
+            "precision_type": resolved.get("precision_type"),
             "loader_template": dataset_args.get("loader_template"),
             "task_tag": resolved.get("task_tag"),
         }
@@ -1104,10 +1367,16 @@ def _hf_prepared_model_key(config: dict[str, Any], meta: Any) -> str:
             "model_type": config.get("model_type"),
             "device": config.get("device"),
             "mixed_precision": config.get("mixed_precision"),
+            "precision_type": config.get("precision_type"),
             "num_labels": infer_num_labels(meta_dict, fallback=meta_dict.get("num_classes")),
             "label_format": infer_label_format(meta_dict, task_type=meta_dict.get("task_type") or config.get("task_type")),
         }
     )
+
+
+def _normalize_precision_type(value: Any) -> str:
+    text = str(value or "fp16").strip().lower()
+    return "bf16" if text == "bf16" else "fp16"
 
 
 def _entry_group_sort_key(entry: ManifestEntry) -> tuple[Any, ...]:

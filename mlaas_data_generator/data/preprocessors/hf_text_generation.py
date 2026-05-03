@@ -124,6 +124,16 @@ def _to_text_list(values):
     return out
 
 
+def _strip_trailing_eos(token_ids, tokenizer):
+    eos_id = getattr(tokenizer, "eos_token_id", None)
+    if eos_id is None:
+        return list(token_ids)
+    trimmed = list(token_ids)
+    if trimmed and int(trimmed[-1]) == int(eos_id):
+        trimmed = trimmed[:-1]
+    return trimmed
+
+
 def _pad_encodings(enc, pad_to):
     input_ids = enc["input_ids"]
     attention_mask = enc["attention_mask"]
@@ -270,7 +280,7 @@ def preprocess_hf_text_causal_lm_generation(
             tok = tokenizer(texts, truncation=True, padding=False, max_length=max_len, add_special_tokens=True)
 
             for ids in tok["input_ids"]:
-                full_ids = list(ids)[:max_len]
+                full_ids = _strip_trailing_eos(ids, tokenizer)[:max_len]
                 if not full_ids:
                     full_ids = [eos_id]
                 if eos_id is not None and full_ids:
@@ -290,10 +300,11 @@ def preprocess_hf_text_causal_lm_generation(
             t_tok = tokenizer(targets, truncation=True, padding=False, max_length=tgt_max, add_special_tokens=False)
 
             for p_ids, t_ids in zip(p_tok["input_ids"], t_tok["input_ids"]):
-                full_ids = (list(p_ids) + list(t_ids) + [eos_id])[:max_len]
+                prompt_ids = _strip_trailing_eos(p_ids, tokenizer)
+                full_ids = (prompt_ids + list(t_ids) + [eos_id])[:max_len]
                 labels = full_ids.copy()
                 if prompt_loss_only:
-                    prompt_len = min(len(p_ids), len(full_ids))
+                    prompt_len = min(len(prompt_ids), len(full_ids))
                     labels[:prompt_len] = [int(ignore_index)] * prompt_len
 
                 ids_list.append(full_ids)

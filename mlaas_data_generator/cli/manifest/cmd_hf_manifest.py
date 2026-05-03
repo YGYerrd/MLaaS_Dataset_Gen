@@ -10,10 +10,13 @@ from mlaas_data_generator.config import DEFAULT_MANIFEST_PATH
 from .hf_manifest_builder import MANIFEST_PROFILES, RESOURCE_TIERS, build_hf_manifest, save_manifest
 
 
-def _parse_csv_arg(value: str | None) -> list[str] | None:
+def _parse_csv_arg(value: str | list[str] | None) -> list[str] | None:
     if value is None:
         return None
-    items = [item.strip() for item in value.split(",") if item.strip()]
+    raw_values = value if isinstance(value, list) else [value]
+    items: list[str] = []
+    for raw_value in raw_values:
+        items.extend(item.strip() for item in str(raw_value).split(",") if item.strip())
     return items or None
 
 
@@ -45,11 +48,19 @@ def register_hf_manifest(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument("--input-json", help="Optional HF audit JSON used only for metadata enrichment")
     p.add_argument("--output", default=str(DEFAULT_MANIFEST_PATH), help="Output .csv or .xlsx path")
     p.add_argument("--sheet", default="services", help="Sheet name for xlsx output")
-    p.add_argument("--task-keys", help="Comma-separated registry task keys")
+    p.add_argument(
+        "--task-keys",
+        nargs="+",
+        help="Registry task keys. Accepts comma-separated values, space-separated values, or both.",
+    )
     p.add_argument("--models-per-task", type=int, default=10)
     p.add_argument("--max-models-per-family", type=int, help="Optional cap on models selected from the same family within each task")
     p.add_argument("--datasets-per-model", type=int, default=1)
-    p.add_argument("--training-regimes", help="Comma-separated training regimes: finetune_transfer,inference_only")
+    p.add_argument(
+        "--training-regimes",
+        nargs="+",
+        help="Training regimes. Accepts comma-separated values, space-separated values, or both.",
+    )
     p.add_argument("--dataset-variants-per-pair", type=int, default=1)
     p.add_argument("--split-variants-per-pair", type=int, default=1)
     p.add_argument("--knob-variants-per-pair", type=int, default=1)

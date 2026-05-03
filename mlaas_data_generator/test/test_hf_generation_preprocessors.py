@@ -58,6 +58,37 @@ class EmptyPreservingFakeTokenizer(FakeTokenizer):
         return [min(50, max(3, len(tok))) for tok in str(text).split()]
 
 
+class EosAppendingFakeTokenizer(FakeTokenizer):
+    @classmethod
+    def from_pretrained(cls, *args, **kwargs):
+        return cls()
+
+    def __call__(self, texts=None, text_target=None, truncation=True, padding=False, max_length=8, add_special_tokens=True, return_attention_mask=True, **kwargs):
+        out = super().__call__(
+            texts=texts,
+            text_target=text_target,
+            truncation=truncation,
+            padding=padding,
+            max_length=max_length,
+            add_special_tokens=add_special_tokens,
+            return_attention_mask=return_attention_mask,
+            **kwargs,
+        )
+        if text_target is None and add_special_tokens:
+            ids = []
+            for token_ids in out["input_ids"]:
+                token_ids = list(token_ids)
+                if len(token_ids) < int(max_length):
+                    token_ids.append(self.eos_token_id)
+                else:
+                    token_ids[-1] = self.eos_token_id
+                ids.append(token_ids)
+            out["input_ids"] = ids
+            if return_attention_mask and "attention_mask" in out:
+                out["attention_mask"] = [[1] * len(token_ids) for token_ids in ids]
+        return out
+
+
 def _install_fake_transformers():
     fake_mod = types.SimpleNamespace(AutoTokenizer=FakeTokenizer)
     sys.modules["transformers"] = fake_mod
@@ -65,6 +96,11 @@ def _install_fake_transformers():
 
 def _install_empty_preserving_fake_transformers():
     fake_mod = types.SimpleNamespace(AutoTokenizer=EmptyPreservingFakeTokenizer)
+    sys.modules["transformers"] = fake_mod
+
+
+def _install_eos_appending_fake_transformers():
+    fake_mod = types.SimpleNamespace(AutoTokenizer=EosAppendingFakeTokenizer)
     sys.modules["transformers"] = fake_mod
 
 
@@ -122,6 +158,29 @@ def test_causal_lm_generation_preprocessor_prompt_completion_mapping():
     assert meta["column_mapping"]["target"] == "completion"
     assert meta["accounting"]["sequence_count"] == 2
     assert meta["accounting"]["supervised_token_count"] > 0
+
+
+def test_causal_lm_generation_preprocessor_strips_trailing_prompt_eos_before_target():
+    _install_eos_appending_fake_transformers()
+    train_rows = [{"prompt": "Write a haiku", "completion": "Soft rain"}]
+    test_rows = [{"prompt": "Say hi", "completion": "hi"}]
+
+    train, _, _ = preprocess_hf(
+        (DummySplit(train_rows), None),
+        (DummySplit(test_rows), None),
+        {"hf_task": "causal_lm_generation", "modality": "text", "max_length": 12, "hf_id": "dummy"},
+        hf_model_id="dummy/model",
+        source_max_length=6,
+        target_max_length=6,
+        dynamic_padding=True,
+    )
+
+    x_train, y_train = train
+    active_ids = x_train["input_ids"][0][x_train["attention_mask"][0] == 1].tolist()
+    active_labels = y_train[0][y_train[0] != -100].tolist()
+
+    assert active_ids.count(EosAppendingFakeTokenizer.eos_token_id) == 1
+    assert active_labels[-1] == EosAppendingFakeTokenizer.eos_token_id
 
 
 def test_seq2seq_generation_preprocessor_source_target_mapping():
