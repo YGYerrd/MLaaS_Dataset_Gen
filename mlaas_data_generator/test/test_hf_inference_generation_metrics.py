@@ -387,6 +387,25 @@ def test_hfcore_batch_iter_trims_common_left_padding_per_batch():
     assert xb["attention_mask"].tolist() == [[0, 1, 1], [1, 1, 1]]
 
 
+def test_hfcore_batch_iter_keeps_fill_mask_labels_aligned_to_trimmed_inputs():
+    core = HFCore.__new__(HFCore)
+    core.batch_size = 2
+    core.label_pad_value = -100
+
+    xs = {
+        "input_ids": np.asarray([[11, 12, 13, 0], [21, 22, 23, 24]], dtype=np.int64),
+        "attention_mask": np.asarray([[1, 1, 1, 0], [1, 1, 1, 1]], dtype=np.int64),
+    }
+    ys = np.asarray([[-100, 12, -100, -100], [-100, 22, -100, -100]], dtype=np.int64)
+
+    xb, yb = next(core._batch_iter(xs, ys))
+
+    assert xb["input_ids"].shape == (2, 4)
+    assert xb["attention_mask"].shape == (2, 4)
+    assert yb.shape == (2, 4)
+    assert yb.tolist() == [[-100, 12, -100, -100], [-100, 22, -100, -100]]
+
+
 def test_service_perturbation_probe_left_pads_decoder_only_generation():
     core = _make_generation_probe_core()
     adapter = type("Adapter", (), {"core": core})()

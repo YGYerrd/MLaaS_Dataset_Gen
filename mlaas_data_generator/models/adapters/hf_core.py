@@ -453,8 +453,8 @@ class HFCore:
             for i in range(0, n, bs):
                 xb = {k: v[i:i + bs] for k, v in xs.items()}
                 yb = None if ys is None else ys[i:i + bs]
-                xb = self._trim_batch_sequence_padding(xb)
-                yb = self._trim_label_padding(yb)
+                xb, span = self._trim_batch_sequence_padding(xb)
+                yb = self._trim_label_padding(yb, span=span)
                 yield xb, yb
             return
 
@@ -476,15 +476,15 @@ class HFCore:
 
     def _trim_batch_sequence_padding(self, xb):
         if not isinstance(xb, dict):
-            return xb
+            return xb, None
         attention_mask = xb.get("attention_mask")
         span = self._active_column_span(attention_mask, inactive_value=0)
         if span is None:
-            return xb
+            return xb, None
         start, end = span
         width = int(np.asarray(attention_mask).shape[1])
         if start == 0 and end == width:
-            return xb
+            return xb, span
 
         trimmed = {}
         for key, value in xb.items():
@@ -497,11 +497,15 @@ class HFCore:
                 trimmed[key] = value[:, start:end]
             else:
                 trimmed[key] = value
-        return trimmed
+        return trimmed, span
 
-    def _trim_label_padding(self, yb):
+    def _trim_label_padding(self, yb, *, span=None):
         if not isinstance(yb, np.ndarray) or yb.ndim < 2 or yb.shape[1] == 0:
             return yb
+        if span is not None:
+            start, end = span
+            if 0 <= start < end <= int(yb.shape[1]):
+                return yb[:, start:end]
         span = self._active_column_span(yb, inactive_value=self.label_pad_value)
         if span is None:
             return yb

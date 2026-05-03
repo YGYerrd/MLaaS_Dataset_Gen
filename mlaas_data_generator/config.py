@@ -10,7 +10,7 @@ DEFAULT_MANIFEST_PATH = BASE_OUTPUT_DIR / "service_manifest.xlsx"
 MANIFEST_RESULTS_PATH = BASE_OUTPUT_DIR / "service_manifest_results.csv"
 FAILURE_LOG_PATH = BASE_OUTPUT_DIR / "service_failures.log"
 
-SQL_DB_PATH = Path(os.getenv("MLAAS_SQL_DB_PATH") or os.getenv("MLAAS_DB_PATH") or BASE_OUTPUT_DIR / "servicesTest.db")
+SQL_DB_PATH = Path(os.getenv("MLAAS_SQL_DB_PATH") or os.getenv("MLAAS_DB_PATH") or BASE_OUTPUT_DIR / "services2.db")
 
 CONFIG = {
     "db_path": str(SQL_DB_PATH),
