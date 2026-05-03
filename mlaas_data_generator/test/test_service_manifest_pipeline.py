@@ -224,6 +224,27 @@ def test_manifest_service_ids_are_deterministic():
     pd.testing.assert_series_equal(first["service_id"], second["service_id"])
 
 
+def test_manifest_builder_varies_when_seed_is_omitted():
+    first = build_hf_manifest(
+        task_keys=["text_classification"],
+        models_per_task=1,
+        datasets_per_model=1,
+        total_services=2,
+        seed=None,
+    )
+    second = build_hf_manifest(
+        task_keys=["text_classification"],
+        models_per_task=1,
+        datasets_per_model=1,
+        total_services=2,
+        seed=None,
+    )
+
+    assert not first.empty
+    assert not second.empty
+    assert not first["service_id"].equals(second["service_id"])
+
+
 def test_run_manifest_dry_run_validates_service_rows(tmp_path):
     manifest = tmp_path / "manifest.csv"
     pd.DataFrame(

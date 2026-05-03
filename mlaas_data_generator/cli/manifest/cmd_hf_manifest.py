@@ -69,7 +69,7 @@ def register_hf_manifest(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument("--resource-tier", choices=sorted(RESOURCE_TIERS), help="Workload budget. Defaults from --manifest-profile.")
     p.add_argument("--avg-sample-size", type=int, help="Target average max_samples across emitted service rows")
     p.add_argument("--exclude-failures-csv", help="Drop manifest rows matching known failures from this CSV")
-    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--seed", type=int, help="Optional seed. Omit for a fresh randomized manifest on each run.")
 
     def _run(args: argparse.Namespace) -> None:
         df = build_hf_manifest(

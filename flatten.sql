@@ -149,6 +149,7 @@ raw_base AS (
         s.service_id AS run_id,
         s.status,
         s.created_at,
+        s.training_regime,
         COALESCE(s.task_family, s.task_type) AS task_family,
         COALESCE(s.task_type, s.task_family) AS task_type,
         s.hf_task,
@@ -499,62 +500,34 @@ reviewed AS (
 
 SELECT
     run_id,
-    status,
-    created_at,
     dataset,
     task_type,
-    model_type,
+    CASE
+        WHEN lower(COALESCE(training_regime, '')) IN ('inference_only', 'inference') THEN 'inferance'
+        ELSE 'finetune'
+    END AS "type (finetune, inferance)",
     COALESCE(hf_model_id, 'Not Available') AS "HF model id",
-    COALESCE(hf_dataset_id, 'Not Available') AS "HF dataset id",
-
-    metric_score,
     COALESCE(primary_metric_name, 'Not Available') AS "Primary metric name",
     COALESCE(CAST(primary_metric AS TEXT), 'Not Available') AS "Primary metric",
     COALESCE(auxiliary_metric_name, 'Not Available') AS "Auxiliary metric name",
     COALESCE(CAST(auxiliary_metric AS TEXT), 'Not Available') AS "Auxiliary metric",
     COALESCE(CAST(latency AS TEXT), 'Not Available') AS "Latency",
     COALESCE(CAST(tail_latency AS TEXT), 'Not Available') AS "Tail latency",
-    COALESCE(CAST(participation_rate AS TEXT), 'Not Available') AS "Participation rate",
-    COALESCE(CAST(max(0.0, min(1.0, COALESCE(reliability_score, participation_rate))) AS TEXT), 'Not Available') AS "Reliability score",
     COALESCE(CAST(mean_compute_time AS TEXT), 'Not Available') AS "Mean compute time",
     COALESCE(CAST(resource_cost_score AS TEXT), 'Not Available') AS "Resource cost score",
     COALESCE(CAST(cost_efficiency AS TEXT), 'Not Available') AS "Cost efficiency",
-    CASE
-        WHEN model_size IS NULL OR model_size <= 0 THEN 'Not Available'
-        ELSE CAST(model_size AS TEXT)
-    END AS "Model size",
-    COALESCE(CAST(downloads AS TEXT), 'Not Available') AS "Downloads",
-    COALESCE(CAST(likes AS TEXT), 'Not Available') AS "Likes",
     COALESCE(CAST(hf_model_downloads AS TEXT), 'Not Available') AS "HF model downloads",
     COALESCE(CAST(hf_dataset_downloads AS TEXT), 'Not Available') AS "HF dataset downloads",
     COALESCE(CAST(hf_model_likes AS TEXT), 'Not Available') AS "HF model likes",
     COALESCE(CAST(hf_dataset_likes AS TEXT), 'Not Available') AS "HF dataset likes",
     COALESCE(CAST(learning_rate AS TEXT), 'Not Available') AS "Learning rate",
     COALESCE(CAST(batch_size AS TEXT), 'Not Available') AS "Batch size",
-    COALESCE(split_strategy_requested, 'Not Available') AS "Split strategy requested",
-    COALESCE(split_strategy_effective, 'Not Available') AS "Split strategy effective",
-    COALESCE(split_skew_axis, 'Not Available') AS "Split skew axis",
+    COALESCE(split_strategy_effective, split_strategy_requested, 'Not Available') AS "Split strategy",
     COALESCE(split_skew_axis_effective, 'Not Available') AS "Split skew axis effective",
     COALESCE(split_bucket_spec_json, 'Not Available') AS "Split bucket spec",
-    COALESCE(data_distribution, 'Not Available') AS "Data distribution",
     COALESCE(dataset_distributions, 'Not Available') AS "Dataset distributions",
-    COALESCE(CAST(dataset_size AS TEXT), 'Not Available') AS "Dataset size",
     COALESCE(CAST(explainability_score AS TEXT), 'Not Available') AS "Explainability score",
-    COALESCE(update_signature_id, 'Not Available') AS "Update signature id",
-    COALESCE(CAST(signature_dim AS TEXT), 'Not Available') AS "Signature dim",
-    COALESCE(CAST(signature_norm AS TEXT), 'Not Available') AS "Signature norm",
-    COALESCE(update_signature_path, 'Not Available') AS "Update signature path",
-    COALESCE(update_signature_method, 'Not Available') AS "Update signature method",
-    CASE
-        WHEN lower(COALESCE(status, '')) = 'failed' THEN latest_failure_stage
-        ELSE NULL
-    END AS failure_stage,
-    CASE
-        WHEN lower(COALESCE(status, '')) = 'failed' THEN latest_failure_message
-        ELSE NULL
-    END AS failure_message,
-    historical_failure_count,
-    review_bucket,
-    review_reason
+    COALESCE(update_signature_path, 'Not Available') AS "Update signature path"
 FROM reviewed
+WHERE lower(COALESCE(status, '')) <> 'failed'
 ORDER BY created_at DESC;

@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import random
+import secrets
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -350,6 +351,12 @@ def _normalise_positive_int(value: int | None, *, minimum: int = 1) -> int:
     if value is None:
         return minimum
     return max(minimum, int(value))
+
+
+def _resolve_manifest_seed(seed: int | None) -> int:
+    if seed is None:
+        return secrets.randbits(63)
+    return int(seed)
 
 
 def _as_int(value: Any) -> int | None:
@@ -1342,6 +1349,7 @@ def _row_from_registry(
             "dataset_variant": dataset_variant,
             "split_variant": split_variant,
             "knob_variant": knob_variant,
+            "sample_seed": sample_seed,
         },
     )
     row["service_config"] = _service_config(row)
@@ -1397,6 +1405,7 @@ def _row_from_generic_case(
     dataset_variant: int,
     split_variant: int,
     knob_variant: int,
+    seed: int,
 ) -> dict[str, Any]:
     split_strategy, distribution_param, skew_axis, skew_axis_config = _split_knobs_for_variant(case["task_key"], knob_variant, resource_tier)
     epochs = _epochs_for(case["task_key"], resource_tier)[int(knob_variant) % len(_epochs_for(case["task_key"], resource_tier))]
@@ -1467,6 +1476,7 @@ def _row_from_generic_case(
             "dataset_variant": dataset_variant,
             "split_variant": split_variant,
             "knob_variant": knob_variant,
+            "seed": seed,
         },
     )
     row["service_config"] = _service_config(row)
@@ -1483,7 +1493,7 @@ def build_hf_manifest(
     split_variants_per_pair: int = 1,
     knob_variants_per_pair: int = 1,
     total_services: int | None = None,
-    seed: int = 42,
+    seed: int | None = None,
     manifest_profile: str = "balanced",
     resource_tier: str | None = None,
     avg_sample_size: int | None = None,
@@ -1491,6 +1501,7 @@ def build_hf_manifest(
     strict_inference_dataset_match: bool = True,
 ) -> pd.DataFrame:
     del json_path
+    seed = _resolve_manifest_seed(seed)
     rng = random.Random(seed)
     profile = _resolve_manifest_profile(manifest_profile)
     resolved_resource_tier, resource_tier_explicit = _resolve_resource_tier(resource_tier, profile)
@@ -1581,6 +1592,7 @@ def build_hf_manifest(
                             dataset_variant=dataset_variant,
                             split_variant=split_variant,
                             knob_variant=knob_variant,
+                            seed=seed,
                         )
                     )
 
@@ -1632,7 +1644,7 @@ def main() -> None:
     parser.add_argument("--manifest-profile", choices=sorted(MANIFEST_PROFILES), default="balanced")
     parser.add_argument("--resource-tier", choices=sorted(RESOURCE_TIERS), help="Workload budget: smoketest, light, medium, heavy, or stress_test. Defaults from --manifest-profile.")
     parser.add_argument("--avg-sample-size", type=int)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, help="Optional seed. Omit for a fresh randomized manifest on each run.")
     args = parser.parse_args()
 
     df = build_hf_manifest(

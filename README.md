@@ -250,6 +250,7 @@ python -m mlaas_data_generator.cli.main hf-manifest \
 ```
 
 This writes an Excel workbook with a `services` sheet and a `defaults` sheet.
+By default, `hf-manifest` now uses a fresh random seed on each run, so repeated invocations produce slightly different reviewed manifests. Pass `--seed <int>` when you want a reproducible manifest.
 
 Useful manifest profiles:
 
