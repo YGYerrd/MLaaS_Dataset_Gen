@@ -396,6 +396,7 @@ The run writes:
 | `outputs/services.db` | SQLite database containing service records and metrics. |
 | `outputs/services.gpu0.db`, `outputs/services.gpu1.db`, ... | Per-GPU SQLite databases created automatically during GPU-parallel runs. |
 | `outputs/service_manifest_results.csv` | Per-row success/failure summary. |
+| `outputs/service_manifest_failed.csv` | Retry manifest containing only failed row-level runs from the latest manifest execution. |
 | `outputs/service_failures.log` | Detailed validation or runtime failures. |
 
 Successful rows are written to the SQLite database configured by `CONFIG["db_path"]`, `MLAAS_DB_PATH`, `MLAAS_SQL_DB_PATH`, or the `--db` override.
@@ -521,6 +522,14 @@ import pandas as pd
 conn = sqlite3.connect("outputs/services.db")
 print(pd.read_sql_query("select * from service_failures order by failure_id desc limit 10", conn))
 PY
+```
+
+To rerun only failed rows after fixing the cause, use:
+
+```bash
+python -m mlaas_data_generator.cli.main run-manifest \
+  --file outputs/service_manifest_failed.csv \
+  --db outputs/services.db
 ```
 
 ## Extending

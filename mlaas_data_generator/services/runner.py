@@ -49,6 +49,16 @@ class ServiceExecutionError(RuntimeError):
         self.failure_stage = failure_stage
 
 
+class _StageTimer:
+    """Small helper for consistent stage timing in seconds."""
+
+    def __init__(self):
+        self._start = time.perf_counter()
+
+    def elapsed_s(self) -> float:
+        return float(time.perf_counter() - self._start)
+
+
 def _is_blank(value: Any) -> bool:
     if value is None:
         return True
@@ -97,13 +107,28 @@ class ServiceRunner:
 
         try:
             record, metrics, artifacts, split_provenance_rows = self._execute_service(started_at=started_at)
+            db_timer = _StageTimer()
             writer.write_service(record)
             writer.write_service_metrics(service_id, metrics)
             for row in split_provenance_rows:
                 writer.write_service_split_provenance(service_id, **row)
             for artifact in artifacts:
                 writer.write_service_artifact(service_id, **artifact)
+            db_write_pre_commit_s = db_timer.elapsed_s()
+            metrics["db_write_s"] = _metric(db_write_pre_commit_s, "runtime", "s", "lower_better")
+            writer.write_service_metric(
+                service_id,
+                "db_write_s",
+                metrics["db_write_s"],
+            )
             writer.finish()
+            _log_service_timing(
+                self.config,
+                service_id,
+                "DB write",
+                db_timer.elapsed_s(),
+                detail=f"db_path={db_path}",
+            )
             return ServiceExecutionResult(service_id=service_id, status="success", db_path=db_path, metrics=metrics)
         except Exception as exc:  # noqa: BLE001
             elapsed = time.perf_counter() - t0
@@ -119,6 +144,7 @@ class ServiceRunner:
                 },
             )
             try:
+                db_timer = _StageTimer()
                 writer.write_service(failure_record)
                 writer.write_service_failure(
                     service_id=service_id,
@@ -131,22 +157,49 @@ class ServiceRunner:
                     traceback_text="".join(traceback.format_exception(type(exc), exc, exc.__traceback__)).strip(),
                 )
                 writer.finish()
+                _log_service_timing(
+                    self.config,
+                    service_id,
+                    "DB write",
+                    db_timer.elapsed_s(),
+                    detail=f"db_path={db_path} status=failed",
+                )
             except Exception:
                 writer.abort()
             return ServiceExecutionResult(service_id=service_id, status="failed", db_path=db_path, metrics={}, error=str(exc))
 
     def _execute_service(self, *, started_at: str) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
         service_start = time.perf_counter()
+        stage_timings: dict[str, float] = {}
         training_regime = str(self.config.get("training_regime") or "finetune_transfer").strip().lower()
         prepared_dataset = self.config.get("_prepared_dataset")
         if prepared_dataset is None:
             dataset_args = dict(self.config.get("dataset_args") or {})
             dataset_args.setdefault("inference_only", training_regime in {"inference_only", "inference"})
+            dataset_timer = _StageTimer()
             train, test, meta = _load_dataset(self.config.get("dataset", "hf"), **dataset_args)
+            stage_timings["dataset_load_s"] = dataset_timer.elapsed_s()
+            _log_service_timing(
+                self.config,
+                self.service_id,
+                "dataset load",
+                stage_timings["dataset_load_s"],
+                detail=f"dataset={self.config.get('dataset_name') or self.config.get('dataset')}",
+            )
         else:
+            dataset_timer = _StageTimer()
             train, test, meta = prepared_dataset
+            stage_timings["dataset_load_s"] = float(self.config.get("_dataset_load_s") or dataset_timer.elapsed_s())
+            _log_service_timing(
+                self.config,
+                self.service_id,
+                "dataset load",
+                stage_timings["dataset_load_s"],
+                detail="source=prepared_dataset",
+            )
         (x_train, y_train), (x_test, y_test) = train, test
         meta = dict(meta or {})
+        stage_timings.update(_preprocessor_stage_timings(meta))
         meta.setdefault("hf_model_id", self.config.get("hf_model_id"))
         meta.setdefault("hf_task", self.config.get("hf_task"))
         meta.setdefault("task_tag", self.config.get("task_tag"))
@@ -160,7 +213,16 @@ class ServiceRunner:
                 if value is not None:
                     meta.setdefault(key, value)
 
+        split_timer = _StageTimer()
         split_info = self._resolve_service_split(x_train, y_train, meta)
+        stage_timings["split_selection_s"] = split_timer.elapsed_s()
+        _log_service_timing(
+            self.config,
+            self.service_id,
+            "split selection",
+            stage_timings["split_selection_s"],
+            detail=f"strategy={split_info['resolved'].get('effective_strategy')}",
+        )
         x_train, y_train = split_info["x_train"], split_info["y_train"]
         split_provenance_rows = list(split_info["provenance_rows"])
 
@@ -191,6 +253,24 @@ class ServiceRunner:
             model = prepared_model
             _apply_runtime_knobs_to_model(model, self.config)
         model_build_s = time.perf_counter() - model_build_start
+        if self.config.get("_model_reset_s") is not None:
+            stage_timings["model_reset_s"] = float(self.config.get("_model_reset_s") or 0.0)
+            _log_service_timing(
+                self.config,
+                self.service_id,
+                "model reset",
+                stage_timings["model_reset_s"],
+                detail="source=prepared_model",
+            )
+        else:
+            stage_timings["model_reset_s"] = 0.0
+            _log_service_timing(
+                self.config,
+                self.service_id,
+                "model reset",
+                0.0,
+                detail="not_applicable=row_local_model",
+            )
         resolved_device = _resolve_execution_device(model)
         gpu_fallback_warning = _gpu_fallback_warning(self.config.get("device"), resolved_device)
         self._print_run_summary(
@@ -215,6 +295,22 @@ class ServiceRunner:
 
         workload_start = time.perf_counter()
         if training_regime in {"inference_only", "inference"}:
+            stage_timings["finetune_s"] = 0.0
+            stage_timings["signature_s"] = 0.0
+            _log_service_timing(
+                self.config,
+                self.service_id,
+                "finetune",
+                0.0,
+                detail="skipped=inference_only",
+            )
+            _log_service_timing(
+                self.config,
+                self.service_id,
+                "signature",
+                0.0,
+                detail="skipped=inference_only",
+            )
             eval_start = time.perf_counter()
             loss, primary, secondary, eval_qos = self._evaluate_model(model, x_test, y_test, inference_only=True, task_family=task_family)
             eval_runtime_s = time.perf_counter() - eval_start
@@ -223,9 +319,26 @@ class ServiceRunner:
             train_start = time.perf_counter()
             train_metrics = self._train_model(model, x_train, y_train, task_family=task_family)
             train_runtime_s = time.perf_counter() - train_start
+            stage_timings["finetune_s"] = train_runtime_s
+            _log_service_timing(
+                self.config,
+                self.service_id,
+                "finetune",
+                train_runtime_s,
+                detail=f"train_samples={train_samples}",
+            )
+            signature_timer = _StageTimer()
             update_signature_metrics, update_signature_artifact = self._capture_update_signature(
                 weights_before_training,
                 _snapshot_model_weights(model),
+            )
+            stage_timings["signature_s"] = signature_timer.elapsed_s()
+            _log_service_timing(
+                self.config,
+                self.service_id,
+                "signature",
+                stage_timings["signature_s"],
+                detail=f"available={bool(update_signature_metrics.get('update_signature_available', {}).get('value'))}",
             )
             eval_start = time.perf_counter()
             loss, primary, secondary, eval_qos = self._evaluate_model(model, x_test, y_test, inference_only=False, task_family=task_family)
@@ -323,6 +436,7 @@ class ServiceRunner:
             "precision_type": _metric(str(self.config.get("precision_type") or "fp16").strip().lower(), "metadata"),
             "gpu_requested_cpu_fallback_flag": _metric(bool(gpu_fallback_warning), "reliability", direction="lower_better"),
         }
+        metrics.update(_stage_timing_metrics(stage_timings))
         if gpu_fallback_warning:
             metrics["gpu_fallback_warning"] = _metric(gpu_fallback_warning, "reliability")
         metrics.update(_hf_metadata_metrics(hf_metadata))
@@ -1374,6 +1488,37 @@ def _service_perturbation_metrics(model, x_eval, y_eval, *, config: Mapping[str,
             "metadata": {"perturbation_samples": samples},
         }
     return {key: _metric(value, metric_domain(key)) for key, value in (values or {}).items()}, artifact
+
+
+def _log_service_timing(config: Mapping[str, Any], service_id: str, stage: str, elapsed_s: float, *, detail: str | None = None) -> None:
+    if not _config_bool(config.get("service_stage_timing_logging"), True):
+        return
+    model_id = config.get("hf_model_id") or config.get("model_id") or config.get("model_type") or "unknown"
+    message = f"[ServiceTiming] service_id={service_id} | model={model_id} | stage={stage} | elapsed_s={elapsed_s:.3f}"
+    if detail:
+        message = f"{message} | {detail}"
+    print(message, flush=True)
+
+
+def _stage_timing_metrics(stage_timings: Mapping[str, float]) -> dict[str, Any]:
+    return {
+        key: _metric(float(value), "runtime", "s", "lower_better")
+        for key, value in (stage_timings or {}).items()
+        if value is not None
+    }
+
+
+def _preprocessor_stage_timings(meta: Mapping[str, Any]) -> dict[str, float]:
+    timings = meta.get("preprocess_timing_s") if isinstance(meta, Mapping) else None
+    if not isinstance(timings, Mapping):
+        return {}
+    out: dict[str, float] = {}
+    for key, value in timings.items():
+        try:
+            out[f"preprocess_{key}_s"] = float(value)
+        except Exception:
+            continue
+    return out
 
 
 def _load_dataset(name: str, **kwargs):

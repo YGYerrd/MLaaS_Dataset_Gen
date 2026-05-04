@@ -9,6 +9,7 @@ import os
 import queue
 import shutil
 import sys
+import time
 import traceback
 import uuid
 from dataclasses import dataclass
@@ -19,7 +20,7 @@ from typing import Any
 import pandas as pd
 
 from ..compatibility import known_bad_row_reason
-from ..config import CONFIG, FAILURE_LOG_PATH, MANIFEST_RESULTS_PATH
+from ..config import CONFIG, FAILED_MANIFEST_PATH, FAILURE_LOG_PATH, MANIFEST_RESULTS_PATH
 from ..hf_auth import load_hf_token_from_file
 from ..registry.datasets import DATASET_REGISTRY
 from ..models.label_schema import infer_label_format, infer_num_labels
@@ -725,6 +726,102 @@ def _write_failure_db(resolved: dict[str, Any], *, row_index, service_id, case_n
         print(f"Warning: failed to persist service failure to SQLite: {db_exc}")
 
 
+def _manifest_csv_value(value: Any) -> Any:
+    value = _normalize_value(value)
+    if isinstance(value, (dict, list, tuple)):
+        return json.dumps(value, default=str)
+    return value
+
+
+def _failed_result_row_indexes(results: list[dict[str, Any]]) -> list[int]:
+    failed: list[int] = []
+    seen: set[int] = set()
+    for result in _sort_result_rows(results):
+        if str(result.get("status") or "").strip().lower() == "success":
+            continue
+        row_index = result.get("row_index")
+        if row_index is None or _is_blank(row_index):
+            continue
+        try:
+            parsed = int(row_index)
+        except Exception:
+            continue
+        if parsed not in seen:
+            failed.append(parsed)
+            seen.add(parsed)
+    return failed
+
+
+def _resolved_from_result(result: dict[str, Any]) -> dict[str, Any]:
+    raw = result.get("resolved_config_json")
+    if not raw:
+        return {}
+    try:
+        value = json.loads(str(raw))
+    except Exception:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _write_failed_manifest_csv(
+    *,
+    rows_df: pd.DataFrame,
+    manifest_defaults: dict[str, Any],
+    results: list[dict[str, Any]],
+    output_path: Path | None = None,
+    db_path: str | None = None,
+) -> Path | None:
+    output_path = output_path or FAILED_MANIFEST_PATH
+    failed_indexes = _failed_result_row_indexes(results)
+    if not failed_indexes:
+        if output_path.exists():
+            output_path.unlink()
+            print(f"Removed stale failed-row manifest: {output_path}")
+        return None
+
+    result_by_index: dict[int, dict[str, Any]] = {}
+    for result in results:
+        row_index = result.get("row_index")
+        if row_index is None or _is_blank(row_index):
+            continue
+        try:
+            result_by_index[int(row_index)] = result
+        except Exception:
+            continue
+
+    columns = list(rows_df.columns)
+    for column in manifest_defaults:
+        if column not in columns:
+            columns.append(column)
+    if "service_id" not in columns:
+        columns.insert(0, "service_id")
+    if db_path is not None and "db_path" not in columns:
+        columns.append("db_path")
+
+    retry_rows: list[dict[str, Any]] = []
+    for row_index in failed_indexes:
+        if row_index not in rows_df.index:
+            continue
+        source = rows_df.loc[row_index].to_dict()
+        resolved = _resolved_from_result(result_by_index.get(row_index, {}))
+        retry_row: dict[str, Any] = {}
+        for column in columns:
+            value = source.get(column)
+            if _is_blank(value) and column in manifest_defaults:
+                value = manifest_defaults[column]
+            if column == "service_id" and _is_blank(value):
+                value = resolved.get("service_id") or result_by_index.get(row_index, {}).get("service_id")
+            if column == "db_path" and _is_blank(value) and db_path is not None:
+                value = db_path
+            retry_row[column] = _manifest_csv_value(value)
+        retry_rows.append(retry_row)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(retry_rows, columns=columns).to_csv(output_path, index=False)
+    print(f"Wrote failed-row retry manifest: {output_path} ({len(retry_rows)} rows)")
+    return output_path
+
+
 def run_manifest(
     file: str,
     sheet: str = "services",
@@ -795,6 +892,12 @@ def run_manifest(
                 output_path = MANIFEST_RESULTS_PATH
                 output_path.parent.mkdir(parents=True, exist_ok=True)
                 pd.DataFrame(results).to_csv(output_path, index=False)
+                _write_failed_manifest_csv(
+                    rows_df=rows_df,
+                    manifest_defaults=manifest_defaults,
+                    results=results,
+                    db_path=db_path,
+                )
                 print(f"Manifest preflight failed: {exc}")
                 print(f"Wrote results: {output_path}")
                 return output_path
@@ -872,7 +975,14 @@ def run_manifest(
 
         output_path = MANIFEST_RESULTS_PATH
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        pd.DataFrame(_sort_result_rows(results)).to_csv(output_path, index=False)
+        sorted_results = _sort_result_rows(results)
+        pd.DataFrame(sorted_results).to_csv(output_path, index=False)
+        _write_failed_manifest_csv(
+            rows_df=rows_df,
+            manifest_defaults=manifest_defaults,
+            results=sorted_results,
+            db_path=db_path,
+        )
         print(f"Wrote results: {output_path}")
         return output_path
     finally:
@@ -1251,7 +1361,16 @@ def _execute_hf_model_group(entries: list[ManifestEntry]) -> list[dict[str, Any]
             f"rows={len(dataset_entries)}"
         )
         try:
+            dataset_load_start = time.perf_counter()
             prepared_dataset = service_runner._load_dataset(first.get("dataset", "hf"), **dataset_args)
+            dataset_load_s = float(time.perf_counter() - dataset_load_start)
+            print(
+                "[ServiceTiming] "
+                f"model={first.get('hf_model_id') or first.get('model_type')} "
+                f"| stage=dataset load | elapsed_s={dataset_load_s:.3f} "
+                f"| dataset={first.get('dataset_name')}",
+                flush=True,
+            )
         except Exception as exc:  # noqa: BLE001
             print(f"Grouped HF dataset load failed; falling back to row-local execution: {exc}")
             results.extend(_execute_entries_row_local(dataset_entries))
@@ -1275,11 +1394,24 @@ def _execute_hf_model_group(entries: list[ManifestEntry]) -> list[dict[str, Any]
 
         model, base_weights = model_cache[model_key]
         for entry in dataset_entries:
+            model_reset_s = None
             if base_weights is not None:
+                reset_start = time.perf_counter()
                 service_runner.reset_model_to_weights(model, base_weights)
+                model_reset_s = float(time.perf_counter() - reset_start)
+                print(
+                    "[ServiceTiming] "
+                    f"service_id={entry.resolved.get('service_id')} "
+                    f"| model={entry.resolved.get('hf_model_id') or entry.resolved.get('model_type')} "
+                    f"| stage=model reset | elapsed_s={model_reset_s:.3f}",
+                    flush=True,
+                )
             prepared_config = dict(entry.resolved)
             prepared_config["_prepared_dataset"] = prepared_dataset
             prepared_config["_prepared_model"] = model
+            prepared_config["_dataset_load_s"] = dataset_load_s
+            if model_reset_s is not None:
+                prepared_config["_model_reset_s"] = model_reset_s
             summary = service_runner.ServiceRunner(prepared_config).run()
             status = "success" if summary.status == "success" else "failed"
             error = summary.error or ""

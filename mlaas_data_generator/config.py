@@ -8,6 +8,7 @@ from pathlib import Path
 BASE_OUTPUT_DIR = Path(os.getenv("MLAAS_OUTDIR") or "outputs")
 DEFAULT_MANIFEST_PATH = BASE_OUTPUT_DIR / "service_manifest.xlsx"
 MANIFEST_RESULTS_PATH = BASE_OUTPUT_DIR / "service_manifest_results.csv"
+FAILED_MANIFEST_PATH = BASE_OUTPUT_DIR / "service_manifest_failed.csv"
 FAILURE_LOG_PATH = BASE_OUTPUT_DIR / "service_failures.log"
 
 SQL_DB_PATH = Path(os.getenv("MLAAS_SQL_DB_PATH") or os.getenv("MLAAS_DB_PATH") or BASE_OUTPUT_DIR / "services2.db")

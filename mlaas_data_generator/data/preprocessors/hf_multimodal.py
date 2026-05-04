@@ -8,6 +8,7 @@ from ..multimodal_columns import resolve_existing_column
 import numpy as np
 from collections import Counter
 import re
+import time
 
 
 _IMAGE_COLUMN_ALIASES = ("image", "img", "images", "pixel_values")
@@ -699,7 +700,13 @@ def preprocess_hf_multimodal(
             model_config = None
 
     tokenizer = _load_auto_tokenizer(AutoTokenizer, hf_model_id)
+    image_processor_timer = time.perf_counter()
     image_processor = AutoImageProcessor.from_pretrained(hf_model_id)
+    image_processor_load_s = float(time.perf_counter() - image_processor_timer)
+    print(
+        f"[ServiceTiming] model={hf_model_id} | stage=image processor load | elapsed_s={image_processor_load_s:.3f}",
+        flush=True,
+    )
     text_max_length, requested_max_length, model_text_max_length = _resolve_text_max_length(
         tokenizer,
         hf_model_id,
@@ -723,6 +730,7 @@ def preprocess_hf_multimodal(
         missing_pair_handling=policy,
     )
 
+    train_encode_timer = time.perf_counter()
     x_train, y_train, train_survived, train_decode_report = _encode_split(
         ds_train,
         hf_task=hf_task,
@@ -736,6 +744,13 @@ def preprocess_hf_multimodal(
         on_decode_error=decode_policy,
         report_decode_errors=bool(report_decode_errors),
     )
+    train_encode_s = float(time.perf_counter() - train_encode_timer)
+    print(
+        f"[ServiceTiming] model={hf_model_id} | stage=multimodal encode train | elapsed_s={train_encode_s:.3f} "
+        f"| samples={train_survived}",
+        flush=True,
+    )
+    test_encode_timer = time.perf_counter()
     x_test, y_test, test_survived, test_decode_report = _encode_split(
         ds_test,
         hf_task=hf_task,
@@ -748,6 +763,12 @@ def preprocess_hf_multimodal(
         split_name="test",
         on_decode_error=decode_policy,
         report_decode_errors=bool(report_decode_errors),
+    )
+    test_encode_s = float(time.perf_counter() - test_encode_timer)
+    print(
+        f"[ServiceTiming] model={hf_model_id} | stage=multimodal encode test | elapsed_s={test_encode_s:.3f} "
+        f"| samples={test_survived}",
+        flush=True,
     )
 
     vqa_meta = {}
@@ -877,6 +898,12 @@ def preprocess_hf_multimodal(
                 "diagonal_in_batch" if hf_task == "text_image_retrieval" else None
             ),
             "x_keys": ["input_ids", "attention_mask", "pixel_values"],
+            "preprocess_timing_s": {
+                "image_processor_load": image_processor_load_s,
+                "multimodal_encode_train": train_encode_s,
+                "multimodal_encode_test": test_encode_s,
+                "multimodal_encode_total": train_encode_s + test_encode_s,
+            },
             **vqa_meta,
             "schema": {
                 "image_column": image_column,

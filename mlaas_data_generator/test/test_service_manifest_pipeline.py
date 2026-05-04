@@ -9,6 +9,7 @@ import mlaas_data_generator.cli.run_manifest as run_manifest_module
 from mlaas_data_generator.services import runner as service_runner_module
 from mlaas_data_generator.cli.manifest.hf_manifest_builder import MANIFEST_COLUMNS, build_hf_manifest
 from mlaas_data_generator.cli.run_manifest import _resolve_row, _validate_row, run_manifest
+from mlaas_data_generator.services.runner import ServiceExecutionResult
 
 
 def test_manifest_builder_emits_service_rows_without_federated_columns():
@@ -278,6 +279,85 @@ def test_run_manifest_dry_run_validates_service_rows(tmp_path):
     assert resolved["benchmark_split"] == "validation"
     assert "num_rounds" not in resolved
     assert "num_clients" not in resolved
+
+
+def test_run_manifest_writes_failed_rows_to_retry_manifest(monkeypatch, tmp_path):
+    manifest = tmp_path / "manifest.csv"
+    results_path = tmp_path / "service_manifest_results.csv"
+    failed_manifest_path = tmp_path / "service_manifest_failed.csv"
+    db_path = tmp_path / "services.db"
+    pd.DataFrame(
+        [
+            {
+                "service_id": "defaults",
+                "batch_size": 4,
+                "training_regime": "generic",
+            },
+            {
+                "service_id": "svc_retry",
+                "enabled": True,
+                "dataset": "fixture",
+                "model_type": "generic",
+                "task_type": "classification",
+            },
+        ]
+    ).to_csv(manifest, index=False)
+
+    def fake_execute_service(config):
+        return ServiceExecutionResult(
+            service_id=config["service_id"],
+            status="failed",
+            db_path=str(db_path),
+            metrics={},
+            error="planned failure",
+        )
+
+    monkeypatch.setattr(run_manifest_module, "MANIFEST_RESULTS_PATH", results_path)
+    monkeypatch.setattr(run_manifest_module, "FAILED_MANIFEST_PATH", failed_manifest_path)
+    monkeypatch.setattr(run_manifest_module, "execute_service", fake_execute_service)
+
+    run_manifest(str(manifest), db_path=str(db_path))
+
+    retry = pd.read_csv(failed_manifest_path)
+    assert len(retry) == 1
+    assert retry.iloc[0]["service_id"] == "svc_retry"
+    assert retry.iloc[0]["dataset"] == "fixture"
+    assert retry.iloc[0]["batch_size"] == 4
+    assert retry.iloc[0]["db_path"] == str(db_path)
+
+
+def test_run_manifest_removes_stale_retry_manifest_when_no_rows_fail(monkeypatch, tmp_path):
+    manifest = tmp_path / "manifest.csv"
+    failed_manifest_path = tmp_path / "service_manifest_failed.csv"
+    failed_manifest_path.write_text("service_id\nstale\n", encoding="utf-8")
+    pd.DataFrame(
+        [
+            {
+                "service_id": "svc_ok",
+                "enabled": True,
+                "dataset": "hf",
+                "model_type": "hf",
+                "task_type": "classification",
+                "hf_task": "sequence_classification",
+                "hf_model_id": "distilbert-base-uncased",
+                "dataset_name": "glue",
+                "dataset_config": "sst2",
+                "train_split": "train",
+                "test_split": "validation",
+                "text_column": "sentence",
+                "label_column": "label",
+                "training_regime": "inference_only",
+                "batch_size": 4,
+            }
+        ]
+    ).to_csv(manifest, index=False)
+
+    monkeypatch.setattr(run_manifest_module, "MANIFEST_RESULTS_PATH", tmp_path / "service_manifest_results.csv")
+    monkeypatch.setattr(run_manifest_module, "FAILED_MANIFEST_PATH", failed_manifest_path)
+
+    run_manifest(str(manifest), dry_run=True, db_path=str(tmp_path / "services.db"))
+
+    assert not failed_manifest_path.exists()
 
 
 class TransformersGroupedModel:

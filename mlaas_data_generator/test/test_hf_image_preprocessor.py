@@ -102,6 +102,32 @@ class FakeImageProcessorCallKwargsButStrictPreprocess:
         return {"pixel_values": arr}
 
 
+class FakeTorchLikeTensor:
+    def __init__(self, value):
+        self._value = np.asarray(value)
+
+    def detach(self):
+        return self
+
+    def cpu(self):
+        return self
+
+    def numpy(self):
+        return self._value
+
+
+class FakeTensorImageProcessor:
+    @classmethod
+    def from_pretrained(cls, *args, **kwargs):
+        return cls()
+
+    def __call__(self, image, return_tensors=None, do_resize=True, do_normalize=True, do_augment=False):
+        arr = np.asarray(image, dtype=np.float32)
+        if arr.ndim == 3 and arr.shape[0] != 3 and arr.shape[-1] == 3:
+            arr = np.transpose(arr, (2, 0, 1))
+        return {"pixel_values": [FakeTorchLikeTensor(arr)]}
+
+
 class FakeSegmentationImageProcessor:
     last_from_pretrained_kwargs = None
 
@@ -158,6 +184,11 @@ def _install_fake_transformers_no_augment_arg():
 
 def _install_fake_transformers_call_kwargs_strict_preprocess():
     fake_mod = types.SimpleNamespace(AutoImageProcessor=FakeImageProcessorCallKwargsButStrictPreprocess)
+    sys.modules["transformers"] = fake_mod
+
+
+def _install_fake_transformers_tensor_outputs():
+    fake_mod = types.SimpleNamespace(AutoImageProcessor=FakeTensorImageProcessor)
     sys.modules["transformers"] = fake_mod
 
 
@@ -291,6 +322,29 @@ def test_image_task_dispatch_uses_hf_task_when_modality_missing():
     assert x_test["pixel_values"].shape == (1, 3, 3, 3)
     assert y_train.tolist() == [1]
     assert y_test.tolist() == [0]
+
+
+def test_image_classification_accepts_tensor_like_processor_outputs_and_labels():
+    _install_fake_transformers_tensor_outputs()
+    train_rows = [
+        {"image": np.zeros((3, 3, 3), dtype=np.uint8), "labels": FakeTorchLikeTensor(np.asarray(1))},
+        {"image": np.ones((3, 3, 3), dtype=np.uint8), "labels": FakeTorchLikeTensor(np.asarray([2]))},
+    ]
+    test_rows = [{"image": np.ones((3, 3, 3), dtype=np.uint8), "labels": FakeTorchLikeTensor(np.asarray(0))}]
+
+    (x_train, y_train), (x_test, y_test), meta = preprocess_hf(
+        (DummySplit(train_rows), None),
+        (DummySplit(test_rows), None),
+        {"hf_task": "image_classification", "modality": "image", "task_type": "classification", "hf_id": "dummy"},
+        hf_model_id="dummy/vision",
+        label_column="labels",
+    )
+
+    assert x_train["pixel_values"].shape == (2, 3, 3, 3)
+    assert x_test["pixel_values"].shape == (1, 3, 3, 3)
+    assert y_train.tolist() == [1, 2]
+    assert y_test.tolist() == [0]
+    assert meta["decode_report"]["train"]["failed"] == 0
 
 
 def test_image_classification_preserves_existing_num_classes_metadata():

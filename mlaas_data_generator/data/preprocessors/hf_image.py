@@ -6,6 +6,7 @@ import os
 import inspect
 import logging
 import re
+import time
 
 import numpy as np
 
@@ -32,6 +33,23 @@ def _normalize_label_name(name):
     txt = str(name or "").strip().lower()
     txt = re.sub(r"[^a-z0-9]+", " ", txt).strip()
     return txt
+
+
+def _to_numpy_array(value, *, dtype=None):
+    if hasattr(value, "detach") and hasattr(value, "cpu") and hasattr(value, "numpy"):
+        value = value.detach().cpu().numpy()
+    elif isinstance(value, (list, tuple)):
+        value = [_to_numpy_array(item) for item in value]
+    return np.asarray(value, dtype=dtype)
+
+
+def _to_scalar_int(value, *, field_name="label"):
+    arr = _to_numpy_array(value)
+    if arr.shape == ():
+        return int(arr.item())
+    if arr.size == 1:
+        return int(arr.reshape(-1)[0])
+    raise ValueError(f"{field_name} must be scalar for image classification, got shape={arr.shape}")
 
 
 def _to_numpy_rgb(image_like):
@@ -623,7 +641,7 @@ def _process_split(
                     split_name,
                     idx,
                 )
-            pix = np.asarray(pix, dtype=np.float32)
+            pix = _to_numpy_array(pix, dtype=np.float32)
             if pix.ndim == 4:
                 pix = pix[0]
             if pix.ndim != 3:
@@ -634,7 +652,7 @@ def _process_split(
                 raise ValueError(f"processor output must have 3 channels, got {pix.shape}")
 
             if task_type == "classification":
-                label = int(row.get(label_column))
+                label = _to_scalar_int(row.get(label_column), field_name=str(label_column or "label"))
             elif task_type == "detection":
                 LOGGER.info(
                     "[detection preprocessing] split=%s idx=%d before np.asarray(boxes/classes)",
@@ -814,7 +832,13 @@ def preprocess_hf_image(
                 segmentation_model_num_labels = None
                 segmentation_ignore_index = None
 
+    processor_timer = time.perf_counter()
     processor = AutoImageProcessor.from_pretrained(hf_model_id, **processor_kwargs)
+    processor_load_s = float(time.perf_counter() - processor_timer)
+    print(
+        f"[ServiceTiming] model={hf_model_id} | stage=image processor load | elapsed_s={processor_load_s:.3f}",
+        flush=True,
+    )
     if task_type == "segmentation" and hasattr(processor, "do_reduce_labels"):
         # Scan the selected training split instead of a tiny prefix sample.
         # The previous probe could miss rare max-label ids and cause the same
@@ -833,6 +857,7 @@ def preprocess_hf_image(
         ):
             processor.do_reduce_labels = True
 
+    train_process_timer = time.perf_counter()
     x_train, y_train, train_report = _process_split(
         ds_train,
         split_name="train",
@@ -848,6 +873,13 @@ def preprocess_hf_image(
         on_decode_error=on_decode_error,
         report_decode_errors=report_decode_errors,
     )
+    train_process_s = float(time.perf_counter() - train_process_timer)
+    print(
+        f"[ServiceTiming] model={hf_model_id} | stage=_process_split train | elapsed_s={train_process_s:.3f} "
+        f"| samples={len(x_train)}",
+        flush=True,
+    )
+    test_process_timer = time.perf_counter()
     x_test, y_test, test_report = _process_split(
         ds_test,
         split_name="test",
@@ -862,6 +894,12 @@ def preprocess_hf_image(
         dataset_id=dataset_id,
         on_decode_error=on_decode_error,
         report_decode_errors=report_decode_errors,
+    )
+    test_process_s = float(time.perf_counter() - test_process_timer)
+    print(
+        f"[ServiceTiming] model={hf_model_id} | stage=_process_split test | elapsed_s={test_process_s:.3f} "
+        f"| samples={len(x_test)}",
+        flush=True,
     )
 
     if task_type == "detection":
@@ -972,6 +1010,12 @@ def preprocess_hf_image(
             "decode_error_policy": on_decode_error,
             "decode_report": {"train": train_report, "test": test_report},
             "segmentation_reduce_labels": bool(getattr(processor, "do_reduce_labels", False)) if task_type == "segmentation" else None,
+            "preprocess_timing_s": {
+                "image_processor_load": processor_load_s,
+                "image_process_split_train": train_process_s,
+                "image_process_split_test": test_process_s,
+                "image_process_split_total": train_process_s + test_process_s,
+            },
             "schema": {
                 "image_column": image_column,
                 "label_column": label_column if task_type == "classification" else None,
