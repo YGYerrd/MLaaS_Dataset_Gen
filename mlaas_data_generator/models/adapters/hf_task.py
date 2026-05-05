@@ -991,6 +991,19 @@ class ObjectDetectionSpec(HFTaskSpec):
                         class_labels,
                         force=force_contiguous_remap,
                     )
+                if not np.all(np.isfinite(boxes_cxcywh_norm)):
+                    raise ValueError("object detection labels contain non-finite boxes")
+                if np.any(boxes_cxcywh_norm < 0.0) or np.any(boxes_cxcywh_norm > 1.0):
+                    raise ValueError("object detection boxes must be normalized to [0, 1]")
+                if class_labels.size and int(np.min(class_labels)) < 0:
+                    raise ValueError("object detection class ids must be non-negative")
+                valid_ids = self._model_valid_class_ids
+                if valid_ids and class_labels.size:
+                    valid_set = set(int(v) for v in valid_ids)
+                    unknown = sorted({int(v) for v in class_labels.tolist() if int(v) not in valid_set})
+                    if unknown:
+                        preview = ",".join(str(v) for v in unknown[:5])
+                        raise ValueError(f"object detection class ids outside model label space: {preview}")
                 labels_t.append(
                     {
                         "class_labels": _to_torch_tensor(torch, class_labels, dtype=torch.long, device=device),
@@ -1748,11 +1761,30 @@ class FillMaskSpec(HFTaskSpec):
         if yb is not None:
             labels_t = _to_torch_tensor(torch, yb, dtype=torch.long, device=device)
 
+        if labels_t is not None:
+            seq_len = None
+            for value in enc.values():
+                if hasattr(value, "ndim") and int(value.ndim) >= 2:
+                    seq_len = int(value.shape[1])
+                    break
+            if seq_len is not None and int(labels_t.ndim) >= 2 and int(labels_t.shape[1]) != seq_len:
+                target_len = min(seq_len, int(labels_t.shape[1]))
+                enc = {
+                    key: (value[:, :target_len] if hasattr(value, "ndim") and int(value.ndim) >= 2 else value)
+                    for key, value in enc.items()
+                }
+                labels_t = labels_t[:, :target_len]
+
         return enc, labels_t, {"ignore_index": int(ignore_index)}
 
     def loss_fn(self, torch, logits, labels_t, extra):
         ignore_index = int(extra.get("ignore_index", -100))
         if logits.ndim == 3 and labels_t.ndim == 2:
+            if int(logits.shape[0]) != int(labels_t.shape[0]) or int(logits.shape[1]) != int(labels_t.shape[1]):
+                raise ValueError(
+                    "fill_mask logits/labels shape mismatch before loss: "
+                    f"logits={tuple(logits.shape)} labels={tuple(labels_t.shape)}"
+                )
             return torch.nn.functional.cross_entropy(
                 logits.transpose(1, 2),
                 labels_t,

@@ -465,6 +465,23 @@ class HFCore:
             yield xb, yb
 
     @staticmethod
+    def _batch_item_count(xb):
+        if isinstance(xb, dict):
+            if not xb:
+                return 0
+            return len(next(iter(xb.values())))
+        return len(xb)
+
+    def _should_skip_singleton_train_batch(self, xb):
+        task_name = str(getattr(self.task_spec, "name", "") or "")
+        model_id = str(getattr(self, "model_id", "") or "").lower()
+        return (
+            task_name == "image_segmentation"
+            and model_id.startswith("openmmlab/upernet-")
+            and int(self._batch_item_count(xb)) == 1
+        )
+
+    @staticmethod
     def _active_column_span(mask, *, inactive_value=0):
         if not isinstance(mask, np.ndarray) or mask.ndim != 2 or mask.shape[1] == 0:
             return None
@@ -879,6 +896,8 @@ class HFCore:
                 if self._training_timed_out(t_start, max_train_time_s):
                     timeout_hit = True
                     break
+                if self._should_skip_singleton_train_batch(xb):
+                    continue
 
                 global_batch_idx += 1
                 t0 = time.time()

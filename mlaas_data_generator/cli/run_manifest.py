@@ -27,6 +27,7 @@ from ..models.label_schema import infer_label_format, infer_num_labels
 from ..services.runner import execute_service, resolve_service_id
 from ..services import runner as service_runner
 from ..services.taxonomy import canonical_task_family
+from ..runtime_compat import is_cuda_poison_error
 from ..storage.writer import make_writer
 
 BASE_DEFAULTS: dict[str, Any] = {
@@ -726,6 +727,58 @@ def _write_failure_db(resolved: dict[str, Any], *, row_index, service_id, case_n
         print(f"Warning: failed to persist service failure to SQLite: {db_exc}")
 
 
+def _clear_cuda_runtime_state() -> None:
+    try:
+        import torch
+    except Exception:
+        return
+    cuda = getattr(torch, "cuda", None)
+    if cuda is None or not callable(getattr(cuda, "is_available", None)):
+        return
+    try:
+        if not cuda.is_available():
+            return
+    except Exception:
+        return
+    for name in ("synchronize", "empty_cache", "ipc_collect"):
+        fn = getattr(cuda, name, None)
+        if callable(fn):
+            try:
+                fn()
+            except Exception:
+                pass
+
+
+def _record_entry_failure(entry: ManifestEntry, *, failure_stage: str, error_message: Any, exc=None) -> dict[str, Any]:
+    resolved = entry.resolved
+    service_id = resolved.get("service_id")
+    error_text = str(error_message) if error_message is not None else ""
+    _write_failure_log(
+        FAILURE_LOG_PATH,
+        row_index=entry.idx,
+        service_id=service_id,
+        case_name=resolved.get("case_name"),
+        manifest_group_id=resolved.get("manifest_group_id"),
+        failure_stage=failure_stage,
+        error_message=error_text,
+        resolved=resolved,
+        exc=exc,
+    )
+    _write_failure_db(
+        resolved,
+        row_index=entry.idx,
+        service_id=service_id,
+        case_name=resolved.get("case_name"),
+        manifest_group_id=resolved.get("manifest_group_id"),
+        failure_stage=failure_stage,
+        error_message=error_text,
+        exc=exc,
+    )
+    result = _result_row(resolved, entry.idx, "failed", error_text, service_id=str(service_id or ""))
+    _record_manifest_progress_result(result)
+    return result
+
+
 def _manifest_csv_value(value: Any) -> Any:
     value = _normalize_value(value)
     if isinstance(value, (dict, list, tuple)):
@@ -1317,14 +1370,30 @@ def _execute_hf_groups_with_gpu_affinity(model_groups: list[list[ManifestEntry]]
                     results.extend(future.result())
                 except Exception as exc:  # noqa: BLE001
                     _manifest_progress_clear(worker_label)
-                    _manifest_progress_start("main", _describe_group(model_entries))
                     first = model_entries[0].resolved
-                    print(
-                        "Parallel grouped HF worker failed; retrying in main process: "
-                        f"model={first.get('hf_model_id')} task={first.get('hf_task')} error={exc}"
-                    )
-                    results.extend(_execute_hf_model_group(model_entries))
-                    _manifest_progress_clear("main")
+                    if is_cuda_poison_error(exc):
+                        print(
+                            "Parallel grouped HF worker hit a CUDA poison error; recording group failures: "
+                            f"model={first.get('hf_model_id')} task={first.get('hf_task')} error={exc}"
+                        )
+                        _clear_cuda_runtime_state()
+                        for entry in model_entries:
+                            results.append(
+                                _record_entry_failure(
+                                    entry,
+                                    failure_stage="grouped_worker_cuda_poison",
+                                    error_message=exc,
+                                    exc=exc,
+                                )
+                            )
+                    else:
+                        _manifest_progress_start("main", _describe_group(model_entries))
+                        print(
+                            "Parallel grouped HF worker failed; retrying in main process: "
+                            f"model={first.get('hf_model_id')} task={first.get('hf_task')} error={exc}"
+                        )
+                        results.extend(_execute_hf_model_group(model_entries))
+                        _manifest_progress_clear("main")
                 else:
                     _manifest_progress_clear(worker_label)
                 if pending_groups:
@@ -1393,11 +1462,40 @@ def _execute_hf_model_group(entries: list[ManifestEntry]) -> list[dict[str, Any]
             model_cache[model_key] = (model, base_weights)
 
         model, base_weights = model_cache[model_key]
-        for entry in dataset_entries:
+        for entry_pos, entry in enumerate(dataset_entries):
             model_reset_s = None
             if base_weights is not None:
                 reset_start = time.perf_counter()
-                service_runner.reset_model_to_weights(model, base_weights)
+                try:
+                    service_runner.reset_model_to_weights(model, base_weights)
+                except Exception as exc:  # noqa: BLE001
+                    model_cache.pop(model_key, None)
+                    if is_cuda_poison_error(exc):
+                        _clear_cuda_runtime_state()
+                    result = _record_entry_failure(
+                        entry,
+                        failure_stage=(
+                            "model_reset_cuda_poison"
+                            if is_cuda_poison_error(exc)
+                            else "model_reset_failed"
+                        ),
+                        error_message=exc,
+                        exc=exc,
+                    )
+                    results.append(result)
+                    try:
+                        model = _build_prepared_hf_model(first, meta)
+                        base_weights = service_runner.snapshot_model_weights(model)
+                        model_cache[model_key] = (model, base_weights)
+                    except Exception as rebuild_exc:  # noqa: BLE001
+                        print(
+                            "Grouped HF model rebuild failed after reset error; "
+                            f"remaining rows in dataset group will fall back row-local: {rebuild_exc}"
+                        )
+                        remaining = dataset_entries[entry_pos + 1 :]
+                        results.extend(_execute_entries_row_local(remaining))
+                        return results
+                    continue
                 model_reset_s = float(time.perf_counter() - reset_start)
                 print(
                     "[ServiceTiming] "
@@ -1412,11 +1510,38 @@ def _execute_hf_model_group(entries: list[ManifestEntry]) -> list[dict[str, Any]
             prepared_config["_dataset_load_s"] = dataset_load_s
             if model_reset_s is not None:
                 prepared_config["_model_reset_s"] = model_reset_s
-            summary = service_runner.ServiceRunner(prepared_config).run()
+            try:
+                summary = service_runner.ServiceRunner(prepared_config).run()
+            except Exception as exc:  # noqa: BLE001
+                model_cache.pop(model_key, None)
+                if is_cuda_poison_error(exc):
+                    _clear_cuda_runtime_state()
+                result = _record_entry_failure(
+                    entry,
+                    failure_stage=(
+                        "service_execution_cuda_poison"
+                        if is_cuda_poison_error(exc)
+                        else "service_execution"
+                    ),
+                    error_message=exc,
+                    exc=exc,
+                )
+                results.append(result)
+                if is_cuda_poison_error(exc):
+                    try:
+                        model = _build_prepared_hf_model(first, meta)
+                        base_weights = service_runner.snapshot_model_weights(model)
+                        model_cache[model_key] = (model, base_weights)
+                    except Exception:
+                        pass
+                continue
             status = "success" if summary.status == "success" else "failed"
             error = summary.error or ""
             if status != "success":
                 print(f"Service failed for row {entry.idx}: {error}")
+                if is_cuda_poison_error(error):
+                    model_cache.pop(model_key, None)
+                    _clear_cuda_runtime_state()
             result = _result_row(entry.resolved, entry.idx, status, error, service_id=summary.service_id)
             results.append(result)
             _record_manifest_progress_result(result)

@@ -64,6 +64,12 @@ def known_bad_path_reason(
             "the image/mask schema is explicitly verified"
         )
 
+    if task == "image_segmentation" and dataset == "zhoubolei/scene_parse_150":
+        return (
+            "blocked known-bad runtime path: zhoubolei/scene_parse_150 requires a dataset loading "
+            "path unsupported by the current datasets runtime"
+        )
+
     if task == "image_classification" and (model, dataset, dataset_cfg) in _BLOCKED_IMAGE_CLASSIFICATION_RUNTIME_PAIRS:
         return (
             "blocked known-bad runtime path: this image-classification model/dataset pair repeatedly "

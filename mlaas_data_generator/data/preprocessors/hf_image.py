@@ -44,6 +44,8 @@ def _to_numpy_array(value, *, dtype=None):
 
 
 def _to_scalar_int(value, *, field_name="label"):
+    if isinstance(value, (list, tuple)) and len(value) == 1:
+        return _to_scalar_int(value[0], field_name=field_name)
     arr = _to_numpy_array(value)
     if arr.shape == ():
         return int(arr.item())

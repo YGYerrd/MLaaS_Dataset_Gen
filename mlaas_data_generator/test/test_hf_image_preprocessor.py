@@ -2,6 +2,7 @@ import sys
 import types
 
 import numpy as np
+import pytest
 
 import mlaas_data_generator.data.preprocessors.hf_image as hf_image_module
 from mlaas_data_generator.data.preprocessors.hf import preprocess_hf
@@ -224,6 +225,38 @@ def test_image_classification_routing_and_deterministic_eval():
     assert not np.isclose(float(x_test["pixel_values"][0, 0, 0, 0]), 0.1)
     assert y_train.dtype == np.int64
     assert y_test.dtype == np.int64
+
+
+def test_image_classification_accepts_one_element_tensor_labels():
+    _install_fake_transformers()
+    train_rows = [
+        {"image": np.zeros((4, 4, 3), dtype=np.uint8), "label": [FakeTorchLikeTensor([2])]},
+    ]
+    test_rows = [{"image": np.ones((4, 4, 3), dtype=np.uint8), "label": FakeTorchLikeTensor([1])}]
+
+    train, test, _ = preprocess_hf(
+        (DummySplit(train_rows), None),
+        (DummySplit(test_rows), None),
+        {"hf_task": "image_classification", "modality": "image", "task_type": "classification", "hf_id": "dummy"},
+        hf_model_id="dummy/vision",
+    )
+
+    assert train[1].tolist() == [2]
+    assert test[1].tolist() == [1]
+
+
+def test_image_classification_rejects_multi_element_labels():
+    _install_fake_transformers()
+    train_rows = [{"image": np.zeros((4, 4, 3), dtype=np.uint8), "label": FakeTorchLikeTensor([1, 2])}]
+    test_rows = [{"image": np.ones((4, 4, 3), dtype=np.uint8), "label": 1}]
+
+    with pytest.raises(ValueError, match="all samples failed preprocessing"):
+        preprocess_hf(
+            (DummySplit(train_rows), None),
+            (DummySplit(test_rows), None),
+            {"hf_task": "image_classification", "modality": "image", "task_type": "classification", "hf_id": "dummy"},
+            hf_model_id="dummy/vision",
+        )
 
 
 def test_image_decode_error_skip_and_report():

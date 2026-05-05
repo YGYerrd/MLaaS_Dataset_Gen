@@ -752,7 +752,7 @@ class ServiceRunner:
             device=_device_arg_for_model(self.config.get("device")),
             mixed_precision=self.config.get("mixed_precision"),
             precision_type=self.config.get("precision_type"),
-            batch_size=int(self.config.get("batch_size", 16) or 16),
+            batch_size=_effective_hf_batch_size(self.config, task_family),
             task_tag=self.config.get("task_tag"),
             clustering_k=self.config.get("clustering_k"),
             clustering_init=self.config.get("clustering_init", "k-means++"),
@@ -862,6 +862,15 @@ def reset_model_to_weights(model: Any, weights: Any) -> bool:
     set_weights(_clone_weight_payload(weights))
     _clear_model_runtime_state(model)
     return True
+
+
+def _effective_hf_batch_size(config: Mapping[str, Any], task_family: str | None = None) -> int:
+    requested = int(config.get("batch_size", 16) or 16)
+    model_id = str(config.get("hf_model_id") or config.get("model_id") or "").strip().lower()
+    family = str(task_family or config.get("task_type") or "").strip().lower()
+    if family == "segmentation" and model_id.startswith("nvidia/segformer-b5-"):
+        return max(1, min(requested, 2))
+    return requested
 
 
 def snapshot_model_weights(model: Any) -> Any | None:
