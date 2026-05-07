@@ -92,6 +92,32 @@ class TransformersBrokenMetricModel:
         return 64
 
 
+class TransformersSentenceSimilarityFallbackModel:
+    def evaluate(self, x, y, inference_only=False, max_eval_time_s=None, progress_log_interval=10):
+        return 0.2, np.nan, 0.5, {"pearson": np.nan, "spearman": 0.5}
+
+    def count_params(self):
+        return 64
+
+
+class TransformersOomOnceModel:
+    def __init__(self):
+        self.batch_size = 4
+        self.fit_calls = 0
+
+    def fit(self, x, y, **kwargs):
+        self.fit_calls += 1
+        if self.fit_calls == 1:
+            raise RuntimeError("CUDA out of memory. Tried to allocate 44.00 MiB.")
+        return {"completed_batches": 1}
+
+    def evaluate(self, x, y, inference_only=False, max_eval_time_s=None, progress_log_interval=10):
+        return 0.1, 0.75, 0.5, {}
+
+    def count_params(self):
+        return 64
+
+
 @pytest.fixture(autouse=True)
 def _stub_optional_runner_metrics(monkeypatch):
     monkeypatch.setattr(runner, "capture_hardware_snapshot", lambda: {"platform": "test"})
@@ -157,6 +183,58 @@ def test_service_runner_prefers_loader_regression_semantics_for_sentence_similar
         assert metric_rows["metric_score"] == pytest.approx(0.625)
 
 
+def test_service_runner_uses_spearman_score_when_sentence_similarity_pearson_is_nan(monkeypatch, tmp_path):
+    db_path = tmp_path / "services.db"
+
+    def fake_load_dataset(name, **kwargs):
+        x_train = [("a", "b"), ("c", "d")]
+        y_train = np.asarray([0.1, 0.9], dtype="float32")
+        x_test = [("e", "f"), ("g", "h")]
+        y_test = np.asarray([0.2, 0.8], dtype="float32")
+        meta = {
+            "input_shape": (2,),
+            "num_classes": 1,
+            "task_type": "regression",
+            "hf_task": "sentence_similarity",
+            "input_schema": "text_pair",
+            "dataset_family": "synthetic",
+        }
+        return (x_train, y_train), (x_test, y_test), meta
+
+    monkeypatch.setattr(runner, "load_dataset", fake_load_dataset)
+    monkeypatch.setattr(runner, "create_model", lambda **kwargs: TransformersSentenceSimilarityFallbackModel())
+
+    result = runner.execute_service(
+        {
+            "service_id": "svc_sts_nan_pearson",
+            "db_path": str(db_path),
+            "dataset": "synthetic",
+            "dataset_name": "synthetic_pairs",
+            "model_type": "hf",
+            "task_type": "regression",
+            "hf_task": "sentence_similarity",
+            "modality": "text",
+            "training_regime": "inference_only",
+            "training_epochs": 0,
+            "batch_size": 2,
+        }
+    )
+
+    assert result.status == "success"
+    with sqlite3.connect(db_path) as conn:
+        metric_rows = dict(
+            conn.execute(
+                "SELECT metric_name, value_num FROM service_metrics WHERE service_id='svc_sts_nan_pearson'"
+            ).fetchall()
+        )
+        pearson_json = conn.execute(
+            "SELECT value_json FROM service_metrics WHERE service_id='svc_sts_nan_pearson' AND metric_name='pearson'"
+        ).fetchone()[0]
+        assert pearson_json == "null"
+        assert metric_rows["spearman"] == pytest.approx(0.5)
+        assert metric_rows["metric_score"] == pytest.approx(0.75)
+
+
 def test_service_runner_fails_metric_validation_for_non_finite_primary_metric(monkeypatch, tmp_path):
     db_path = tmp_path / "services.db"
 
@@ -193,6 +271,42 @@ def test_service_runner_fails_metric_validation_for_non_finite_primary_metric(mo
             "SELECT failure_stage FROM service_failures WHERE service_id='svc_bad_metric'"
         ).fetchone()[0]
         assert failure_stage == "metric_validation"
+
+
+def test_service_runner_retries_transformers_finetune_once_after_cuda_oom(monkeypatch, tmp_path):
+    db_path = tmp_path / "services.db"
+    model = TransformersOomOnceModel()
+
+    def fake_load_dataset(name, **kwargs):
+        x_train = np.asarray([[0.0], [1.0], [2.0], [3.0]])
+        y_train = np.asarray([0, 1, 0, 1])
+        x_test = np.asarray([[0.0], [1.0]])
+        y_test = np.asarray([1, 0])
+        meta = {"input_shape": (1,), "num_classes": 2, "task_type": "classification", "dataset_family": "synthetic"}
+        return (x_train, y_train), (x_test, y_test), meta
+
+    monkeypatch.setattr(runner, "load_dataset", fake_load_dataset)
+    monkeypatch.setattr(runner, "create_model", lambda **kwargs: model)
+
+    result = runner.execute_service(
+        {
+            "service_id": "svc_oom_retry",
+            "db_path": str(db_path),
+            "dataset": "synthetic",
+            "dataset_name": "synthetic_oom",
+            "model_type": "hf",
+            "task_type": "classification",
+            "hf_task": "sequence_classification",
+            "modality": "text",
+            "training_regime": "finetune_transfer",
+            "training_epochs": 1,
+            "batch_size": 4,
+        }
+    )
+
+    assert result.status == "success"
+    assert model.fit_calls == 2
+    assert model.batch_size == 2
 
 
 def test_service_runner_rejects_undersized_detection_finetune_run_before_model_build(monkeypatch, tmp_path):

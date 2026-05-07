@@ -41,6 +41,20 @@ class BrokenRowDS(DummyDS):
         return self.rows[key]
 
 
+class TensorLikeArray:
+    def __init__(self, value):
+        self._value = np.asarray(value, dtype=np.float32)
+
+    def detach(self):
+        return self
+
+    def cpu(self):
+        return self
+
+    def numpy(self):
+        return self._value
+
+
 def test_vqa_token_label_encoding_masks_special_tokens():
     class DummyTokenizer:
         all_special_ids = [101, 102, 0]
@@ -250,6 +264,88 @@ def test_hf_multimodal_preprocessor_skips_decode_errors(monkeypatch):
     assert y_train.tolist() == [1]
     assert meta["schema"]["decode_report"]["train"]["failed"] == 1
     assert meta["schema"]["decode_report"]["train"]["survived"] == 1
+
+
+def test_hf_multimodal_retrieval_accepts_tensor_like_image_processor_output(monkeypatch):
+    train = DummyDS([
+        {"image": np.ones((8, 8, 3), dtype=np.uint8), "caption": "hello"},
+        {"image": np.ones((8, 8, 3), dtype=np.uint8), "caption": "world"},
+    ])
+    test = DummyDS([
+        {"image": np.ones((8, 8, 3), dtype=np.uint8), "caption": "test"},
+    ])
+
+    class DummyTokenizer:
+        def __call__(self, text, **kwargs):
+            return {"input_ids": [1, 2, 0], "attention_mask": [1, 1, 0]}
+
+    class DummyImageProcessor:
+        def __call__(self, image, **kwargs):
+            chw = np.transpose(np.asarray(image, dtype=np.float32), (2, 0, 1))
+            return {"pixel_values": TensorLikeArray(chw.reshape(1, *chw.shape))}
+
+    fake_tr = types.SimpleNamespace(
+        AutoTokenizer=types.SimpleNamespace(from_pretrained=lambda *a, **k: DummyTokenizer()),
+        AutoImageProcessor=types.SimpleNamespace(from_pretrained=lambda *a, **k: DummyImageProcessor()),
+    )
+    monkeypatch.setitem(sys.modules, "transformers", fake_tr)
+
+    (x_train, y_train), (_, _), meta = preprocess_hf_multimodal(
+        (train, None),
+        (test, None),
+        {"task_type": "retrieval"},
+        hf_model_id="dummy/model",
+        hf_task="text_image_retrieval",
+        image_column="image",
+        text_column="caption",
+        max_length=4,
+    )
+
+    assert x_train["pixel_values"].shape == (2, 3, 8, 8)
+    assert x_train["caption_lengths"].tolist() == [1, 1]
+    assert y_train.tolist() == [0, 0]
+    assert meta["schema"]["decode_report"]["train"]["survived"] == 2
+
+
+def test_hf_multimodal_retrieval_all_invalid_split_still_fails(monkeypatch):
+    train = DummyDS([
+        {"image": "missing-a.jpg", "caption": "bad"},
+        {"image": "missing-b.jpg", "caption": "also bad"},
+    ])
+    test = DummyDS([
+        {"image": np.ones((8, 8, 3), dtype=np.uint8), "caption": "test"},
+    ])
+
+    class DummyTokenizer:
+        def __call__(self, text, **kwargs):
+            return {"input_ids": [1, 2, 0], "attention_mask": [1, 1, 0]}
+
+    class DummyImageProcessor:
+        def __call__(self, image, **kwargs):
+            if isinstance(image, str):
+                raise FileNotFoundError(image)
+            chw = np.transpose(np.asarray(image, dtype=np.float32), (2, 0, 1))
+            return {"pixel_values": chw}
+
+    fake_tr = types.SimpleNamespace(
+        AutoTokenizer=types.SimpleNamespace(from_pretrained=lambda *a, **k: DummyTokenizer()),
+        AutoImageProcessor=types.SimpleNamespace(from_pretrained=lambda *a, **k: DummyImageProcessor()),
+    )
+    monkeypatch.setitem(sys.modules, "transformers", fake_tr)
+
+    import pytest
+
+    with pytest.raises(ValueError, match="zero valid examples"):
+        preprocess_hf_multimodal(
+            (train, None),
+            (test, None),
+            {"task_type": "retrieval"},
+            hf_model_id="dummy/model",
+            hf_task="text_image_retrieval",
+            image_column="image",
+            text_column="caption",
+            max_length=4,
+        )
 
 
 def test_hf_multimodal_preprocessor_relocates_moved_hf_cache_paths(monkeypatch, tmp_path):

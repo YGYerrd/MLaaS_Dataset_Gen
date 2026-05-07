@@ -21,6 +21,17 @@ _BLOCKED_IMAGE_CLASSIFICATION_RUNTIME_PAIRS = {
     ("microsoft/resnet-50", "microsoft/cats_vs_dogs", ""),
 }
 
+_BLOCKED_TOKEN_CLASSIFICATION_DATASETS = {
+    "chintagunta85/ncbi_disease",
+    "leondz/wnut_17",
+    "lhoestq/conll2003",
+    "tomaarsen/conllpp",
+}
+
+_TABLE_DETECTION_DATASETS = {
+    "bsmock/pubtables-1m",
+}
+
 
 def known_bad_path_reason(
     *,
@@ -74,6 +85,18 @@ def known_bad_path_reason(
         return (
             "blocked known-bad runtime path: this image-classification model/dataset pair repeatedly "
             "hit miopenStatusUnknownError in this project"
+        )
+
+    if hf == "token_classification" and dataset in _BLOCKED_TOKEN_CLASSIFICATION_DATASETS:
+        return (
+            "blocked known-bad token-classification dataset: this dataset either requires removed "
+            "HF dataset scripts or does not expose Sequence(ClassLabel) token labels in this runtime"
+        )
+
+    if task == "object_detection" and model == "microsoft/table-transformer-detection" and dataset not in _TABLE_DETECTION_DATASETS:
+        return (
+            "blocked incompatible object-detection pair: microsoft/table-transformer-detection is "
+            "table-specific and its label space does not match this detection dataset"
         )
 
     if hf in {"seq2seq_generation", "text2text_generation"} and tag == "summarization" and model == "salesforce/codet5-small":

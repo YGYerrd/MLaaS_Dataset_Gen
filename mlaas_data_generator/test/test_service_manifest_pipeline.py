@@ -7,7 +7,13 @@ import pytest
 
 import mlaas_data_generator.cli.run_manifest as run_manifest_module
 from mlaas_data_generator.services import runner as service_runner_module
-from mlaas_data_generator.cli.manifest.hf_manifest_builder import MANIFEST_COLUMNS, build_hf_manifest
+from mlaas_data_generator.cli.manifest.hf_manifest_builder import (
+    MANIFEST_COLUMNS,
+    RESOURCE_TIERS,
+    _batch_sizes_for,
+    _model_aware_max_samples,
+    build_hf_manifest,
+)
 from mlaas_data_generator.cli.run_manifest import _resolve_row, _validate_row, run_manifest
 from mlaas_data_generator.services.runner import ServiceExecutionResult
 
@@ -805,6 +811,66 @@ def test_validate_row_rejects_known_bad_paths(row, expected_message):
 
     assert not validation.ok
     assert expected_message in validation.error
+
+
+def test_validate_row_rejects_known_bad_token_classification_dataset():
+    row = {
+        "service_id": "svc_blocked_token_dataset",
+        "dataset": "hf",
+        "dataset_name": "tomaarsen/conllpp",
+        "model_type": "hf_finetune",
+        "task_type": "classification",
+        "task": "token_classification",
+        "hf_task": "token_classification",
+        "hf_model_id": "dslim/bert-base-NER",
+        "text_column": "tokens",
+        "label_column": "ner_tags",
+        "training_regime": "finetune_transfer",
+        "batch_size": 4,
+    }
+
+    validation = _validate_row(_resolve_row(pd.Series(row), {}))
+
+    assert not validation.ok
+    assert "known-bad token-classification dataset" in validation.error
+
+
+def test_validate_row_rejects_table_transformer_for_non_table_detection_dataset():
+    row = {
+        "service_id": "svc_blocked_table_transformer",
+        "dataset": "hf",
+        "dataset_name": "detection-datasets/fashionpedia_4_categories",
+        "model_type": "hf_finetune",
+        "task_type": "detection",
+        "task": "object_detection",
+        "hf_task": "image_detection",
+        "hf_model_id": "microsoft/table-transformer-detection",
+        "image_column": "image",
+        "label_column": "objects",
+        "training_regime": "finetune_transfer",
+        "batch_size": 2,
+    }
+
+    validation = _validate_row(_resolve_row(pd.Series(row), {}))
+
+    assert not validation.ok
+    assert "table-specific" in validation.error
+
+
+def test_manifest_builder_caps_detr_object_detection_workload_knobs():
+    model = {"hf_model_id": "microsoft/conditional-detr-resnet-50", "family": "conditional-detr"}
+    dataset_spec = {"dataset_name": "rishitdagli/cppe-5", "max_samples": 240}
+    tier = RESOURCE_TIERS["medium"]
+
+    assert max(_batch_sizes_for("object_detection", model, tier)) <= 2
+    assert _model_aware_max_samples(
+        dataset_spec=dataset_spec,
+        model=model,
+        target_sample_size=768,
+        resource_tier=tier,
+        task_key="object_detection",
+        training_regime="finetune_transfer",
+    ) <= 96
 
 
 def test_run_manifest_preflight_records_one_failure_for_missing_datasets(monkeypatch, tmp_path):

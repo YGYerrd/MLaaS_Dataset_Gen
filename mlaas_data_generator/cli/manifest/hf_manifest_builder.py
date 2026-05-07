@@ -673,6 +673,11 @@ def _model_aware_max_samples(
     training_regime: str,
 ) -> int:
     base = _max_samples(dataset_spec, target_sample_size, resource_tier, task_key)
+    if training_regime != "inference_only" and task_key == "object_detection":
+        model_id = str(model.get("hf_model_id") or "").strip().lower()
+        family = str(model.get("family") or "").strip().lower()
+        if family in {"detr", "conditional-detr", "deformable-detr"} or "detr" in model_id:
+            return min(base, 96)
     if training_regime != "inference_only" or task_key != "text2text_generation":
         return base
 
@@ -731,6 +736,10 @@ def _batch_sizes_for(task_key: str, model: dict[str, Any], resource_tier: Resour
 
     params_m = _estimated_model_params_m(model)
     values = table[min(rank, len(table) - 1)]
+    model_id = str(model.get("hf_model_id") or "").strip().lower()
+    family = str(model.get("family") or "").strip().lower()
+    if task_key == "object_detection" and (family in {"detr", "conditional-detr", "deformable-detr"} or "detr" in model_id):
+        values = tuple(min(2, value) for value in values)
     if params_m is not None and params_m > 700:
         values = tuple(max(1, value // 4) for value in values)
     elif params_m is not None and params_m > 250:

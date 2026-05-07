@@ -346,7 +346,14 @@ class ServiceRunner:
             train_metrics.setdefault("train_runtime_s", train_runtime_s)
 
         workload_runtime_s = time.perf_counter() - workload_start
-        primary_score = metric_score_value(task_family, primary_name, primary)
+        primary_score = _service_metric_score_value(
+            task_family=task_family,
+            hf_task=resolved_hf_task,
+            primary_name=primary_name,
+            primary_value=primary,
+            secondary_name=secondary_name,
+            secondary_value=secondary,
+        )
         model_size = _count_model_params(model)
         _validate_service_metrics(
             task_family=task_family,
@@ -781,14 +788,14 @@ class ServiceRunner:
                 "progress_log_interval": self.config.get("train_progress_log_interval", 10),
             }
             try:
-                qos = model.fit(x_train, y_train, **fit_kwargs)
+                qos = _fit_transformers_with_cuda_oom_retry(model, x_train, y_train, fit_kwargs, self.config)
             except TypeError:
                 fallback_kwargs = {
                     key: fit_kwargs[key]
                     for key in ("epochs", "lr", "max_train_time_s", "progress_log_interval")
                     if key in fit_kwargs
                 }
-                qos = model.fit(x_train, y_train, **fallback_kwargs)
+                qos = _fit_transformers_with_cuda_oom_retry(model, x_train, y_train, fallback_kwargs, self.config)
             return dict(qos or {}, training_epochs=epochs)
         train_local_model(model, x_train, y_train, epochs=epochs, batch_size=batch_size, lr=learning_rate)
         return {"training_epochs": epochs}
@@ -932,6 +939,63 @@ def _apply_runtime_knobs_to_model(model: Any, config: Mapping[str, Any]) -> None
                 reconfigure()
             except Exception:
                 pass
+
+
+def _is_cuda_oom_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return "cuda out of memory" in text or (
+        exc.__class__.__name__.lower() == "outofmemoryerror" and "cuda" in text
+    )
+
+
+def _clear_cuda_cache_if_available(model: Any = None) -> None:
+    torch_mod = None
+    core = getattr(model, "core", None) if model is not None else None
+    for candidate in (model, core):
+        if candidate is None:
+            continue
+        torch_mod = getattr(candidate, "torch", None) or getattr(candidate, "_torch", None)
+        if torch_mod is not None:
+            break
+    if torch_mod is None:
+        try:
+            import torch as torch_mod  # type: ignore[no-redef]
+        except Exception:
+            torch_mod = None
+    cuda = getattr(torch_mod, "cuda", None) if torch_mod is not None else None
+    empty_cache = getattr(cuda, "empty_cache", None)
+    if callable(empty_cache):
+        try:
+            empty_cache()
+        except Exception:
+            pass
+
+
+def _fit_transformers_with_cuda_oom_retry(
+    model: Any,
+    x_train: Any,
+    y_train: Any,
+    fit_kwargs: dict[str, Any],
+    config: dict[str, Any],
+) -> Any:
+    try:
+        return model.fit(x_train, y_train, **fit_kwargs)
+    except Exception as exc:
+        if not _is_cuda_oom_error(exc):
+            raise
+        current_batch_size = _safe_int(config.get("batch_size")) or _safe_int(getattr(model, "batch_size", None)) or 1
+        if current_batch_size <= 1 or bool(config.get("_cuda_oom_retry_attempted")):
+            raise
+        retry_batch_size = max(1, int(current_batch_size) // 2)
+        config["_cuda_oom_retry_attempted"] = True
+        config["batch_size"] = retry_batch_size
+        _apply_runtime_knobs_to_model(model, config)
+        _clear_cuda_cache_if_available(model)
+        print(
+            "[HFCore.finetune] CUDA OOM retry starts | "
+            f"batch_size={current_batch_size} -> {retry_batch_size}"
+        )
+        return model.fit(x_train, y_train, **fit_kwargs)
 
 
 def _clear_model_runtime_state(model: Any) -> None:
@@ -1850,6 +1914,51 @@ def _is_finite_numeric_metric(value: Any) -> bool:
     return bool(np.isfinite(numeric))
 
 
+def _is_sentence_similarity_metric_fallback(
+    *,
+    hf_task: str | None,
+    primary_name: str | None,
+    primary_value: Any,
+    secondary_name: str | None,
+    secondary_value: Any,
+    metric_score: Any,
+) -> bool:
+    hf_task_norm = str(hf_task or "").strip().lower().replace("-", "_")
+    primary_norm = str(primary_name or "").strip().lower()
+    secondary_norm = str(secondary_name or "").strip().lower()
+    return (
+        hf_task_norm == "sentence_similarity"
+        and primary_norm == "pearson"
+        and secondary_norm == "spearman"
+        and not _is_finite_numeric_metric(primary_value)
+        and _is_finite_numeric_metric(secondary_value)
+        and _is_finite_numeric_metric(metric_score)
+    )
+
+
+def _service_metric_score_value(
+    *,
+    task_family: str,
+    hf_task: str | None,
+    primary_name: str | None,
+    primary_value: Any,
+    secondary_name: str | None,
+    secondary_value: Any,
+) -> float:
+    score = metric_score_value(task_family, primary_name, primary_value)
+    if _is_finite_numeric_metric(score):
+        return score
+    hf_task_norm = str(hf_task or "").strip().lower().replace("-", "_")
+    if (
+        hf_task_norm == "sentence_similarity"
+        and str(primary_name or "").strip().lower() == "pearson"
+        and str(secondary_name or "").strip().lower() == "spearman"
+        and _is_finite_numeric_metric(secondary_value)
+    ):
+        return metric_score_value(task_family, primary_name, secondary_value)
+    return score
+
+
 def _validate_service_metrics(
     *,
     task_family: str,
@@ -1861,6 +1970,15 @@ def _validate_service_metrics(
     metric_score: Any,
 ) -> None:
     if not _is_finite_numeric_metric(primary_value):
+        if _is_sentence_similarity_metric_fallback(
+            hf_task=hf_task,
+            primary_name=primary_name,
+            primary_value=primary_value,
+            secondary_name=secondary_name,
+            secondary_value=secondary_value,
+            metric_score=metric_score,
+        ):
+            return
         raise ServiceExecutionError(
             f"Primary metric '{primary_name}' is not a finite numeric value: {primary_value!r}",
             failure_stage="metric_validation",

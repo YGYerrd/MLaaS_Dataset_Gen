@@ -65,6 +65,17 @@ def _coerce_image_input(value):
     return value
 
 
+def _coerce_array(value, *, dtype=None):
+    if hasattr(value, "detach") and callable(value.detach):
+        value = value.detach()
+    if hasattr(value, "cpu") and callable(value.cpu):
+        value = value.cpu()
+    if hasattr(value, "numpy") and callable(value.numpy):
+        value = value.numpy()
+    arr = np.asarray(value)
+    return arr.astype(dtype, copy=False) if dtype is not None else arr
+
+
 def _infer_image_hw(value):
     if _is_pil_image(value):
         width, height = value.size
@@ -83,7 +94,12 @@ def _infer_image_hw(value):
                 return int(height), int(width)
             except Exception:
                 return None, None
-    arr = np.asarray(value) if hasattr(value, "__array__") or hasattr(value, "__array_interface__") else None
+    arr = _coerce_array(value) if (
+        hasattr(value, "__array__")
+        or hasattr(value, "__array_interface__")
+        or hasattr(value, "detach")
+        or hasattr(value, "cpu")
+    ) else None
     if arr is not None and arr.ndim >= 2:
         return int(arr.shape[0]), int(arr.shape[1])
     return None, None
@@ -127,7 +143,7 @@ def _resize_chw_float32(chw, target_hw):
 
 
 def _normalize_multimodal_pixel_array(pixel_values, *, target_hw=None):
-    arr = np.asarray(pixel_values, dtype=np.float32)
+    arr = _coerce_array(pixel_values, dtype=np.float32)
     while arr.ndim > 3 and arr.shape[0] == 1:
         arr = arr[0]
     if arr.ndim == 3 and arr.shape[0] != 3 and arr.shape[-1] == 3:
@@ -145,11 +161,12 @@ def _stack_multimodal_pixel_values(pixel_values, *, target_hw=None):
 
     resolved_target_hw = target_hw
     if resolved_target_hw is None:
-        shape_counts = Counter(
-            tuple(np.asarray(pix, dtype=np.float32).shape[-2:])
-            for pix in pixel_values
-            if np.asarray(pix).ndim >= 3
-        )
+        shapes = []
+        for pix in pixel_values:
+            arr = _coerce_array(pix, dtype=np.float32)
+            if arr.ndim >= 3:
+                shapes.append(tuple(arr.shape[-2:]))
+        shape_counts = Counter(shapes)
         if shape_counts:
             resolved_target_hw = shape_counts.most_common(1)[0][0]
 
