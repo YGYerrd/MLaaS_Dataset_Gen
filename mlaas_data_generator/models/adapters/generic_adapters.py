@@ -57,7 +57,13 @@ class KMeansAdapter:
         return (np.nan, sil, inertia)
 
     def get_weights(self):
-        return []
+        if self.km is None or self._centers is None:
+            return {}
+        return {
+            "cluster_centers": np.asarray(self._centers, dtype="float64"),
+            "inertia": np.asarray([getattr(self.km, "inertia_", 0.0)], dtype="float64"),
+            "n_iter": np.asarray([getattr(self.km, "n_iter_", 0)], dtype="float64"),
+        }
 
     def set_weights(self, weights_list):
         return
@@ -112,13 +118,14 @@ class EstimatorAdapter:
         return rmse, rmse, np.nan
 
     def get_weights(self):
-        return []
+        return _estimator_state_arrays(self.estimator)
 
     def set_weights(self, weights_list):
         return
 
     def count_params(self):
-        return 0
+        state = self.get_weights()
+        return int(sum(np.asarray(value).size for value in state.values()))
 
 
 def make_random_forest(task_type: str, **kwargs) -> EstimatorAdapter:
@@ -127,3 +134,35 @@ def make_random_forest(task_type: str, **kwargs) -> EstimatorAdapter:
     else:
         estimator = RandomForestClassifier(**kwargs)
     return EstimatorAdapter(estimator, task_type)
+
+
+def _estimator_state_arrays(estimator) -> dict[str, np.ndarray]:
+    estimators = getattr(estimator, "estimators_", None)
+    if not estimators:
+        return {}
+
+    state: dict[str, np.ndarray] = {}
+    for idx, tree_estimator in enumerate(estimators):
+        tree = getattr(tree_estimator, "tree_", None)
+        if tree is None:
+            continue
+        prefix = f"tree_{idx}"
+        state[f"{prefix}_children_left"] = np.asarray(tree.children_left, dtype="float64")
+        state[f"{prefix}_children_right"] = np.asarray(tree.children_right, dtype="float64")
+        state[f"{prefix}_feature"] = np.asarray(tree.feature, dtype="float64")
+        state[f"{prefix}_threshold"] = np.asarray(tree.threshold, dtype="float64")
+        state[f"{prefix}_value"] = np.asarray(tree.value, dtype="float64").reshape(-1)
+
+    feature_importances = getattr(estimator, "feature_importances_", None)
+    if feature_importances is not None:
+        state["feature_importances"] = np.asarray(feature_importances, dtype="float64")
+    classes = getattr(estimator, "classes_", None)
+    if classes is not None:
+        if isinstance(classes, list):
+            state["classes"] = np.asarray([len(item) for item in classes], dtype="float64")
+        else:
+            try:
+                state["classes"] = np.asarray(classes, dtype="float64").reshape(-1)
+            except Exception:
+                state["classes"] = np.arange(len(classes), dtype="float64")
+    return state

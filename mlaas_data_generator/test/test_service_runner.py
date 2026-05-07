@@ -76,6 +76,114 @@ def test_service_runner_writes_one_service_record(monkeypatch, tmp_path):
         assert old_tables == set()
 
 
+def test_randomforest_service_records_update_signature(tmp_path):
+    db_path = tmp_path / "services.db"
+
+    result = runner.execute_service(
+        {
+            "service_id": "svc_rf_digits",
+            "db_path": str(db_path),
+            "dataset": "digits",
+            "dataset_name": "digits",
+            "model_type": "randomforest",
+            "task_type": "classification",
+            "task": "classification",
+            "modality": "image",
+            "training_regime": "generic",
+            "training_epochs": 1,
+            "batch_size": 8,
+            "max_samples": 32,
+            "rf_trees": 3,
+            "enable_perturbation_metrics": False,
+            "measure_system_metrics": False,
+            "update_signature_enabled": True,
+        }
+    )
+
+    assert result.status == "success"
+    with sqlite3.connect(db_path) as conn:
+        metrics = dict(
+            conn.execute(
+                """
+                SELECT metric_name, COALESCE(value_text, CAST(value_num AS TEXT), CAST(value_int AS TEXT), CAST(value_bool AS TEXT))
+                FROM service_metrics
+                WHERE service_id='svc_rf_digits'
+                  AND metric_name IN ('accuracy', 'update_signature_available', 'update_signature_id', 'signature_dim')
+                """
+            ).fetchall()
+        )
+        assert float(metrics["accuracy"]) >= 0.0
+        assert metrics["update_signature_available"] == "1"
+        assert metrics["update_signature_id"]
+        assert int(float(metrics["signature_dim"])) == 256
+        sizes = dict(
+            conn.execute(
+                """
+                SELECT metric_name, COALESCE(value_int, value_num)
+                FROM service_metrics
+                WHERE service_id='svc_rf_digits'
+                  AND metric_name IN ('train_set_size', 'benchmark_set_size')
+                """
+            ).fetchall()
+        )
+        assert int(sizes["train_set_size"]) == 32
+        assert int(sizes["benchmark_set_size"]) == 32
+
+
+def test_kmeans_service_records_update_signature(tmp_path):
+    db_path = tmp_path / "services.db"
+
+    result = runner.execute_service(
+        {
+            "service_id": "svc_cluster",
+            "db_path": str(db_path),
+            "dataset": "synthetic",
+            "dataset_name": "synthetic",
+            "model_type": "kmeans",
+            "task_type": "clustering",
+            "task": "clustering",
+            "modality": "tabular",
+            "training_regime": "generic",
+            "training_epochs": 1,
+            "batch_size": 8,
+            "max_samples": 64,
+            "clustering_k": 3,
+            "enable_perturbation_metrics": False,
+            "measure_system_metrics": False,
+            "update_signature_enabled": True,
+        }
+    )
+
+    assert result.status == "success"
+    with sqlite3.connect(db_path) as conn:
+        metrics = dict(
+            conn.execute(
+                """
+                SELECT metric_name, COALESCE(value_text, CAST(value_num AS TEXT), CAST(value_int AS TEXT), CAST(value_bool AS TEXT))
+                FROM service_metrics
+                WHERE service_id='svc_cluster'
+                  AND metric_name IN ('silhouette', 'inertia', 'update_signature_available', 'update_signature_id')
+                """
+            ).fetchall()
+        )
+        assert float(metrics["silhouette"]) == pytest.approx(float(metrics["silhouette"]))
+        assert float(metrics["inertia"]) >= 0.0
+        assert metrics["update_signature_available"] == "1"
+        assert metrics["update_signature_id"]
+        sizes = dict(
+            conn.execute(
+                """
+                SELECT metric_name, COALESCE(value_int, value_num)
+                FROM service_metrics
+                WHERE service_id='svc_cluster'
+                  AND metric_name IN ('train_set_size', 'benchmark_set_size')
+                """
+            ).fetchall()
+        )
+        assert int(sizes["train_set_size"]) == 64
+        assert int(sizes["benchmark_set_size"]) == 64
+
+
 class TransformersSentenceSimilarityModel:
     def evaluate(self, x, y, inference_only=False, max_eval_time_s=None, progress_log_interval=10):
         return 0.2, 0.25, 0.5, {"pearson": 0.25, "spearman": 0.5}

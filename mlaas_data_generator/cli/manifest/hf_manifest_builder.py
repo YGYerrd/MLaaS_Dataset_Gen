@@ -141,6 +141,10 @@ MANIFEST_COLUMNS = [
     "optimizer",
     "weight_decay",
     "momentum",
+    "clustering_k",
+    "clustering_n_init",
+    "clustering_max_iter",
+    "clustering_tol",
     "warmup_ratio",
     "mlm_probability",
     "gradient_accumulation_steps",
@@ -226,7 +230,7 @@ GENERIC_MANIFEST_CASES: tuple[dict[str, Any], ...] = (
         "modality": "image",
         "model_type": "cnn",
         "input_schema": "single_image",
-        "max_samples": 1200,
+        "max_samples": 5000,
         "batch_size": 32,
         "learning_rate": 1e-3,
         "optimizer": "adam",
@@ -234,14 +238,14 @@ GENERIC_MANIFEST_CASES: tuple[dict[str, Any], ...] = (
     {
         "task_key": "sklearn_image_classification",
         "task_label": "sk_imgcls",
-        "dataset": "cifar10",
-        "dataset_name": "cifar10",
+        "dataset": "digits",
+        "dataset_name": "digits",
         "task_type": "classification",
         "task": "classification",
         "modality": "image",
         "model_type": "randomforest",
         "input_schema": "single_image_flattened",
-        "max_samples": 1000,
+        "max_samples": 5000,
         "batch_size": 64,
         "learning_rate": 1e-3,
         "optimizer": "none",
@@ -256,10 +260,25 @@ GENERIC_MANIFEST_CASES: tuple[dict[str, Any], ...] = (
         "modality": "tabular",
         "model_type": "mlp",
         "input_schema": "tabular_features",
-        "max_samples": 1200,
+        "max_samples": 5000,
         "batch_size": 32,
         "learning_rate": 1e-3,
         "optimizer": "adam",
+    },
+    {
+        "task_key": "tabular_regression",
+        "task_label": "tabreg_rf",
+        "dataset": "synthetic",
+        "dataset_name": "synthetic",
+        "task_type": "regression",
+        "task": "regression",
+        "modality": "tabular",
+        "model_type": "randomforest",
+        "input_schema": "tabular_features",
+        "max_samples": 5000,
+        "batch_size": 32,
+        "learning_rate": 1e-3,
+        "optimizer": "none",
     },
     {
         "task_key": "tabular_regression",
@@ -271,7 +290,7 @@ GENERIC_MANIFEST_CASES: tuple[dict[str, Any], ...] = (
         "modality": "tabular",
         "model_type": "randomforest",
         "input_schema": "tabular_features",
-        "max_samples": 1600,
+        "max_samples": 5000,
         "batch_size": 32,
         "learning_rate": 1e-3,
         "optimizer": "none",
@@ -286,7 +305,7 @@ GENERIC_MANIFEST_CASES: tuple[dict[str, Any], ...] = (
         "modality": "tabular",
         "model_type": "kmeans",
         "input_schema": "tabular_features",
-        "max_samples": 1200,
+        "max_samples": 5000,
         "batch_size": 64,
         "learning_rate": 1e-3,
         "optimizer": "none",
@@ -398,6 +417,10 @@ def _service_config(row: dict[str, Any]) -> str:
         "mlm_probability": row.get("mlm_probability"),
         "gradient_accumulation_steps": row.get("gradient_accumulation_steps"),
         "momentum": row.get("momentum"),
+        "clustering_k": row.get("clustering_k"),
+        "clustering_n_init": row.get("clustering_n_init"),
+        "clustering_max_iter": row.get("clustering_max_iter"),
+        "clustering_tol": row.get("clustering_tol"),
         "max_samples": row.get("max_samples"),
         "sample_size": row.get("sample_size"),
         "sample_seed": row.get("sample_seed"),
@@ -1405,6 +1428,109 @@ def _selected_generic_cases(requested_task_keys: list[str]) -> list[dict[str, An
     return [case for case in GENERIC_MANIFEST_CASES if case["task_key"] in requested]
 
 
+def _generic_split_knobs_for_variant(
+    case: dict[str, Any],
+    split_variant: int,
+    resource_tier: ResourceTierSpec,
+) -> tuple[str, float | None, str | None, dict[str, Any] | None]:
+    task_key = str(case.get("task_key") or "")
+    task_type = str(case.get("task_type") or "")
+    if task_type == "regression":
+        skew_axis = "score_bin"
+        skew_axis_config = {"num_bins": 5 + (int(split_variant) % 4)}
+    elif task_type in {"classification", "clustering"}:
+        skew_axis = "class_label"
+        skew_axis_config = None
+    else:
+        skew_axis = _default_skew_axis_for_task(task_key)
+        skew_axis_config = _skew_axis_config_for_task(task_key)
+
+    if resource_tier.rank == 0:
+        return "iid", None, skew_axis, skew_axis_config
+
+    options: tuple[tuple[str, float | None], ...] = (
+        ("iid", None),
+        ("dirichlet", 0.05),
+        ("dirichlet", 0.1),
+        ("dirichlet", 0.2),
+        ("dirichlet", 0.5),
+        ("dirichlet", 1.0),
+        ("quantity_skew", 0.1),
+        ("quantity_skew", 0.3),
+    )
+    split_strategy, distribution_param = options[int(split_variant) % len(options)]
+    return split_strategy, distribution_param, skew_axis, skew_axis_config
+
+
+def _generic_training_knobs_for_variant(
+    case: dict[str, Any],
+    knob_variant: int,
+    resource_tier: ResourceTierSpec,
+) -> dict[str, Any]:
+    task_key = str(case.get("task_key") or "")
+    model_type = str(case.get("model_type") or "").lower()
+    variant = int(knob_variant)
+
+    if model_type in {"randomforest", "kmeans"}:
+        learning_rates = (None,)
+        optimizers = ("none",)
+        weight_decays = (0.0,)
+        momentum_values = (0.0,)
+    elif task_key == "keras_image_classification":
+        learning_rates = (1e-4, 3e-4, 1e-3, 3e-3, 1e-2)
+        optimizers = ("adam", "sgd", "rmsprop", "adamw")
+        weight_decays = (0.0, 1e-5, 1e-4, 1e-3)
+        momentum_values = (0.0, 0.5, 0.9)
+    elif task_key == "tabular_regression":
+        learning_rates = (1e-4, 3e-4, 1e-3, 3e-3, 1e-2)
+        optimizers = ("adam", "sgd", "rmsprop", "adamw", "adagrad")
+        weight_decays = (0.0, 1e-6, 1e-5, 1e-4, 1e-3)
+        momentum_values = (0.0, 0.5, 0.9)
+    else:
+        learning_rates = (case.get("learning_rate"),)
+        optimizers = (case.get("optimizer") or "adam",)
+        weight_decays = (0.0,)
+        momentum_values = (0.0,)
+
+    base_batch_sizes = _batch_sizes_for(task_key, case, resource_tier)
+    case_batch = case.get("batch_size")
+    if case_batch:
+        candidates = tuple(sorted({1, 2, 4, 8, 16, 32, int(case_batch)}))
+        batch_sizes = _unique_ints(
+            tuple(value for value in candidates if value <= max(int(case_batch), max(base_batch_sizes)))
+        )
+    else:
+        batch_sizes = base_batch_sizes
+
+    if model_type == "kmeans":
+        epochs = (1,)
+    else:
+        epochs = (1, 2, 3) if resource_tier.rank >= 1 else (1, 2)
+
+    return {
+        "training_epochs": epochs[variant % len(epochs)],
+        "batch_size": batch_sizes[variant % len(batch_sizes)],
+        "learning_rate": learning_rates[(variant * 2 + variant // 3) % len(learning_rates)],
+        "optimizer": optimizers[(variant * 3 + variant // 2) % len(optimizers)],
+        "weight_decay": weight_decays[(variant * 5 + variant // 4) % len(weight_decays)],
+        "momentum": momentum_values[(variant * 7 + variant // 5) % len(momentum_values)],
+        "clustering_k": (2, 3, 4, 5, 6)[variant % 5] if model_type == "kmeans" else case.get("clustering_k"),
+        "clustering_n_init": (5, 10, 20)[variant % 3] if model_type == "kmeans" else None,
+        "clustering_max_iter": (100, 200, 300, 500)[variant % 4] if model_type == "kmeans" else None,
+        "clustering_tol": (1e-3, 1e-4, 1e-5)[variant % 3] if model_type == "kmeans" else None,
+    }
+
+
+def _generic_max_samples_for_variant(case: dict[str, Any], target_sample_size: int, dataset_variant: int, resource_tier: ResourceTierSpec) -> int:
+    del target_sample_size
+    case_max = int(case.get("max_samples", 5000))
+    tier_caps = (128, 5000, 5000, 5000)
+    cap = min(case_max, tier_caps[min(resource_tier.rank, len(tier_caps) - 1)])
+    fractions = (0.25, 0.4, 0.6, 0.75, 1.0, 0.5, 0.9)
+    value = int(round(cap * fractions[int(dataset_variant) % len(fractions)]))
+    return max(16, min(cap, value))
+
+
 def _row_from_generic_case(
     *,
     case: dict[str, Any],
@@ -1416,15 +1542,10 @@ def _row_from_generic_case(
     knob_variant: int,
     seed: int,
 ) -> dict[str, Any]:
-    split_strategy, distribution_param, skew_axis, skew_axis_config = _split_knobs_for_variant(case["task_key"], knob_variant, resource_tier)
-    epochs = _epochs_for(case["task_key"], resource_tier)[int(knob_variant) % len(_epochs_for(case["task_key"], resource_tier))]
-    case_batch = case.get("batch_size")
-    if case_batch:
-        batch_sizes = _unique_ints((max(1, min(int(case_batch), size)) for size in _batch_sizes_for(case["task_key"], case, resource_tier)))
-    else:
-        batch_sizes = profile.batch_sizes
-    batch_size = batch_sizes[int(knob_variant) % len(batch_sizes)]
-    max_samples = min(int(case.get("max_samples", target_sample_size)), int(target_sample_size))
+    del profile
+    split_strategy, distribution_param, skew_axis, skew_axis_config = _generic_split_knobs_for_variant(case, split_variant, resource_tier)
+    training_knobs = _generic_training_knobs_for_variant(case, knob_variant, resource_tier)
+    max_samples = _generic_max_samples_for_variant(case, target_sample_size, dataset_variant, resource_tier)
     row = {
         **case,
         "enabled": True,
@@ -1441,12 +1562,12 @@ def _row_from_generic_case(
         "distribution_type": split_strategy,
         "distribution_param": distribution_param,
         "custom_distributions": None,
-        "training_epochs": epochs,
-        "batch_size": batch_size,
-        "learning_rate": case.get("learning_rate"),
-        "optimizer": case.get("optimizer"),
-        "weight_decay": 0.0,
-        "momentum": 0.0,
+        "training_epochs": training_knobs["training_epochs"],
+        "batch_size": training_knobs["batch_size"],
+        "learning_rate": training_knobs["learning_rate"],
+        "optimizer": training_knobs["optimizer"],
+        "weight_decay": training_knobs["weight_decay"],
+        "momentum": training_knobs["momentum"],
         "sample_size": None,
         "max_samples": max_samples,
         "timeout_s": resource_tier.timeout_s,
@@ -1475,6 +1596,9 @@ def _row_from_generic_case(
         "device": "auto",
         "save_weights": False,
     }
+    for clustering_key in ("clustering_k", "clustering_n_init", "clustering_max_iter", "clustering_tol"):
+        if training_knobs.get(clustering_key) is not None:
+            row[clustering_key] = training_knobs[clustering_key]
     row["service_id"] = _service_id(
         f"gen_{case['task_label']}",
         {

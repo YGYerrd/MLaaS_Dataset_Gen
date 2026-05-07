@@ -21,6 +21,7 @@ import pandas as pd
 
 from ..compatibility import known_bad_row_reason
 from ..config import CONFIG, FAILED_MANIFEST_PATH, FAILURE_LOG_PATH, MANIFEST_RESULTS_PATH
+from ..data.sources.generic import KERAS_DATASETS
 from ..hf_auth import load_hf_token_from_file
 from ..registry.datasets import DATASET_REGISTRY
 from ..models.label_schema import infer_label_format, infer_num_labels
@@ -168,6 +169,7 @@ DATASET_ARG_COLUMNS = {
 REQUIRED_COLUMNS = {"dataset", "model_type", "task_type"}
 BLANK_STRINGS = {"", "na", "n/a", "nan", "null", "none", "not applicable", "not_applicable"}
 RESOURCE_TIER_VALUES = {"smoketest", "light", "medium", "heavy", "stress_test"}
+KERAS_MODEL_TYPES = {"cnn", "mobilenetv2", "mlp", "logreg"}
 
 COLUMN_ALIASES = {
     "manifest group id": "manifest_group_id",
@@ -613,13 +615,39 @@ def _manifest_requires_hf_preflight(enabled_df: pd.DataFrame) -> bool:
     return False
 
 
+def _row_requires_keras_preflight(row: pd.Series | dict[str, Any]) -> bool:
+    dataset = str(_normalize_value(row.get("dataset")) or "").strip().lower()
+    model_type = str(_normalize_value(row.get("model_type")) or "").strip().lower()
+    if dataset in KERAS_DATASETS:
+        return True
+    if dataset in {"hf", "huggingface"} or model_type.startswith("hf"):
+        return False
+    return model_type in KERAS_MODEL_TYPES
+
+
+def _manifest_requires_keras_preflight(enabled_df: pd.DataFrame) -> bool:
+    for _, row in enabled_df.iterrows():
+        if _row_requires_keras_preflight(row):
+            return True
+    return False
+
+
 def _ensure_manifest_preflight(enabled_df: pd.DataFrame) -> None:
-    if not _manifest_requires_hf_preflight(enabled_df):
-        return
-    required_imports = {
-        "datasets": "Hugging Face dataset loading requires the 'datasets' package. Install it with: pip install datasets",
-        "transformers": "Manifest preflight failed: required HF dependency 'transformers' is not importable. Install it with: pip install transformers",
-    }
+    required_imports = {}
+    if _manifest_requires_hf_preflight(enabled_df):
+        required_imports.update(
+            {
+                "datasets": "Hugging Face dataset loading requires the 'datasets' package. Install it with: pip install datasets",
+                "transformers": "Manifest preflight failed: required HF dependency 'transformers' is not importable. Install it with: pip install transformers",
+            }
+        )
+    if _manifest_requires_keras_preflight(enabled_df):
+        required_imports.update(
+            {
+                "tensorflow": "Keras-backed generic service rows require TensorFlow. Install it with: pip install tensorflow",
+                "keras": "Keras-backed generic service rows require Keras. Install it with: pip install keras",
+            }
+        )
     for package_name, message in required_imports.items():
         try:
             importlib.import_module(package_name)

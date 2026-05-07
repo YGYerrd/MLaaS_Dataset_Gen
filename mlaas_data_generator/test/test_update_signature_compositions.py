@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 
 from mlaas_data_generator.cli.cmd_export_compositions import generate_compositions, load_services_from_db
-from mlaas_data_generator.federated.update_signature import compute_and_store_update_signature
+from mlaas_data_generator.federated.update_signature import compute_and_store_update_signature, compute_update_signature
 from mlaas_data_generator.storage.writer import make_writer
 
 
@@ -90,3 +90,17 @@ def test_composition_export_computes_mus_from_selected_update_signatures(tmp_pat
     assert len(compositions) == 1
     assert json.loads(compositions.iloc[0]["service_ids"]) == ["svc_a", "svc_b"]
     assert compositions.iloc[0]["mus"] > 0.99
+
+
+def test_update_signature_supports_zero_baseline_estimator_state():
+    signature = compute_update_signature(
+        {},
+        {"tree_0_threshold": np.asarray([0.2, -2.0, 0.8]), "feature_importances": np.asarray([0.7, 0.3])},
+        dim=16,
+        seed=7,
+    )
+
+    assert signature is not None
+    assert signature["source_dim"] == 5
+    assert signature["source_norm"] > 0
+    assert signature["vector"].shape == (16,)

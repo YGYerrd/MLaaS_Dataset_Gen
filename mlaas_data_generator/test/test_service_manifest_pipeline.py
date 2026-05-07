@@ -91,6 +91,42 @@ def test_manifest_smoketest_expands_to_all_pairs_with_minimum_sample_budgets():
     assert baseline_pairs.issubset(smoke_pairs)
 
 
+def test_generic_sklearn_image_manifest_uses_sklearn_dataset():
+    df = build_hf_manifest(
+        task_keys=["sklearn_image_classification"],
+        training_regimes=["generic"],
+        dataset_variants_per_pair=1,
+        split_variants_per_pair=1,
+        knob_variants_per_pair=1,
+        seed=123,
+    )
+
+    assert len(df) == 1
+    row = df.iloc[0]
+    assert row["case_name"].startswith("sk_imgcls__digits__")
+    assert row["dataset"] == "digits"
+    assert row["dataset_name"] == "digits"
+    assert row["model_type"] == "randomforest"
+
+
+def test_generic_tabular_regression_includes_synthetic_sklearn_path():
+    df = build_hf_manifest(
+        task_keys=["tabular_regression"],
+        training_regimes=["generic"],
+        dataset_variants_per_pair=1,
+        split_variants_per_pair=1,
+        knob_variants_per_pair=1,
+        seed=123,
+    )
+
+    synthetic_rf = df[df["case_name"].str.startswith("tabreg_rf__synthetic__")]
+    assert len(synthetic_rf) == 1
+    row = synthetic_rf.iloc[0]
+    assert row["dataset"] == "synthetic"
+    assert row["model_type"] == "randomforest"
+    assert row["optimizer"] == "none"
+
+
 def test_run_manifest_validation_accepts_smoketest_resource_tier():
     row = pd.Series(
         {
@@ -118,6 +154,30 @@ def test_run_manifest_validation_accepts_smoketest_resource_tier():
 
     validation = _validate_row(_resolve_row(row, {}))
     assert validation.ok, validation.error
+
+
+def test_manifest_preflight_reports_missing_keras_dependency(monkeypatch):
+    enabled_df = pd.DataFrame(
+        [
+            {
+                "enabled": True,
+                "dataset": "synthetic",
+                "model_type": "mlp",
+                "task_type": "regression",
+            }
+        ]
+    )
+    real_import_module = run_manifest_module.importlib.import_module
+
+    def fake_import_module(name):
+        if name == "tensorflow":
+            raise ModuleNotFoundError("No module named 'tensorflow'")
+        return real_import_module(name)
+
+    monkeypatch.setattr(run_manifest_module.importlib, "import_module", fake_import_module)
+
+    with pytest.raises(run_manifest_module.ManifestPreflightError, match="Keras-backed generic service rows require TensorFlow"):
+        run_manifest_module._ensure_manifest_preflight(enabled_df)
 
 
 def test_manifest_knob_variants_are_task_aware_and_distinct():

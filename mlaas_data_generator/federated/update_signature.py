@@ -90,8 +90,10 @@ def compute_update_signature(
 
     left = _as_named_arrays(before)
     right = _as_named_arrays(after)
-    if not left or not right:
+    if not right:
         return None
+    if not left:
+        left = {key: np.zeros_like(value, dtype=np.float64) for key, value in right.items()}
 
     common = [
         key

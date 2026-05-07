@@ -175,6 +175,7 @@ class ServiceRunner:
         prepared_dataset = self.config.get("_prepared_dataset")
         if prepared_dataset is None:
             dataset_args = dict(self.config.get("dataset_args") or {})
+            dataset_args.setdefault("task", self.config.get("task") or self.config.get("task_type"))
             dataset_args.setdefault("inference_only", training_regime in {"inference_only", "inference"})
             dataset_timer = _StageTimer()
             train, test, meta = _load_dataset(self.config.get("dataset", "hf"), **dataset_args)
@@ -224,6 +225,11 @@ class ServiceRunner:
             detail=f"strategy={split_info['resolved'].get('effective_strategy')}",
         )
         x_train, y_train = split_info["x_train"], split_info["y_train"]
+        x_test, y_test, benchmark_sample_info = _cap_benchmark_split(
+            x_test,
+            y_test,
+            config=self.config,
+        )
         split_provenance_rows = list(split_info["provenance_rows"])
 
         task_family = canonical_task_family(resolved_task_type, resolved_hf_task)
@@ -477,6 +483,7 @@ class ServiceRunner:
             "loader_meta": _jsonable(meta),
             "hf_metadata": hf_metadata,
             "split_resolution": split_info["resolved"],
+            "benchmark_sample_resolution": benchmark_sample_info,
             "split_provenance": split_info["distribution_map"],
             "resolved_device": resolved_device,
             "gpu_fallback_warning": gpu_fallback_warning,
@@ -1161,6 +1168,43 @@ def _sample_service_rows(
     else:
         idx = rng.choice(total, size=requested, replace=False)
     return _take_rows(x, idx), _take_rows(y, idx), info
+
+
+def _cap_benchmark_split(x, y, *, config: Mapping[str, Any]) -> tuple[Any, Any, dict[str, Any]]:
+    cap = (
+        config.get("benchmark_sample_size")
+        or config.get("max_benchmark_samples")
+        or config.get("max_eval_samples")
+        or config.get("max_samples")
+        or config.get("sample_size")
+    )
+    requested = _safe_int(cap)
+    total = _sample_count(x, y)
+    if requested is None:
+        return x, y, {
+            "requested_sample_size_total": None,
+            "effective_sample_size_total": total,
+            "sample_strategy_effective": "all",
+        }
+    requested = max(0, min(total, int(requested)))
+    if requested == total:
+        return x, y, {
+            "requested_sample_size_total": requested,
+            "effective_sample_size_total": total,
+            "sample_strategy_effective": "all",
+        }
+
+    seed = _safe_int(config.get("sample_seed"))
+    if seed is None:
+        seed = _stable_sample_seed(config)
+    rng = np.random.default_rng(int(seed) + 1)
+    idx = rng.choice(total, size=requested, replace=False)
+    return _take_rows(x, idx), _take_rows(y, idx), {
+        "requested_sample_size_total": requested,
+        "effective_sample_size_total": requested,
+        "sample_strategy_effective": "iid",
+        "sample_seed": int(seed) + 1,
+    }
 
 
 def _strategy_sample_indices(bucket_ids, *, total: int, requested: int, strategy: str, distribution_param: Any, bucket_labels: Mapping[str, Any] | None, rng) -> tuple[np.ndarray, dict[str, Any]]:
