@@ -1,6 +1,6 @@
 # MLaaS Service Dataset Generator
 
-Generate comparable MLaaS service records from reviewed manifest rows.
+This project generates comparable Machine Learning as a Service records from reviewed Hugging Face service manifests. Each manifest row defines an independent model, dataset, task, and training regime. The runner validates the row, trains or loads the model, evaluates it on a benchmark split, records functional attributes and system metrics, and writes the resulting service data to a SQLite database.
 
 The active workflow is:
 
@@ -19,7 +19,7 @@ On Ubuntu or Debian:
 
 ```bash
 sudo apt update
-sudo apt install -y git rsync unzip sqlite3 python3 python3-venv python3-dev build-essential
+sudo apt install -y git rsync unzip sqlite3 python3 python3-venv python3-dev build-essentia l
 ```
 
 Check Python:
