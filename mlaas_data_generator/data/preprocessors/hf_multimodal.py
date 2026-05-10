@@ -53,7 +53,7 @@ def _coerce_image_input(value):
         return value.convert("RGB")
     if isinstance(value, dict):
         if value.get("array") is not None:
-            return np.asarray(value.get("array"))
+            return _coerce_image_array_for_processor(value.get("array"))
         if value.get("bytes") is not None:
             return load_image_from_bytes(value.get("bytes"))
         if value.get("path"):
@@ -62,7 +62,57 @@ def _coerce_image_input(value):
         return load_image_from_bytes(value)
     if isinstance(value, str):
         return load_image_from_path(value)
+    if _shape_tuple(value) is not None or _has_tensorlike_array_api(value):
+        return _coerce_image_array_for_processor(value)
     return value
+
+
+def _has_tensorlike_array_api(value):
+    return any(hasattr(value, attr) for attr in ("__array__", "__array_interface__", "detach", "cpu", "numpy"))
+
+
+def _shape_tuple(value):
+    shape = getattr(value, "shape", None)
+    if shape is None:
+        size = getattr(value, "size", None)
+        if callable(size):
+            try:
+                shape = size()
+            except TypeError:
+                shape = None
+    if shape is None:
+        return None
+
+    dims = []
+    try:
+        iterator = tuple(shape)
+    except TypeError:
+        return None
+    for dim in iterator:
+        try:
+            if hasattr(dim, "item") and callable(dim.item):
+                dim = dim.item()
+            dims.append(int(dim))
+        except Exception:
+            return None
+    return tuple(dims)
+
+
+def _image_hw_from_shape(shape):
+    if not shape:
+        return None
+    dims = tuple(int(dim) for dim in shape)
+    while len(dims) > 3 and dims[0] == 1:
+        dims = dims[1:]
+    if len(dims) == 2:
+        return dims[0], dims[1]
+    if len(dims) < 3:
+        return None
+    if dims[-1] in {1, 3, 4}:
+        return dims[-3], dims[-2]
+    if dims[-3] in {1, 3, 4}:
+        return dims[-2], dims[-1]
+    return dims[-3], dims[-2]
 
 
 def _coerce_array(value, *, dtype=None):
@@ -72,8 +122,24 @@ def _coerce_array(value, *, dtype=None):
         value = value.cpu()
     if hasattr(value, "numpy") and callable(value.numpy):
         value = value.numpy()
-    arr = np.asarray(value)
+    if isinstance(value, (list, tuple)) and value and any(_has_tensorlike_array_api(item) for item in value):
+        converted = [_coerce_array(item, dtype=dtype) for item in value]
+        try:
+            arr = np.stack(converted)
+        except ValueError:
+            arr = np.asarray(converted)
+    else:
+        arr = np.asarray(value)
     return arr.astype(dtype, copy=False) if dtype is not None else arr
+
+
+def _coerce_image_array_for_processor(value):
+    arr = _coerce_array(value)
+    while arr.ndim > 3 and arr.shape[0] == 1:
+        arr = arr[0]
+    if arr.ndim == 3 and arr.shape[0] in {1, 3, 4} and arr.shape[-1] not in {1, 3, 4}:
+        arr = np.transpose(arr, (1, 2, 0))
+    return arr
 
 
 def _infer_image_hw(value):
@@ -86,7 +152,7 @@ def _infer_image_hw(value):
         if height is not None and width is not None:
             return int(height), int(width)
         if value.get("array") is not None:
-            return _infer_image_hw(np.asarray(value.get("array")))
+            return _infer_image_hw(value.get("array"))
         if value.get("path"):
             try:
                 image = load_image_from_path(value.get("path"))
@@ -94,14 +160,15 @@ def _infer_image_hw(value):
                 return int(height), int(width)
             except Exception:
                 return None, None
-    arr = _coerce_array(value) if (
-        hasattr(value, "__array__")
-        or hasattr(value, "__array_interface__")
-        or hasattr(value, "detach")
-        or hasattr(value, "cpu")
-    ) else None
+    shape = _shape_tuple(value)
+    hw = _image_hw_from_shape(shape)
+    if hw is not None:
+        return hw
+    arr = _coerce_array(value) if _has_tensorlike_array_api(value) else None
     if arr is not None and arr.ndim >= 2:
-        return int(arr.shape[0]), int(arr.shape[1])
+        hw = _image_hw_from_shape(arr.shape)
+        if hw is not None:
+            return hw
     return None, None
 
 
@@ -413,6 +480,15 @@ def _load_auto_tokenizer(AutoTokenizer, hf_model_id):
         return AutoTokenizer.from_pretrained(hf_model_id, use_fast=False)
 
 
+def _should_left_pad_multimodal_tokenizer(hf_task, config, hf_model_id=None):
+    task_name = str(hf_task or "").strip().lower()
+    if task_name not in {"image_captioning", "visual_question_answering"}:
+        return False
+    if config is None:
+        return "git" in str(hf_model_id or "").strip().lower()
+    return not bool(getattr(config, "is_encoder_decoder", False))
+
+
 def _validate_pair_alignment(ds, *, image_column, text_column, split_name, missing_pair_handling):
     valid_indices = []
     missing_pairs = []
@@ -717,6 +793,8 @@ def preprocess_hf_multimodal(
             model_config = None
 
     tokenizer = _load_auto_tokenizer(AutoTokenizer, hf_model_id)
+    if _should_left_pad_multimodal_tokenizer(hf_task, model_config, hf_model_id):
+        tokenizer.padding_side = "left"
     image_processor_timer = time.perf_counter()
     image_processor = AutoImageProcessor.from_pretrained(hf_model_id)
     image_processor_load_s = float(time.perf_counter() - image_processor_timer)

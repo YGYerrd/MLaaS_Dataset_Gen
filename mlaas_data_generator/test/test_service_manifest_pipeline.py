@@ -426,6 +426,136 @@ def test_run_manifest_removes_stale_retry_manifest_when_no_rows_fail(monkeypatch
     assert not failed_manifest_path.exists()
 
 
+def test_multimodal_audit_uses_services_db_as_source_of_truth(tmp_path):
+    db_path = tmp_path / "services.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE services (
+          service_id TEXT PRIMARY KEY,
+          status TEXT,
+          case_name TEXT,
+          hf_task TEXT,
+          model_id TEXT,
+          dataset_name TEXT,
+          training_regime TEXT
+        );
+        CREATE TABLE service_metrics (
+          service_id TEXT,
+          metric_name TEXT,
+          value_num REAL,
+          value_int INTEGER,
+          value_bool INTEGER
+        );
+        CREATE TABLE service_failures (
+          failure_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          service_id TEXT,
+          error_message TEXT
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO services VALUES (?,?,?,?,?,?,?)",
+        ("svc_bad_ret", "completed", "ret", "text_image_retrieval", "google/siglip-base-patch16-224", "jxie/flickr8k", "inference_only"),
+    )
+    conn.execute("INSERT INTO service_metrics VALUES (?,?,?,?,?)", ("svc_bad_ret", "metric_score", 0.01, None, None))
+    conn.execute("INSERT INTO service_metrics VALUES (?,?,?,?,?)", ("svc_bad_ret", "r@1", 0.01, None, None))
+    conn.execute(
+        "INSERT INTO services VALUES (?,?,?,?,?,?,?)",
+        ("svc_failed_vqa", "failed", "vqa", "visual_question_answering", "microsoft/git-base-vqav2", "HuggingFaceM4/VQAv2", "inference_only"),
+    )
+    conn.execute("INSERT INTO service_failures(service_id,error_message) VALUES (?,?)", ("svc_failed_vqa", "planned failure"))
+    conn.commit()
+    conn.close()
+
+    rows_df = pd.DataFrame(
+        [
+            {"service_id": "svc_bad_ret", "enabled": True, "hf_task": "text_image_retrieval", "modality": "multimodal"},
+            {"service_id": "svc_failed_vqa", "enabled": True, "hf_task": "visual_question_answering", "modality": "multimodal"},
+        ]
+    )
+    audit_path = tmp_path / "audit.csv"
+    missing_path = tmp_path / "missing.csv"
+
+    run_manifest_module._write_multimodal_audit_csv(
+        rows_df=rows_df,
+        manifest_defaults={},
+        db_path=str(db_path),
+        output_path=audit_path,
+    )
+    run_manifest_module._write_missing_multimodal_manifest_csv(
+        rows_df=rows_df,
+        manifest_defaults={},
+        db_path=str(db_path),
+        output_path=missing_path,
+    )
+
+    audit = pd.read_csv(audit_path)
+    assert set(audit["service_id"]) == {"svc_bad_ret", "svc_failed_vqa"}
+    assert "r@1_lte_0.02" in audit.loc[audit["service_id"] == "svc_bad_ret", "audit_reasons"].iloc[0]
+    assert "status_not_completed" in audit.loc[audit["service_id"] == "svc_failed_vqa", "audit_reasons"].iloc[0]
+    missing = pd.read_csv(missing_path)
+    assert missing["service_id"].tolist() == ["svc_failed_vqa"]
+
+
+def test_final_multimodal_rows_are_blocked_or_isolated_for_stability():
+    blocked = {
+        "service_id": "svc_siglip",
+        "dataset": "hf",
+        "model_type": "hf",
+        "task_type": "retrieval",
+        "task": "text_image_retrieval",
+        "hf_task": "text_image_retrieval",
+        "hf_model_id": "google/siglip-base-patch16-224",
+        "dataset_name": "jxie/flickr8k",
+        "training_regime": "inference_only",
+        "batch_size": 2,
+        "precision_type": "fp16",
+        "resource_tier": "medium",
+        "image_column": "image",
+        "text_column": "caption_0",
+        "modality": "multimodal",
+    }
+
+    assert not run_manifest_module._validate_row(blocked).ok
+
+    caption = dict(blocked, hf_task="image_captioning", task="image_captioning", hf_model_id="Salesforce/blip-image-captioning-base")
+    assert not run_manifest_module._is_groupable_hf_entry(caption)
+
+
+def test_row_local_hf_execution_clears_cuda_state(monkeypatch):
+    calls = {"cleanup": 0}
+
+    def fake_execute_service(config):
+        return ServiceExecutionResult(
+            service_id=config["service_id"],
+            status="success",
+            db_path="",
+            metrics={},
+            error=None,
+        )
+
+    monkeypatch.setattr(run_manifest_module, "execute_service", fake_execute_service)
+    monkeypatch.setattr(run_manifest_module, "_clear_cuda_runtime_state", lambda: calls.__setitem__("cleanup", calls["cleanup"] + 1))
+
+    entry = run_manifest_module.ManifestEntry(
+        idx=0,
+        ordinal=1,
+        resolved={
+            "service_id": "svc_hf",
+            "dataset": "hf",
+            "model_type": "hf",
+            "hf_model_id": "openai/clip-vit-base-patch32",
+        },
+        validation=run_manifest_module.RowValidation(True),
+    )
+
+    result = run_manifest_module._execute_entry_row_local(entry)
+
+    assert result["status"] == "success"
+    assert calls["cleanup"] == 1
+
+
 class TransformersGroupedModel:
     fit_start_weights = []
     fit_lrs = []

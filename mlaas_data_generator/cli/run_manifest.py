@@ -8,6 +8,7 @@ import multiprocessing
 import os
 import queue
 import shutil
+import sqlite3
 import sys
 import time
 import traceback
@@ -15,7 +16,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import pandas as pd
 
@@ -103,6 +104,10 @@ FLOAT_COLUMNS = {
 }
 ENUM_COLUMNS = {"training_regime", "resource_tier", "optimizer", "device", "model_type", "hf_task", "task_type", "modality", "split_strategy", "distribution_type", "skew_axis", "precision_type"}
 JSON_COLUMNS = {"column_mapping", "service_config", "custom_distributions", "skew_axis_config"}
+
+MULTIMODAL_TASKS = {"image_captioning", "text_image_retrieval", "visual_question_answering"}
+MULTIMODAL_AUDIT_PATH = MANIFEST_RESULTS_PATH.parent / "service_manifest_multimodal_audit.csv"
+MISSING_MULTIMODAL_MANIFEST_PATH = MANIFEST_RESULTS_PATH.parent / "service_manifest_missing_multimodal.csv"
 
 DATASET_ARG_COLUMNS = {
     "dataset_name",
@@ -528,10 +533,27 @@ def _resolve_row(row: pd.Series, manifest_defaults: dict[str, Any]) -> dict[str,
     if str(_normalize_requested_device(resolved.get("device"))).strip().lower() == "cpu":
         resolved["mixed_precision"] = False
         resolved["precision_type"] = "fp16"
+    _apply_final_multimodal_runtime_defaults(resolved)
     if _is_blank(resolved.get("service_id")):
         resolved["service_id"] = resolve_service_id(resolved)
     resolved["dataset_args"] = _build_dataset_args(resolved)
     return resolved
+
+
+def _apply_final_multimodal_runtime_defaults(resolved: dict[str, Any]) -> None:
+    hf_task = str(resolved.get("hf_task") or "").strip().lower().replace("-", "_")
+    model_id = str(resolved.get("hf_model_id") or "").strip().lower()
+    generative_vqa = hf_task == "visual_question_answering" and (
+        model_id.startswith("salesforce/blip")
+        or model_id.startswith("microsoft/git-")
+        or "blip" in model_id
+        or "git" in model_id
+    )
+    if hf_task == "image_captioning" or generative_vqa:
+        resolved["batch_size"] = 1
+        service_config = resolved.get("service_config")
+        if isinstance(service_config, dict):
+            service_config["batch_size"] = 1
 
 
 def _build_dataset_args(resolved: dict[str, Any]) -> dict[str, Any]:
@@ -583,6 +605,9 @@ def _validate_row(resolved: dict[str, Any]) -> RowValidation:
     blocked_reason = known_bad_row_reason(resolved)
     if blocked_reason:
         return RowValidation(False, blocked_reason)
+    final_blocked_reason = _final_multimodal_row_reason(resolved)
+    if final_blocked_reason:
+        return RowValidation(False, final_blocked_reason)
 
     if str(resolved.get("dataset")).strip().lower() == "hf":
         if _is_blank(resolved.get("hf_model_id")):
@@ -603,6 +628,30 @@ def _validate_row(resolved: dict[str, Any]) -> RowValidation:
         if _is_blank(resolved.get("text_column")):
             return RowValidation(False, "Multimodal service rows require text_column")
     return RowValidation(True)
+
+
+def _final_multimodal_row_reason(resolved: Mapping[str, Any]) -> str | None:
+    hf_task = str(resolved.get("hf_task") or resolved.get("task") or "").strip().lower().replace("-", "_")
+    training_regime = str(resolved.get("training_regime") or "").strip().lower()
+    if training_regime == "inference_only":
+        return None
+    model_id = str(resolved.get("hf_model_id") or "").strip().lower()
+    if hf_task == "image_captioning" and model_id.startswith("microsoft/git-"):
+        return (
+            "blocked final-run multimodal row: fine-tuned GIT image-captioning rows produced "
+            "very low CIDEr metrics in this project"
+        )
+    if hf_task == "visual_question_answering" and (
+        model_id.startswith("salesforce/blip")
+        or model_id.startswith("microsoft/git-")
+        or "blip" in model_id
+        or "git" in model_id
+    ):
+        return (
+            "blocked final-run multimodal row: fine-tuned generative VQA rows produced zero "
+            "exact-match metrics in this project"
+        )
+    return None
 
 
 def _manifest_requires_hf_preflight(enabled_df: pd.DataFrame) -> bool:
@@ -903,6 +952,203 @@ def _write_failed_manifest_csv(
     return output_path
 
 
+def _multimodal_task(value: Any) -> str:
+    task = str(value or "").strip().lower().replace("-", "_")
+    return task if task in MULTIMODAL_TASKS else ""
+
+
+def _row_multimodal_task(row: Mapping[str, Any]) -> str:
+    for key in ("hf_task", "task", "task_type"):
+        task = _multimodal_task(row.get(key))
+        if task:
+            return task
+    if str(row.get("modality") or "").strip().lower() == "multimodal":
+        return _multimodal_task(row.get("task_type"))
+    return ""
+
+
+def _service_ids_from_multimodal_rows(rows_df: pd.DataFrame, manifest_defaults: dict[str, Any]) -> set[str]:
+    service_ids: set[str] = set()
+    for _, row in rows_df.iterrows():
+        source = row.to_dict()
+        merged = dict(manifest_defaults)
+        merged.update({key: value for key, value in source.items() if not _is_blank(value)})
+        if not _row_multimodal_task(merged):
+            continue
+        service_id = merged.get("service_id")
+        if not _is_blank(service_id):
+            service_ids.add(str(service_id))
+    return service_ids
+
+
+def _fetch_multimodal_service_audit_rows(db_path: str | None, service_ids: set[str] | None = None) -> list[dict[str, Any]]:
+    if not db_path:
+        return []
+    path = Path(str(db_path))
+    if not path.exists():
+        return []
+    placeholders = ""
+    params: list[Any] = []
+    service_filter = ""
+    if service_ids:
+        placeholders = ",".join("?" for _ in service_ids)
+        service_filter = f" AND s.service_id IN ({placeholders})"
+        params.extend(sorted(service_ids))
+    sql = f"""
+    WITH m AS (
+        SELECT
+            service_id,
+            metric_name,
+            COALESCE(value_num, CAST(value_int AS REAL), CAST(value_bool AS REAL)) AS num_value
+        FROM service_metrics
+    ),
+    metric_values AS (
+        SELECT
+            service_id,
+            MAX(CASE WHEN metric_name = 'metric_score' THEN num_value END) AS metric_score,
+            MAX(CASE WHEN metric_name = 'r@1' THEN num_value END) AS recall_at_1,
+            MAX(CASE WHEN metric_name = 'r@5' THEN num_value END) AS recall_at_5,
+            MAX(CASE WHEN metric_name = 'cider' THEN num_value END) AS cider,
+            MAX(CASE WHEN metric_name = 'bleu' THEN num_value END) AS bleu,
+            MAX(CASE WHEN metric_name = 'exact_match' THEN num_value END) AS exact_match,
+            MAX(CASE WHEN metric_name = 'answer_token_accuracy' THEN num_value END) AS answer_token_accuracy
+        FROM m
+        GROUP BY service_id
+    ),
+    latest_failures AS (
+        SELECT sf.service_id, sf.error_message
+        FROM service_failures sf
+        JOIN (
+            SELECT service_id, MAX(failure_id) AS failure_id
+            FROM service_failures
+            WHERE service_id IS NOT NULL
+            GROUP BY service_id
+        ) latest ON latest.failure_id = sf.failure_id
+    )
+    SELECT
+        s.service_id,
+        s.status,
+        s.case_name,
+        s.hf_task,
+        s.model_id,
+        s.dataset_name,
+        s.training_regime,
+        mv.metric_score,
+        mv.recall_at_1,
+        mv.recall_at_5,
+        mv.cider,
+        mv.bleu,
+        mv.exact_match,
+        mv.answer_token_accuracy,
+        lf.error_message
+    FROM services s
+    LEFT JOIN metric_values mv ON mv.service_id = s.service_id
+    LEFT JOIN latest_failures lf ON lf.service_id = s.service_id
+    WHERE s.hf_task IN ('image_captioning', 'text_image_retrieval', 'visual_question_answering')
+    {service_filter}
+    ORDER BY s.hf_task, s.status, s.service_id
+    """
+    try:
+        conn = sqlite3.connect(str(path))
+        conn.row_factory = sqlite3.Row
+        rows = [dict(row) for row in conn.execute(sql, params)]
+        conn.close()
+    except Exception as exc:  # noqa: BLE001
+        print(f"Warning: failed to audit multimodal services from SQLite: {exc}")
+        return []
+    return rows
+
+
+def _multimodal_audit_reasons(row: Mapping[str, Any]) -> list[str]:
+    reasons: list[str] = []
+    status = str(row.get("status") or "").strip().lower()
+    task = _multimodal_task(row.get("hf_task"))
+    if status != "completed":
+        reasons.append("status_not_completed")
+    metric_score = row.get("metric_score")
+    if metric_score is not None:
+        try:
+            if float(metric_score) <= 0.05:
+                reasons.append("metric_score_lte_0.05")
+        except Exception:
+            pass
+    if task == "text_image_retrieval" and row.get("recall_at_1") is not None:
+        try:
+            if float(row.get("recall_at_1")) <= 0.02:
+                reasons.append("r@1_lte_0.02")
+        except Exception:
+            pass
+    if task == "visual_question_answering" and row.get("exact_match") is not None:
+        try:
+            if float(row.get("exact_match")) == 0.0:
+                reasons.append("exact_match_eq_0")
+        except Exception:
+            pass
+    return reasons
+
+
+def _write_multimodal_audit_csv(
+    *,
+    rows_df: pd.DataFrame,
+    manifest_defaults: dict[str, Any],
+    db_path: str | None,
+    output_path: Path | None = None,
+) -> Path | None:
+    output_path = output_path or MULTIMODAL_AUDIT_PATH
+    service_ids = _service_ids_from_multimodal_rows(rows_df, manifest_defaults)
+    audit_rows = []
+    for row in _fetch_multimodal_service_audit_rows(db_path, service_ids or None):
+        reasons = _multimodal_audit_reasons(row)
+        if not reasons:
+            continue
+        audit_rows.append({**row, "audit_reasons": ",".join(reasons)})
+    if not audit_rows:
+        if output_path.exists():
+            output_path.unlink()
+            print(f"Removed stale multimodal audit report: {output_path}")
+        return None
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(audit_rows).to_csv(output_path, index=False)
+    print(f"Wrote multimodal audit report: {output_path} ({len(audit_rows)} rows)")
+    return output_path
+
+
+def _write_missing_multimodal_manifest_csv(
+    *,
+    rows_df: pd.DataFrame,
+    manifest_defaults: dict[str, Any],
+    db_path: str | None,
+    output_path: Path | None = None,
+) -> Path | None:
+    output_path = output_path or MISSING_MULTIMODAL_MANIFEST_PATH
+    service_rows = {
+        str(row.get("service_id")): row
+        for row in _fetch_multimodal_service_audit_rows(db_path, _service_ids_from_multimodal_rows(rows_df, manifest_defaults) or None)
+        if row.get("service_id") is not None
+    }
+    missing_rows: list[dict[str, Any]] = []
+    for _, row in rows_df.iterrows():
+        source = row.to_dict()
+        merged = dict(manifest_defaults)
+        merged.update({key: value for key, value in source.items() if not _is_blank(value)})
+        if not _row_multimodal_task(merged):
+            continue
+        service_id = str(merged.get("service_id") or "")
+        db_row = service_rows.get(service_id)
+        if db_row is not None and str(db_row.get("status") or "").strip().lower() == "completed":
+            continue
+        missing_rows.append({column: _manifest_csv_value(source.get(column, manifest_defaults.get(column))) for column in rows_df.columns})
+    if not missing_rows:
+        if output_path.exists():
+            output_path.unlink()
+            print(f"Removed stale missing multimodal manifest: {output_path}")
+        return None
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(missing_rows, columns=list(rows_df.columns)).to_csv(output_path, index=False)
+    print(f"Wrote missing multimodal manifest: {output_path} ({len(missing_rows)} rows)")
+    return output_path
+
+
 def run_manifest(
     file: str,
     sheet: str = "services",
@@ -1064,6 +1310,18 @@ def run_manifest(
             results=sorted_results,
             db_path=db_path,
         )
+        if not dry_run:
+            effective_db_path = db_path or CONFIG.get("db_path")
+            _write_multimodal_audit_csv(
+                rows_df=rows_df,
+                manifest_defaults=manifest_defaults,
+                db_path=effective_db_path,
+            )
+            _write_missing_multimodal_manifest_csv(
+                rows_df=rows_df,
+                manifest_defaults=manifest_defaults,
+                db_path=effective_db_path,
+            )
         print(f"Wrote results: {output_path}")
         return output_path
     finally:
@@ -1290,6 +1548,9 @@ def _execute_entry_row_local(entry: ManifestEntry) -> dict[str, Any]:
         result = _result_row(resolved, entry.idx, "failed", str(exc), service_id=service_id)
         _record_manifest_progress_result(result)
         return result
+    finally:
+        if _is_hf_resolved(resolved):
+            _clear_cuda_runtime_state()
 
 
 def _execute_entries_grouped_hf(entries: list[ManifestEntry], *, workers: int = 1) -> list[dict[str, Any]]:
@@ -1511,6 +1772,7 @@ def _execute_hf_model_group(entries: list[ManifestEntry]) -> list[dict[str, Any]
                         exc=exc,
                     )
                     results.append(result)
+                    _clear_cuda_runtime_state()
                     try:
                         model = _build_prepared_hf_model(first, meta)
                         base_weights = service_runner.snapshot_model_weights(model)
@@ -1522,6 +1784,8 @@ def _execute_hf_model_group(entries: list[ManifestEntry]) -> list[dict[str, Any]
                         )
                         remaining = dataset_entries[entry_pos + 1 :]
                         results.extend(_execute_entries_row_local(remaining))
+                        model_cache.clear()
+                        _clear_cuda_runtime_state()
                         return results
                     continue
                 model_reset_s = float(time.perf_counter() - reset_start)
@@ -1555,6 +1819,7 @@ def _execute_hf_model_group(entries: list[ManifestEntry]) -> list[dict[str, Any]
                     exc=exc,
                 )
                 results.append(result)
+                _clear_cuda_runtime_state()
                 if is_cuda_poison_error(exc):
                     try:
                         model = _build_prepared_hf_model(first, meta)
@@ -1573,6 +1838,9 @@ def _execute_hf_model_group(entries: list[ManifestEntry]) -> list[dict[str, Any]
             result = _result_row(entry.resolved, entry.idx, status, error, service_id=summary.service_id)
             results.append(result)
             _record_manifest_progress_result(result)
+            _clear_cuda_runtime_state()
+    model_cache.clear()
+    _clear_cuda_runtime_state()
     return results
 
 
@@ -1582,12 +1850,31 @@ def _build_prepared_hf_model(config: dict[str, Any], meta: Any):
     return service_runner.ServiceRunner(config)._build_model(meta=meta_dict, task_family=task_family)
 
 
-def _is_groupable_hf_entry(resolved: dict[str, Any]) -> bool:
+def _is_hf_resolved(resolved: dict[str, Any]) -> bool:
     dataset = str(resolved.get("dataset") or "").strip().lower()
     model_type = str(resolved.get("model_type") or "").strip().lower()
-    return dataset in {"hf", "huggingface"} and bool(resolved.get("hf_model_id")) and (
+    return dataset in {"hf", "huggingface"} and (
         model_type.startswith("hf") or model_type.startswith("transformers")
     )
+
+
+def _requires_row_local_hf_entry(resolved: dict[str, Any]) -> bool:
+    hf_task = str(resolved.get("hf_task") or "").strip().lower().replace("-", "_")
+    model_id = str(resolved.get("hf_model_id") or "").strip().lower()
+    if hf_task == "image_captioning":
+        return True
+    if hf_task == "visual_question_answering" and (
+        model_id.startswith("salesforce/blip")
+        or model_id.startswith("microsoft/git-")
+        or "blip" in model_id
+        or "git" in model_id
+    ):
+        return True
+    return False
+
+
+def _is_groupable_hf_entry(resolved: dict[str, Any]) -> bool:
+    return _is_hf_resolved(resolved) and bool(resolved.get("hf_model_id")) and not _requires_row_local_hf_entry(resolved)
 
 
 def _is_trainable_entry(resolved: dict[str, Any]) -> bool:

@@ -154,8 +154,14 @@ class TransformersTextClassifierAdapter:
         loader_template=None,
         generation_config=None,
         task_tag=None,
+        label_format="single_index",
     ):
-        task, spec = build_task_spec(hf_task, loader_template=loader_template, num_labels=None)
+        task, spec = build_task_spec(
+            hf_task,
+            loader_template=loader_template,
+            num_labels=None,
+            label_format=label_format,
+        )
         core = HFCore(
             model_id=model_id,
             num_labels=None,

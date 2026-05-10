@@ -154,3 +154,16 @@ def test_cached_tokenizer_left_pads_decoder_only_models_even_outside_generation_
     )
 
     assert tokenizer.padding_side == "left"
+
+
+def test_cached_tokenizer_left_pads_decoder_only_image_caption_generation():
+    _install_fake_transformers_with_decoder_config(is_decoder=False)
+
+    tokenizer, _, _ = hf_cache.get_cached_tokenizer(
+        hf_model_id="microsoft/git-base-textcaps",
+        task="image_captioning",
+        device="cpu",
+        transformers_module=sys.modules["transformers"],
+    )
+
+    assert tokenizer.padding_side == "left"

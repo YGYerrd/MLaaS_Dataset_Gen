@@ -748,6 +748,9 @@ def _unique_ints(values: tuple[int, ...] | list[int]) -> tuple[int, ...]:
 
 def _batch_sizes_for(task_key: str, model: dict[str, Any], resource_tier: ResourceTierSpec) -> tuple[int, ...]:
     rank = resource_tier.rank
+    family = str(model.get("family") or "").strip().lower()
+    if task_key == "image_captioning" or (task_key == "visual_question_answering" and family in {"blip", "blip2", "git"}):
+        return (1,)
     if task_key in {"object_detection", "image_segmentation", "image_captioning", "visual_question_answering", "text_image_retrieval"}:
         table = ((1, 2), (2, 4), (4, 8), (8, 16))
     elif task_key in {"text_generation", "text2text_generation", "token_classification"}:
@@ -760,7 +763,6 @@ def _batch_sizes_for(task_key: str, model: dict[str, Any], resource_tier: Resour
     params_m = _estimated_model_params_m(model)
     values = table[min(rank, len(table) - 1)]
     model_id = str(model.get("hf_model_id") or "").strip().lower()
-    family = str(model.get("family") or "").strip().lower()
     if task_key == "object_detection" and (family in {"detr", "conditional-detr", "deformable-detr"} or "detr" in model_id):
         values = tuple(min(2, value) for value in values)
     if params_m is not None and params_m > 700:
@@ -1014,6 +1016,11 @@ def _quality_allows_combo(
     if training_regime != "inference_only":
         if not _vision_dataset_meets_minimum_examples(task_key, dataset_spec):
             return False
+        family = str(model.get("family") or "").strip().lower()
+        if task_key == "image_captioning" and family == "git":
+            return False
+        if task_key == "visual_question_answering" and family in {"blip", "blip2", "git"}:
+            return False
         if task_key in {"image_captioning", "text_image_retrieval", "visual_question_answering"}:
             return bool(model.get("finetune_validated"))
         return True
@@ -1065,6 +1072,22 @@ def _row_is_manifest_eligible(row: dict[str, Any]) -> bool:
         return True
     model_id = str(row.get("hf_model_id") or "").strip().lower()
     task_type = str(row.get("task_type") or "").strip().lower()
+    hf_task = str(row.get("hf_task") or row.get("task") or "").strip().lower().replace("-", "_")
+    meta = row.get("hf_service_meta_json")
+    family = ""
+    if isinstance(meta, str) and meta.strip():
+        try:
+            family = str((json.loads(meta) or {}).get("model_family") or "").strip().lower()
+        except Exception:
+            family = ""
+    if hf_task == "image_captioning" and (family == "git" or model_id.startswith("microsoft/git-")):
+        return False
+    if hf_task == "visual_question_answering" and (
+        family in {"blip", "blip2", "git"}
+        or model_id.startswith("salesforce/blip")
+        or model_id.startswith("microsoft/git-")
+    ):
+        return False
     batch_size = _as_int(row.get("batch_size")) or 0
     if task_type == "segmentation" and model_id.startswith("openmmlab/upernet-") and batch_size < 2:
         return False

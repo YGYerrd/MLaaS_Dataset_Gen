@@ -159,6 +159,7 @@ def create_model(
 
         batch_size = int(kwargs.get("batch_size", 16))
         device = kwargs.get("device", None)
+        label_format = infer_label_format(meta if isinstance(meta, dict) else None, task_type=task_type)
 
         generation_config = {
             "max_new_tokens": kwargs.get("max_new_tokens", (meta or {}).get("max_new_tokens") if isinstance(meta, dict) else None),
@@ -181,6 +182,7 @@ def create_model(
             loader_template=loader_template,
             generation_config=generation_config,
             task_tag=kwargs.get("task_tag", (meta or {}).get("task_tag") if isinstance(meta, dict) else None),
+            label_format=label_format,
         )
 
     # ----------------------------

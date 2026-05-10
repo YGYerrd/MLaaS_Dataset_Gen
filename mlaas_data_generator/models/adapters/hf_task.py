@@ -2040,6 +2040,19 @@ class Seq2SeqGenerationSpec(HFTaskSpec):
 
     def loss_fn(self, torch, logits, labels_t, extra):
         ignore_index = int(extra.get("ignore_index", -100))
+        if logits is None or labels_t is None:
+            return None
+        if int(getattr(logits, "numel", lambda: 0)()) == 0 or int(getattr(labels_t, "numel", lambda: 0)()) == 0:
+            return None
+        if getattr(logits, "ndim", 0) < 3 or getattr(labels_t, "ndim", 0) < 2:
+            return None
+        if int(logits.shape[0]) != int(labels_t.shape[0]):
+            return None
+        common = min(int(logits.shape[1]), int(labels_t.shape[1]))
+        if common <= 0:
+            return None
+        logits = logits[:, :common, :]
+        labels_t = labels_t[:, :common]
         return torch.nn.functional.cross_entropy(logits.transpose(1, 2), labels_t, ignore_index=ignore_index)
 
     def preds_from_logits(self, torch, logits, extra):
@@ -2165,6 +2178,19 @@ class ImageCaptioningSpec(HFTaskSpec):
 
     def loss_fn(self, torch, logits, labels_t, extra):
         ignore_index = int(extra.get("ignore_index", -100))
+        if logits is None or labels_t is None:
+            return None
+        if int(getattr(logits, "numel", lambda: 0)()) == 0 or int(getattr(labels_t, "numel", lambda: 0)()) == 0:
+            return None
+        if getattr(logits, "ndim", 0) < 3 or getattr(labels_t, "ndim", 0) < 2:
+            return None
+        if int(logits.shape[0]) != int(labels_t.shape[0]):
+            return None
+        common = min(int(logits.shape[1]), int(labels_t.shape[1]))
+        if common <= 0:
+            return None
+        logits = logits[:, :common, :]
+        labels_t = labels_t[:, :common]
         return torch.nn.functional.cross_entropy(logits.transpose(1, 2), labels_t, ignore_index=ignore_index)
 
     def preds_from_logits(self, torch, logits, extra):

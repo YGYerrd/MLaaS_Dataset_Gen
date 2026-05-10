@@ -221,6 +221,64 @@ def test_hf_multimodal_preprocessor_contract(monkeypatch):
     assert meta["accounting"]["sequence_count"] == 2
 
 
+def test_image_captioning_preprocessor_left_pads_decoder_only_models(monkeypatch):
+    train = DummyDS([
+        {"image": np.ones((8, 8, 3), dtype=np.uint8), "text": "hello"},
+        {"image": np.ones((8, 8, 3), dtype=np.uint8), "text": "hello world"},
+    ])
+    test = DummyDS([
+        {"image": np.ones((8, 8, 3), dtype=np.uint8), "text": "test"},
+    ])
+
+    class DummyTokenizer:
+        pad_token_id = 0
+        eos_token_id = 2
+        padding_side = "right"
+
+        def __call__(self, text, **kwargs):
+            max_length = int(kwargs.get("max_length", 5))
+            ids = [10 + i for i, _ in enumerate(str(text).split(), start=1)] or [10]
+            ids = ids[:max_length]
+            pad_count = max(0, max_length - len(ids))
+            if self.padding_side == "left":
+                padded = [self.pad_token_id] * pad_count + ids
+                mask = [0] * pad_count + [1] * len(ids)
+            else:
+                padded = ids + [self.pad_token_id] * pad_count
+                mask = [1] * len(ids) + [0] * pad_count
+            return {"input_ids": padded, "attention_mask": mask}
+
+    class DummyImageProcessor:
+        def __call__(self, image, **kwargs):
+            chw = np.transpose(np.asarray(image, dtype=np.float32), (2, 0, 1))
+            return {"pixel_values": chw}
+
+    fake_tr = types.SimpleNamespace(
+        AutoConfig=types.SimpleNamespace(
+            from_pretrained=lambda *a, **k: types.SimpleNamespace(is_encoder_decoder=False)
+        ),
+        AutoTokenizer=types.SimpleNamespace(from_pretrained=lambda *a, **k: DummyTokenizer()),
+        AutoImageProcessor=types.SimpleNamespace(from_pretrained=lambda *a, **k: DummyImageProcessor()),
+    )
+    monkeypatch.setitem(sys.modules, "transformers", fake_tr)
+
+    (x_train, y_train), (_, _), meta = preprocess_hf_multimodal(
+        (train, None),
+        (test, None),
+        {"task_type": "image_captioning"},
+        hf_model_id="microsoft/git-base-textcaps",
+        hf_task="image_captioning",
+        image_column="image",
+        text_column="text",
+        max_length=5,
+    )
+
+    assert x_train["input_ids"][0].tolist() == [0, 0, 0, 0, 11]
+    assert x_train["attention_mask"][0].tolist() == [0, 0, 0, 0, 1]
+    assert y_train[0].tolist() == [-100, -100, -100, -100, 11]
+    assert meta["hf_task"] == "image_captioning"
+
+
 def test_hf_multimodal_preprocessor_skips_decode_errors(monkeypatch):
     train = DummyDS([
         {"image": "missing-file.jpg", "text": "bad", "label": 0},
@@ -304,6 +362,54 @@ def test_hf_multimodal_retrieval_accepts_tensor_like_image_processor_output(monk
     assert x_train["pixel_values"].shape == (2, 3, 8, 8)
     assert x_train["caption_lengths"].tolist() == [1, 1]
     assert y_train.tolist() == [0, 0]
+    assert meta["schema"]["decode_report"]["train"]["survived"] == 2
+
+
+def test_hf_multimodal_retrieval_accepts_flickr8k_tensor_like_image_rows(monkeypatch):
+    train = DummyDS([
+        {"image": {"array": TensorLikeArray(np.ones((3, 8, 8), dtype=np.float32))}, "caption_0": "hello"},
+        {"image": TensorLikeArray(np.ones((8, 8, 3), dtype=np.float32)), "caption_0": "world"},
+    ])
+    test = DummyDS([
+        {"image": {"array": TensorLikeArray(np.ones((3, 8, 8), dtype=np.float32))}, "caption_0": "test"},
+    ])
+    seen_shapes = []
+
+    class DummyTokenizer:
+        def __call__(self, text, **kwargs):
+            return {"input_ids": [1, 2, 0], "attention_mask": [1, 1, 0]}
+
+    class DummyImageProcessor:
+        def __call__(self, image, **kwargs):
+            arr = np.asarray(image, dtype=np.float32)
+            seen_shapes.append(tuple(arr.shape))
+            assert arr.shape == (8, 8, 3)
+            chw = np.transpose(arr, (2, 0, 1))
+            return {"pixel_values": TensorLikeArray(chw.reshape(1, *chw.shape))}
+
+    fake_tr = types.SimpleNamespace(
+        AutoTokenizer=types.SimpleNamespace(from_pretrained=lambda *a, **k: DummyTokenizer()),
+        AutoImageProcessor=types.SimpleNamespace(from_pretrained=lambda *a, **k: DummyImageProcessor()),
+    )
+    monkeypatch.setitem(sys.modules, "transformers", fake_tr)
+
+    (x_train, y_train), (_, _), meta = preprocess_hf_multimodal(
+        (train, None),
+        (test, None),
+        {"task_type": "retrieval"},
+        hf_model_id="openai/clip-vit-base-patch32",
+        hf_task="text_image_retrieval",
+        image_column="image",
+        text_column="caption_0",
+        max_length=4,
+    )
+
+    assert seen_shapes == [(8, 8, 3), (8, 8, 3), (8, 8, 3)]
+    assert x_train["pixel_values"].shape == (2, 3, 8, 8)
+    assert x_train["image_sizes"].tolist() == [[8, 8], [8, 8]]
+    assert x_train["caption_lengths"].tolist() == [1, 1]
+    assert y_train.tolist() == [0, 0]
+    assert meta["schema"]["decode_report"]["train"]["failed"] == 0
     assert meta["schema"]["decode_report"]["train"]["survived"] == 2
 
 

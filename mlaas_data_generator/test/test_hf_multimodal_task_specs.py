@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 
+from mlaas_data_generator.models.adapters.hf_adapter import build_task_spec
 from mlaas_data_generator.models.adapters.hf_task import (
     ImageCaptioningSpec,
     SentenceSimilaritySpec,
@@ -375,6 +376,16 @@ def test_vqa_build_model_routes_answer_text_git_models_to_generative_loader():
     assert GitForCausalLM.called == 1
 
 
+def test_build_task_spec_preserves_vqa_answer_text_for_inference_models():
+    _, spec = build_task_spec(
+        hf_task="visual_question_answering",
+        label_format="answer_text",
+    )
+
+    assert isinstance(spec, VQASpec)
+    assert spec._label_mode() == "auto"
+
+
 def test_vqa_build_model_rejects_classification_labels_for_git_family():
     class DummyConfig:
         model_type = "git"
@@ -396,6 +407,15 @@ def test_vqa_build_model_rejects_classification_labels_for_git_family():
 
     with pytest.raises(ValueError, match="generative VQA architecture family 'git'"):
         spec.build_model(TransformersStub, "microsoft/git-base-vqav2", num_labels=2)
+
+
+def test_captioning_loss_skips_empty_or_mismatched_teacher_logits():
+    torch = pytest.importorskip("torch")
+    spec = ImageCaptioningSpec()
+    logits = torch.empty((0, 4, 10), dtype=torch.float32)
+    labels = torch.ones((22, 4), dtype=torch.long)
+
+    assert spec.loss_fn(torch, logits, labels, {"ignore_index": -100}) is None
 
 
 def test_vqa_build_model_routes_answer_text_vilt_models_to_classification_loader():

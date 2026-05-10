@@ -7,6 +7,12 @@ from ...data.preprocessors.hf_text_generation import _load_auto_tokenizer
 _TOKENIZER_CACHE = {}
 _MODEL_CACHE = {}
 _CACHE_LOCK = threading.Lock()
+_GENERATION_TASKS = {
+    "causal_lm_generation",
+    "seq2seq_generation",
+    "image_captioning",
+    "visual_question_answering",
+}
 
 
 def _cache_key(hf_model_id, task, device):
@@ -29,6 +35,8 @@ def _should_left_pad_tokenizer(*, hf_model_id, task, transformers_module):
 
     if bool(getattr(config, "is_encoder_decoder", False)):
         return False
+    if task_name in _GENERATION_TASKS:
+        return True
     if bool(getattr(config, "is_decoder", False)):
         return True
     return False

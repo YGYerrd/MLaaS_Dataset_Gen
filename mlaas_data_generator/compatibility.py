@@ -99,6 +99,30 @@ def known_bad_path_reason(
             "table-specific and its label space does not match this detection dataset"
         )
 
+    if task == "image_captioning" and model == "microsoft/git-base-vatex":
+        return (
+            "blocked final-run multimodal path: microsoft/git-base-vatex produced empty generation/logit "
+            "batches for Flickr8k captioning in this project"
+        )
+
+    if task == "text_image_retrieval" and dataset == "jxie/flickr8k" and model in {
+        "google/siglip-base-patch16-224",
+        "google/siglip2-base-patch16-224",
+    }:
+        return (
+            "blocked final-run multimodal path: this SigLIP retrieval pairing produced near-random "
+            "Flickr8k r@1 metrics in this project"
+        )
+
+    if task == "visual_question_answering" and dataset == "huggingfacem4/vqav2" and model in {
+        "bingsu/temp_vilt_vqa",
+        "jmonas/vilt-33m-vqa",
+    }:
+        return (
+            "blocked final-run multimodal path: this VQA checkpoint failed or produced zero exact-match "
+            "metrics on VQAv2 in this project"
+        )
+
     if hf in {"seq2seq_generation", "text2text_generation"} and tag == "summarization" and model == "salesforce/codet5-small":
         return (
             "blocked semantic pairing: Salesforce/codet5-small is disabled for summarization-style "
