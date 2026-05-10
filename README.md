@@ -10,75 +10,6 @@ registry -> hf-manifest -> review manifest -> run-manifest --dry-run -> run-mani
 
 Each manifest row describes one independent service instance. Executing a row trains or loads one model, evaluates it on its benchmark split, records functional attributes and service metrics, then stores one service record in SQLite.
 
-## What To Copy To Another Computer
-
-Copy the project source, not the virtual environment.
-
-Keep:
-
-- `mlaas_data_generator/`
-- `requirements.txt`
-- `README.md`
-- any custom registry, manifest, SQL, or experiment files you need
-
-Usually do not copy:
-
-- `.venv/` or `venv/`
-- `__pycache__/`
-- `.pytest_cache/`
-- old Hugging Face caches
-
-Copy only if you want previous results:
-
-- `outputs/`
-- `weights/`
-- existing `.db`, `.csv`, and `.xlsx` output files
-
-## Get The Project Onto Linux
-
-### Option 1: Clone From Git
-
-On the Linux computer:
-
-```bash
-git clone <your-repository-url> MLaaS-Dataset-Generator
-cd MLaaS-Dataset-Generator
-```
-
-If the repository is private, set up SSH keys or authenticate with HTTPS first.
-
-### Option 2: Transfer A Zip Or Tarball
-
-From the old machine, create an archive of the project folder. Exclude `.venv`, caches, and large old outputs unless you need them.
-
-On Linux, unpack it:
-
-```bash
-tar -xzf MLaaS-Dataset-Generator.tar.gz
-cd MLaaS-Dataset-Generator
-```
-
-If you transferred a `.zip` file:
-
-```bash
-unzip MLaaS-Dataset-Generator.zip
-cd MLaaS-Dataset-Generator
-```
-
-### Option 3: Copy Over SSH
-
-From the old machine, copy the folder to the Linux computer:
-
-```bash
-rsync -av --exclude ".venv" --exclude "__pycache__" --exclude ".pytest_cache" MLaaS-Dataset-Generator/ user@linux-host:~/MLaaS-Dataset-Generator/
-```
-
-Then SSH into the Linux computer:
-
-```bash
-ssh user@linux-host
-cd ~/MLaaS-Dataset-Generator
-```
 
 ## Python And Platform Prerequisites
 
@@ -95,13 +26,6 @@ Check Python:
 
 ```bash
 python3 --version
-```
-
-If your system has multiple Python versions, use the one you want explicitly:
-
-```bash
-python3.11 --version
-python3.11 -m venv .venv
 ```
 
 ## Create And Activate A Virtual Environment
