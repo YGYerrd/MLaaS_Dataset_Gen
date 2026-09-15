@@ -11,10 +11,15 @@ MANIFEST_RESULTS_PATH = BASE_OUTPUT_DIR / "service_manifest_results.csv"
 FAILED_MANIFEST_PATH = BASE_OUTPUT_DIR / "service_manifest_failed.csv"
 FAILURE_LOG_PATH = BASE_OUTPUT_DIR / "service_failures.log"
 
-SQL_DB_PATH = Path(os.getenv("MLAAS_SQL_DB_PATH") or os.getenv("MLAAS_DB_PATH") or BASE_OUTPUT_DIR / "services2.db")
+SQL_DB_PATH = Path(os.getenv("MLAAS_SQL_DB_PATH") or os.getenv("MLAAS_DB_PATH") or BASE_OUTPUT_DIR / "services.db")
+
+# Uniform architecture pool for new independent CNN families. Draw once per
+# model/dataset contract; clients in that family share the selected shape.
+CNN_HIDDEN_LAYER_POOL = ((32,), (64,), (128,), (256,))
 
 CONFIG = {
     "db_path": str(SQL_DB_PATH),
+    "log_mode": os.getenv("MLAAS_LOG_MODE", "concise"),
     "seed": 42,
     "batch_size": 32,
     "learning_rate": 0.001,
@@ -31,7 +36,6 @@ CONFIG = {
     "activation": "relu",
     "device": "auto",
     "sample_size": None,
-    "max_samples": 200,
     "dataset_args": None,
     "measure_system_metrics": True,
     "explainability_enabled": False,
@@ -49,6 +53,20 @@ CONFIG = {
     "explainability_meaningful_drop_threshold": 0.2,
     "explainability_selectivity_floor": 0.5,
     "save_weights": False,
+    "no_save_weights": False,
+    "smoke_test": False,
+    "provenance_artifact_dir": None,
+    "checkpoint_patch_compression": "zlib",
+    "checkpoint_patch_operation_policy": "fixed_xor",
+    "checkpoint_measure_full": False,
+    "checkpoint_weight_format": "int8",
+    "checkpoint_reduced_compression": "none",
+    "checkpoint_reduced_compression_level": 1,
+    "checkpoint_validation_samples": 256,
+    "checkpoint_quality_tolerance": 0.01,
+    # Level 1 keeps checkpoint persistence bounded for transformer-sized
+    # states. Callers can still explicitly request a denser level.
+    "checkpoint_patch_compression_level": 1,
     "train_progress_log_interval": 10,
     "update_signature_enabled": True,
     "update_signature_dim": 256,

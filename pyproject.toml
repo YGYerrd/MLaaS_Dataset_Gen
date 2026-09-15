@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mlaas-research-tools"
+version = "0.1.0"
+description = "Tools for generating and composing Machine Learning as a Service catalogues"
+readme = "README.md"
+requires-python = ">=3.11"
+dynamic = ["dependencies"]
+
+[project.scripts]
+mlaas-generate = "mlaas_data_generator.cli.main:main"
+mlaas-compose = "mlaas_composition.cli:main"
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+
+[tool.setuptools.packages.find]
+include = ["mlaas_data_generator*", "mlaas_composition*"]
+exclude = ["*.test", "*.test.*", "*.tests", "*.tests.*"]
+
+[tool.setuptools.package-data]
+mlaas_data_generator = ["storage/schema.sql", "clients/recipe_evidence.json"]
+mlaas_composition = ["assets/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

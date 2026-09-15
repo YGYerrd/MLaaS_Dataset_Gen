@@ -6,6 +6,15 @@ import importlib.util
 # HF Task Specs
 # ----------------------------
 
+
+def _generation_kwargs(config):
+    kwargs = dict(config)
+    if kwargs.get("max_new_tokens") is not None:
+        # Explicitly override checkpoint defaults too (e.g. DistilBART's 62).
+        # generate() derives total length from the new-token budget.
+        kwargs["max_length"] = None
+    return kwargs
+
 def _load_auto_model_with_safetensor_fallback(transformers, model_id, auto_model_names, **from_pretrained_kwargs):
     last_error = None
     missing = []
@@ -1568,7 +1577,13 @@ class ImageSegmentationSpec(HFTaskSpec):
 
     def loss_fn(self, torch, logits, labels_t, extra):
         labels_t = self._resize_labels_to_logits(torch, labels_t, logits.shape[-2:])
-        return torch.nn.functional.cross_entropy(logits, labels_t, ignore_index=int(extra.get("ignore_index", -100)))
+        ignore_index = int(extra.get("ignore_index", -100))
+        if not bool((labels_t != ignore_index).any()):
+            raise ValueError("insufficient_supervision: no segmentation targets remain at logits resolution")
+        # Evaluation calls this outside autocast. Reducing dense pixel losses
+        # in FP16 can overflow even when every logit is finite. Keep the forward
+        # precision, but compute the loss in FP32 in both training and evaluation.
+        return torch.nn.functional.cross_entropy(logits.float(), labels_t, ignore_index=ignore_index)
 
     def preds_from_logits(self, torch, logits, extra):
         return torch.argmax(logits, dim=1)
@@ -1636,7 +1651,7 @@ class SentenceSimilaritySpec(HFTaskSpec):
         AutoModel = transformers.AutoModelForSequenceClassification
         self.weight_format = None
         resolved_num_labels = 1 if self.is_regression else int(num_labels)
-        extra = {"problem_type": "regression"} if self.is_regression else {}
+        extra = {"problem_type": "regression" if self.is_regression else "single_label_classification"}
         try:
             model = AutoModel.from_pretrained(
                 model_id,
@@ -1969,7 +1984,7 @@ class CausalLMGenerationSpec(HFTaskSpec):
     def generate_predictions(self, model, enc, tokenizer, torch, generation_config):
         if getattr(tokenizer, "padding_side", None) != "left":
             tokenizer.padding_side = "left"
-        cfg = dict(generation_config)
+        cfg = _generation_kwargs(generation_config)
         if cfg.get("pad_token_id") is None and tokenizer.pad_token_id is not None:
             cfg["pad_token_id"] = int(tokenizer.pad_token_id)
         generated = model.generate(**enc, **cfg)
@@ -2059,7 +2074,7 @@ class Seq2SeqGenerationSpec(HFTaskSpec):
         return torch.argmax(logits, dim=-1)
 
     def generate_predictions(self, model, enc, tokenizer, torch, generation_config):
-        return model.generate(**enc, **generation_config)
+        return model.generate(**enc, **_generation_kwargs(generation_config))
 
     def metrics(self, y_true, y_pred, y_extra=None):
         task_tag = ""
@@ -2197,7 +2212,7 @@ class ImageCaptioningSpec(HFTaskSpec):
         return torch.argmax(logits, dim=-1)
 
     def generate_predictions(self, model, enc, tokenizer, torch, generation_config):
-        return model.generate(**enc, **generation_config)
+        return model.generate(**enc, **_generation_kwargs(generation_config))
 
     @staticmethod
     def _safe_div(num, den):
@@ -2254,6 +2269,41 @@ class TextImageRetrievalSpec(HFTaskSpec):
     name = "text_image_retrieval"
     requires_num_labels = False
     supports_unlabeled_metric_statistics = True
+
+    def extract_loss(self, torch, outputs, logits, labels_t, extra):
+        # Pair alignment supplies supervision even without numeric labels. Never
+        # accept a model-provided singleton loss that bypasses this guard.
+        return self.loss_fn(torch, logits, labels_t, extra)
+
+    def pooled_evaluation_loss(self, torch, accumulator, model):
+        """Symmetric CE against every evaluation candidate, independent of batches.
+
+        Encode on the GPU in any batch size, then score bounded blocks on the CPU.
+        CLIP's learned temperature is retained; candidates are never singleton.
+        """
+        if not accumulator.get("image_embeds") or not accumulator.get("text_embeds"):
+            raise ValueError("retrieval_evaluation_embeddings_required: cannot compute pooled contrastive loss")
+        image = torch.from_numpy(np.concatenate(accumulator["image_embeds"]).astype(np.float32))
+        text = torch.from_numpy(np.concatenate(accumulator["text_embeds"]).astype(np.float32))
+        if image.ndim != 2 or text.shape != image.shape or len(image) < 2:
+            raise ValueError("insufficient_contrastive_candidates: evaluation requires at least two aligned pairs")
+        image = torch.nn.functional.normalize(image, dim=-1)
+        text = torch.nn.functional.normalize(text, dim=-1)
+        scale = getattr(model, "logit_scale", None)
+        scale = scale.detach().float().cpu().exp() if scale is not None else 1.0
+        count = len(image)
+        total = 0.0
+        with torch.no_grad():
+            for queries, candidates in ((text, image), (image, text)):
+                for start in range(0, count, 256):
+                    stop = min(count, start + 256)
+                    scores = (queries[start:stop] @ candidates.T) * scale
+                    targets = torch.arange(start, stop)
+                    total += float(torch.nn.functional.cross_entropy(scores, targets, reduction="sum"))
+        result = total / (2 * count)
+        if not np.isfinite(result):
+            raise ValueError("nonfinite_evaluation_loss: pooled retrieval contrastive loss is nonfinite")
+        return result, count
 
     def init_metric_accumulator(self):
         return {"image_embeds": [], "text_embeds": []}
@@ -2337,6 +2387,9 @@ class TextImageRetrievalSpec(HFTaskSpec):
                 f"(got {tuple(int(dim) for dim in logits.shape)})"
             )
         batch = int(logits.shape[0])
+        if batch < 2:
+            raise ValueError("insufficient_contrastive_batch: contrastive loss requires at least two pairs per forward")
+        logits = logits.float()
         targets = torch.arange(batch, device=logits.device, dtype=torch.long)
         text_to_image = torch.nn.functional.cross_entropy(logits, targets)
         image_to_text = torch.nn.functional.cross_entropy(logits.transpose(0, 1), targets)
@@ -2616,7 +2669,7 @@ class VQASpec(HFTaskSpec):
             for key in ("max_new_tokens", "num_beams", "do_sample", "temperature", "top_k", "top_p", "length_penalty"):
                 if key in generation_config and generation_config[key] is not None:
                     generation_kwargs[key] = generation_config[key]
-            generated = model.generate(**enc, **generation_kwargs)
+            generated = model.generate(**enc, **_generation_kwargs(generation_kwargs))
             input_ids = enc.get("input_ids") if isinstance(enc, dict) else None
             if (
                 input_ids is not None

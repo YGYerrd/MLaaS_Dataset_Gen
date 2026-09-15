@@ -138,7 +138,11 @@ def preprocess_hf_text_sequence(
         num_classes = int(label_feat.num_classes)
         y_train = np.asarray(train_labels, dtype="int32")
         y_test = np.asarray(test_labels, dtype="int32")
-        label_mapping = {str(i): i for i in range(num_classes)}
+        names = list(getattr(label_feat, "names", []) or [])
+        label_mapping = {
+            str(names[i]) if i < len(names) else str(i): i
+            for i in range(num_classes)
+        }
     else:
         uniq = {}
         y_train_list = []
@@ -157,6 +161,15 @@ def preprocess_hf_text_sequence(
         y_test = np.asarray(y_test_list, dtype="int32")
         num_classes = int(len(uniq))
         label_mapping = {str(k): int(v) for k, v in uniq.items()}
+
+    # Fit the label contract on the complete pool before selecting text rows.
+    from ..tokenization_selection import select_training_rows
+    selection_meta = attach_label_schema({**meta, "hf_task": "sequence_classification",
+        "num_classes": num_classes, "label_mapping": label_mapping,
+        "label_granularity": "sequence", "is_multilabel": bool(is_multilabel)},
+        y_train, default_num_labels=num_classes)
+    ds_train, y_train, meta = select_training_rows(ds_train, y_train, selection_meta,
+                                                  dynamic_padding=dynamic_padding)
 
     try:
         import transformers

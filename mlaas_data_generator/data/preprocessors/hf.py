@@ -1,4 +1,5 @@
 from .hf_text_sequence import preprocess_hf_text_sequence
+from pathlib import Path
 from .hf_text_similarity import preprocess_hf_text_similarity
 from .hf_text_fill_mask import preprocess_hf_text_fill_mask
 from .hf_text_token import preprocess_hf_text_token
@@ -89,10 +90,41 @@ def _validate_hf_preprocessor_output(train, test, meta):
         )
 
     meta["x_keys"] = list(x_train.keys())
+    from ..tokenization_selection import finalize_selected_accounting
+    meta = finalize_selected_accounting(meta, train)
     return train, test, meta
 
 
+def prepare_hf_candidates(selection, train, test, meta, dataset_args, prepare):
+    """Fit cheap raw label metadata, then prepare only selected candidates."""
+    task = _resolve_text_hf_task(meta, dataset_args)
+    raw_labels = train[1]
+    column = dataset_args.get("label_column", "label")
+    if task == "image_classification" and column in train[0].column_names:
+        import numpy as np
+        raw_labels = np.asarray(train[0][column])
+        meta = {**meta, "num_classes": int(np.max(raw_labels)) + 1}
+    if task == "visual_question_answering":
+        # Fitting an answer vocabulary needs only raw labels, never decoded
+        # images or tokens. Keep that fit stable across replacement batches.
+        from .hf_multimodal import _resolve_multimodal_columns, _coerce_vqa_answer
+        _, _, _, answer_column = _resolve_multimodal_columns(task,
+            dataset_args.get("image_column"), dataset_args.get("text_column"), dataset_args.get("label_column"),
+            dataset_args.get("question_column"), dataset_args.get("answer_column"), dataset_args.get("ranking_label_column"))
+        if answer_column in train[0].column_names:
+            meta = {**meta, "_vqa_source_answers": [_coerce_vqa_answer(a) for a in train[0][answer_column]]}
+    return selection.prepare((train[0], raw_labels), test, meta, prepare)
+
+
 def preprocess_hf(train, test, meta, **dataset_args):
+    from ..tokenization_selection import active_selection
+    selection = active_selection()
+    task = _resolve_text_hf_task(meta, dataset_args)
+    # Scalar text labels are fitted by their existing preprocessors before the
+    # row-preserving selection hook. All other tasks select raw candidates here.
+    if selection is not None and task not in {"sequence_classification", "sentence_similarity"}:
+        return prepare_hf_candidates(selection, train, test, meta, dataset_args,
+                                     lambda tr, te, m: preprocess_hf(tr, te, m, **dataset_args))
     requested_modality = str(meta.get("modality", "text")).strip().lower()
     requested_task = meta.get("hf_task", dataset_args.get("hf_task", meta.get("task_type")))
     hf_task = normalize_hf_task(requested_task)
@@ -102,6 +134,16 @@ def preprocess_hf(train, test, meta, **dataset_args):
     hf_model_id = dataset_args.get("hf_model_id")
     if not hf_model_id:
         raise ValueError("HF preprocessing requires hf_model_id in dataset_args")
+    hf_model_revision = dataset_args.get("hf_model_revision") or dataset_args.get("model_revision")
+    if hf_model_revision and not Path(str(dataset_args.get("hf_model_id") or "")).is_dir():
+        try:
+            from huggingface_hub import snapshot_download
+            hf_model_id = snapshot_download(repo_id=str(hf_model_id), revision=str(hf_model_revision))
+        except Exception as exc:
+            raise RuntimeError(f"Unable to resolve pinned Hugging Face model revision {dataset_args.get('hf_model_id')}@{hf_model_revision}") from exc
+    meta["hf_model_revision"] = hf_model_revision
+    from ..tokenization_selection import report_tokenization_policy
+    report_tokenization_policy(meta, dataset_args)
 
     if modality == "image":
         if hf_task not in _IMAGE_TASKS:
@@ -130,6 +172,7 @@ def preprocess_hf(train, test, meta, **dataset_args):
             eval_augmentations=dataset_args.get("eval_augmentations", False),
             on_decode_error=dataset_args.get("on_decode_error", "skip"),
             report_decode_errors=dataset_args.get("report_decode_errors", True),
+            **({"processor_size": dataset_args["processor_size"]} if dataset_args.get("processor_size") is not None else {}),
         )
         return _validate_hf_preprocessor_output(*out)
 
@@ -188,6 +231,8 @@ def preprocess_hf(train, test, meta, **dataset_args):
         return _validate_hf_preprocessor_output(*out)
 
     if hf_task == "sentence_similarity":
+        from ...task_contract import resolve_sentence_pair_contract
+        contract = resolve_sentence_pair_contract({**meta, **dataset_args})
         out = preprocess_hf_text_similarity(
             train,
             test,
@@ -195,7 +240,7 @@ def preprocess_hf(train, test, meta, **dataset_args):
             hf_model_id=hf_model_id,
             text_column=dataset_args.get("text_column", ["sentence1", "sentence2"]),
             label_column=dataset_args.get("label_column", "label"),
-            label_mode=dataset_args.get("label_mode", "auto"),
+            label_mode=contract.get("label_mode", "auto"),
             dynamic_padding=dataset_args.get("dynamic_padding", False),
         )
         return _validate_hf_preprocessor_output(*out)

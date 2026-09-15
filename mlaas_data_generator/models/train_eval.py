@@ -1,4 +1,5 @@
 from __future__ import annotations
+import inspect
 import numpy as np
 
 try:
@@ -9,14 +10,34 @@ except Exception:
         pass
 
 
-def train_local_model(model, x, y, epochs=1, batch_size=32, lr=None):
+def resolve_fit_kwargs(model, x, y, kwargs, *, legacy_kwargs=None):
+    """Negotiate adapter arguments before training can mutate the model.
+
+    Only an incompatible signature permits the caller's explicit legacy form.
+    A TypeError raised inside fit is a training failure, never a retry signal.
+    Opaque extension callables receive the requested arguments unchanged.
+    """
     try:
-        model.fit(x, y, epochs=epochs, batch_size=batch_size, verbose=0)
+        signature = inspect.signature(model.fit)
+    except (TypeError, ValueError):
+        return kwargs
+    try:
+        signature.bind(x, y, **kwargs)
     except TypeError:
-        if lr is None:
-            model.fit(x, y, epochs=epochs, batch_size=batch_size)
-        else:
-            model.fit(x, y, epochs=epochs, batch_size=batch_size, lr=lr)
+        if legacy_kwargs is None:
+            raise
+        signature.bind(x, y, **legacy_kwargs)
+        return legacy_kwargs
+    return kwargs
+
+
+def train_local_model(model, x, y, epochs=1, batch_size=32, lr=None):
+    kwargs = {"epochs": epochs, "batch_size": batch_size, "verbose": 0}
+    legacy_kwargs = {"epochs": epochs, "batch_size": batch_size}
+    if lr is not None:
+        legacy_kwargs["lr"] = lr
+    kwargs = resolve_fit_kwargs(model, x, y, kwargs, legacy_kwargs=legacy_kwargs)
+    model.fit(x, y, **kwargs)
 
     if hasattr(model, "get_weights"):
         try:
@@ -28,7 +49,51 @@ def train_local_model(model, x, y, epochs=1, batch_size=32, lr=None):
     return None
 
 
+def regression_metrics(y_true, y_pred):
+    """Named, unweighted errors in the supplied target units (no broadcasting)."""
+    truth = np.asarray(y_true, dtype=np.float64)
+    prediction = np.asarray(y_pred, dtype=np.float64)
+    if truth.ndim == 1:
+        truth = truth[:, None]
+    if prediction.ndim == 1:
+        prediction = prediction[:, None]
+    if truth.shape != prediction.shape or not truth.size:
+        raise ValueError("regression targets and predictions must have matching non-empty shapes")
+    error = prediction - truth
+    mse = float(np.mean(error ** 2))
+    return {"mse": mse, "rmse": float(np.sqrt(mse)), "mae": float(np.mean(np.abs(error)))}
+
+
+def evaluate_regression_model(model, x_test, y_test):
+    """Return explicit loss/MSE/RMSE/MAE; never reinterpret a positional RMSE.
+
+    Keras loss can include regularization, so it is kept separate from MSE.
+    Legacy Keras checkpoints without all three named metrics use predictions.
+    Other estimators use predictions directly, independent of evaluate order.
+    """
+    try:
+        module = type(model).__module__.lower()
+        keras_result = None
+        if "keras" in module or "tensorflow" in module:
+            keras_result = model.evaluate(x_test, y_test, verbose=0, return_dict=True)
+            if all(name in keras_result for name in ("loss", "mse", "rmse", "mae")):
+                return {name: float(keras_result[name]) for name in ("loss", "mse", "rmse", "mae")}
+        try:
+            inspect.signature(model.predict).bind(x_test, verbose=0)
+        except (TypeError, ValueError):
+            prediction = model.predict(x_test)
+        else:
+            prediction = model.predict(x_test, verbose=0)
+        metrics = regression_metrics(y_test, prediction)
+        return {"loss": float(keras_result["loss"]) if keras_result is not None else metrics["mse"], **metrics}
+    except NotFittedError:
+        return dict.fromkeys(("loss", "mse", "rmse", "mae"), np.nan)
+
+
 def evaluate_model(model, x_test, y_test, task_type="classification"):
+    if task_type == "regression":
+        metrics = evaluate_regression_model(model, x_test, y_test)
+        return metrics["loss"], metrics["rmse"], metrics["mae"]
     if hasattr(model, "evaluate"):
         try:
             try:
@@ -51,9 +116,6 @@ def evaluate_model(model, x_test, y_test, task_type="classification"):
             loss = float(results)
             primary = float(results)
 
-        if task_type == "regression":
-            return loss, primary, np.nan
-
         try:
             try:
                 y_pred = model.predict(x_test, verbose=0)
@@ -70,17 +132,12 @@ def evaluate_model(model, x_test, y_test, task_type="classification"):
         f1 = _macro_f1(y_test, y_pred_classes)
         return loss, primary, f1
 
-    from sklearn.metrics import accuracy_score, f1_score, mean_squared_error
+    from sklearn.metrics import accuracy_score, f1_score
     try:
         y_pred = model.predict(x_test)
     except NotFittedError:
         return np.nan, np.nan, np.nan
 
-    if task_type == "regression":
-        y_pred = np.asarray(y_pred)
-        mse = float(mean_squared_error(y_test, y_pred))
-        rmse = float(np.sqrt(mse))
-        return rmse, rmse, np.nan
     y_pred = np.asarray(y_pred)
     y_hat = y_pred if y_pred.ndim == 1 else np.argmax(y_pred, axis=1)
 

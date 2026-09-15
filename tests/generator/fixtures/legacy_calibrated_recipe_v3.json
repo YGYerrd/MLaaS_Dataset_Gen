@@ -1,0 +1,243 @@
+{
+  "recipe_sampler_version": "conditional_balancing_v3",
+  "training_policy": {
+    "version": "conditional_balancing_v3",
+    "task": "text_classification",
+    "backend": "hf",
+    "policy_version": "catalogue_training_policies_v2",
+    "policy_key": "hf_text",
+    "parameter_count": null,
+    "optimizers": [
+      "adam",
+      "adamw",
+      "sgd",
+      "rmsprop"
+    ],
+    "tiers": {
+      "medium": {
+        "batch_size": [
+          8,
+          16
+        ],
+        "training_epochs": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20
+        ],
+        "learning_rate_by_optimizer": {
+          "adam": [
+            1e-05,
+            2e-05,
+            3e-05,
+            5e-05,
+            0.0001
+          ],
+          "adamw": [
+            1e-05,
+            2e-05,
+            3e-05,
+            5e-05,
+            0.0001
+          ],
+          "sgd": [
+            5e-05,
+            0.001,
+            0.003,
+            0.01
+          ],
+          "rmsprop": [
+            1e-05,
+            1.5e-05,
+            2e-05
+          ]
+        },
+        "gradient_accumulation_steps": [
+          1,
+          2
+        ],
+        "max_effective_batch_size": 32,
+        "weight_decay": [
+          0.0,
+          0.001,
+          0.01,
+          0.05
+        ],
+        "warmup_ratio": [
+          0.0,
+          0.03,
+          0.06,
+          0.1
+        ],
+        "max_train_time_s": 120,
+        "exploration_epochs": [
+          1,
+          2
+        ]
+      }
+    },
+    "minimum_planned_optimizer_steps": 5,
+    "sample_quantity_multiplier": 1,
+    "quality_gate": "none",
+    "calibration": {
+      "status": "available",
+      "evidence_hash": "6e88dd9a78c720b81669943f6b339a892082ed699050139578ae3e16d1dd6280",
+      "source_observation_hash": "3c3f64f5810c3f6d2e74a3867ed31e1bc39d4b5e8d322abda59ac8dbf475eb0c",
+      "mixture": {
+        "supported": 0.7,
+        "challenging": 0.2,
+        "stress": 0.1
+      },
+      "tiers": {
+        "medium": {
+          "scope": "model_dataset_task",
+          "templates": [
+            {
+              "id": "2edd451711bb27e6",
+              "knobs": {
+                "optimizer": "adamw",
+                "learning_rate": 2e-05,
+                "batch_size": 16,
+                "gradient_accumulation_steps": 2,
+                "training_epochs": 2,
+                "weight_decay": 0.05,
+                "warmup_ratio": 0.1
+              },
+              "outcomes": {
+                "healthy": 7
+              },
+              "evidence_ids": [
+                "799760568ef44e31"
+              ],
+              "minimum_steps": 46
+            },
+            {
+              "id": "6fd0cb91d21a6539",
+              "knobs": {
+                "optimizer": "adamw",
+                "learning_rate": 2e-05,
+                "batch_size": 8,
+                "gradient_accumulation_steps": 1,
+                "training_epochs": 1,
+                "weight_decay": 0.0,
+                "warmup_ratio": 0.0
+              },
+              "outcomes": {
+                "healthy": 6,
+                "weak": 1
+              },
+              "evidence_ids": [
+                "28092879514ddd2c"
+              ],
+              "minimum_steps": 48
+            },
+            {
+              "id": "825c0c8318d07332",
+              "knobs": {
+                "optimizer": "sgd",
+                "learning_rate": 5e-05,
+                "batch_size": 8,
+                "gradient_accumulation_steps": 1,
+                "training_epochs": 1,
+                "weight_decay": 0.01,
+                "warmup_ratio": 0.06
+              },
+              "outcomes": {
+                "weak": 3,
+                "healthy": 4
+              },
+              "evidence_ids": [
+                "aa6d8c488aa3d8ea"
+              ],
+              "minimum_steps": 77
+            },
+            {
+              "id": "a35832c8e4ead85c",
+              "knobs": {
+                "optimizer": "adam",
+                "learning_rate": 3e-05,
+                "batch_size": 8,
+                "gradient_accumulation_steps": 1,
+                "training_epochs": 1,
+                "weight_decay": 0.0,
+                "warmup_ratio": 0.0
+              },
+              "outcomes": {
+                "healthy": 7
+              },
+              "evidence_ids": [
+                "c031d95e0bef0625"
+              ],
+              "minimum_steps": 48
+            },
+            {
+              "id": "c00e3adc2b627372",
+              "knobs": {
+                "optimizer": "adam",
+                "learning_rate": 3e-05,
+                "batch_size": 16,
+                "gradient_accumulation_steps": 2,
+                "training_epochs": 2,
+                "weight_decay": 0.001,
+                "warmup_ratio": 0.03
+              },
+              "outcomes": {
+                "collapsed_signature": 1,
+                "healthy": 5,
+                "weak": 1
+              },
+              "evidence_ids": [
+                "38ae83484fcef6b8"
+              ],
+              "minimum_steps": 32
+            }
+          ]
+        }
+      },
+      "class_coverage": {
+        "supported": {
+          "source_mix": 0.5,
+          "minimum_classes": 2
+        },
+        "challenging": {
+          "source_mix": 0.1,
+          "minimum_classes": 1
+        },
+        "stress": {
+          "source_mix": 0.0,
+          "minimum_classes": 1
+        }
+      }
+    }
+  },
+  "training_policy_hash": "3d9dfad5d5603fcd1fdc2a47ab9b49ebd61aa1fc48319ff26dee9c918248906e",
+  "resource_tier": "medium",
+  "optimizer": "adam",
+  "learning_rate": 3e-05,
+  "batch_size": 16,
+  "training_epochs": 2,
+  "weight_decay": 0.001,
+  "warmup_ratio": 0.03,
+  "gradient_accumulation_steps": 2,
+  "effective_batch_size": 32,
+  "max_train_time_s": 120,
+  "sample_size": 835,
+  "calibration_band": "supported",
+  "calibration_template_id": "c00e3adc2b627372"
+}

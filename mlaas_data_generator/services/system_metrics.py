@@ -21,6 +21,9 @@ except Exception:  # pragma: no cover - exercised when optional runtime deps are
     psutil = None
 
 MB = 1024 * 1024
+_gpu_query_lock = threading.Lock()
+_gpu_snapshot: list[dict[str, Any]] = []
+_gpu_sampled_at: float | None = None
 
 
 def _safe_float(value: Any) -> float | None:
@@ -49,6 +52,7 @@ def _query_nvidia_gpu_snapshot() -> list[dict[str, Any]]:
             check=True,
             capture_output=True,
             text=True,
+            timeout=5,
         )
     except Exception:
         return []
@@ -89,7 +93,7 @@ def _query_windows_gpu_snapshot() -> list[dict[str, Any]]:
         r"\GPU Adapter Memory(*)\Shared Usage",
     ]
     try:
-        result = subprocess.run([typeperf, *counters, "-sc", "1"], check=True, capture_output=True, text=True)
+        result = subprocess.run([typeperf, *counters, "-sc", "1"], check=True, capture_output=True, text=True, timeout=5)
     except Exception:
         return []
 
@@ -127,7 +131,17 @@ def _query_windows_gpu_snapshot() -> list[dict[str, Any]]:
 
 
 def query_gpu_snapshot() -> list[dict[str, Any]]:
-    return _query_nvidia_gpu_snapshot() or _query_windows_gpu_snapshot()
+    global _gpu_snapshot, _gpu_sampled_at
+    # Share expensive OS queries across adjacent clients and concurrent samplers.
+    if not _gpu_query_lock.acquire(blocking=False):
+        return [dict(item) for item in _gpu_snapshot]
+    try:
+        if _gpu_sampled_at is None or time.perf_counter() - _gpu_sampled_at >= 1.0:
+            _gpu_snapshot = _query_nvidia_gpu_snapshot() or _query_windows_gpu_snapshot()
+            _gpu_sampled_at = time.perf_counter()
+        return [dict(item) for item in _gpu_snapshot]
+    finally:
+        _gpu_query_lock.release()
 
 
 def capture_hardware_snapshot() -> dict[str, Any]:
@@ -169,7 +183,10 @@ def capture_hardware_snapshot() -> dict[str, Any]:
             "frequency": cpu_freq,
         },
         "memory": memory,
-        "gpu": query_gpu_snapshot(),
+        # Monitoring already collects these values; metadata must not block on
+        # another OS query. An empty list means no sample has completed yet.
+        "gpu": [dict(item) for item in _gpu_snapshot],
+        "gpu_sample_age_s": None if _gpu_sampled_at is None else time.perf_counter() - _gpu_sampled_at,
         "environment": {"pid": os.getpid(), "working_directory": os.getcwd()},
     }
 
@@ -191,6 +208,7 @@ class ResourceUsage:
 
 class ResourceTracker:
     def __init__(self) -> None:
+        self._stop_event = threading.Event()
         if psutil is None:
             self._process = None
             self._cpu_times_start = None
@@ -224,14 +242,16 @@ class ResourceTracker:
             self._samples.append(
                 {
                     "gpu_memory_used_mb": _safe_float(gpu_mem_used),
+                    "gpu_utilization": _aggregate_gpu_metric(gpu_snapshot, "utilization"),
+                    "gpu_memory_utilization": _aggregate_gpu_metric(gpu_snapshot, "memory_utilization"),
                     "host_ram_used_mb": _safe_float(host_used_mb),
                 }
             )
 
     def _run_sampler(self) -> None:
-        while self._running:
+        while not self._stop_event.is_set():
             self._sample_once()
-            time.sleep(self._sample_interval_s)
+            self._stop_event.wait(self._sample_interval_s)
 
     def start(self) -> None:
         if psutil is None or self._process is None:
@@ -247,7 +267,7 @@ class ResourceTracker:
         with self._lock:
             self._samples = []
         self._running = True
-        self._sample_once()
+        self._stop_event.clear()
         self._sampler_thread = threading.Thread(target=self._run_sampler, daemon=True)
         self._sampler_thread.start()
 
@@ -267,9 +287,7 @@ class ResourceTracker:
                 avg_host_ram_mb=None,
             )
         self._running = False
-        if self._sampler_thread is not None:
-            self._sampler_thread.join(timeout=1.0)
-        self._sample_once()
+        self._stop_event.set()
         cpu_time_s = None
         try:
             end_times = self._process.cpu_times()
@@ -291,12 +309,12 @@ class ResourceTracker:
         except Exception:
             memory_util = None
 
-        gpu_snapshot = query_gpu_snapshot()
-        gpu_util = _aggregate_gpu_metric(gpu_snapshot, "utilization")
-        gpu_mem_util = _aggregate_gpu_metric(gpu_snapshot, "memory_utilization")
-        gpu_mem_used = _aggregate_gpu_sum(gpu_snapshot, "memory_used_mb")
         with self._lock:
             samples = list(self._samples)
+        latest = samples[-1] if samples else {}
+        gpu_util = latest.get("gpu_utilization")
+        gpu_mem_util = latest.get("gpu_memory_utilization")
+        gpu_mem_used = latest.get("gpu_memory_used_mb")
 
         vram_samples = [s.get("gpu_memory_used_mb") for s in samples if s.get("gpu_memory_used_mb") is not None]
         host_ram_samples = [s.get("host_ram_used_mb") for s in samples if s.get("host_ram_used_mb") is not None]

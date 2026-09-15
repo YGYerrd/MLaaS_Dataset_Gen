@@ -1,6 +1,11 @@
+
+from mlaas_data_generator.terminal import debug_print
 from ..accounting import append_accounting_stage, finalize_accounting
+from ..image_store import DiskImageArray, DiskArraySequence
 from ..hf_cache_paths import resolve_hf_cache_path, with_hf_columns_decode_disabled
 import io
+from functools import wraps
+from itertools import chain
 import json
 import os
 import inspect
@@ -11,6 +16,7 @@ import time
 import numpy as np
 
 LOGGER = logging.getLogger(__name__)
+IMAGE_MEMORY_LIMIT_BYTES = 64 * 1024 * 1024
 
 
 def _is_pil_image(value):
@@ -127,12 +133,32 @@ def _decode_dataset_specific_rgb_mask(arr, *, dataset_id=None):
     if dataset_id != "qubvel-hf/ade20k-mini" or arr.ndim != 3:
         return arr
 
-    # qubvel ADE20K mini annotations encode class id in R and instance id in G.
+    # This dataset declares background=0/person=1/car=2, not ADE20K's 150
+    # classes. Its RGB masks have differing channels; R contains those class
+    # IDs. See docs/ade20k-mini-mask-audit.md for the actual cached-mask audit.
     if arr.shape[-1] in {3, 4}:
         return np.asarray(arr[..., 0], dtype=np.int64)
     if arr.shape[0] in {3, 4}:
         return np.asarray(arr[0], dtype=np.int64)
     return arr
+
+
+def _declared_segmentation_label_mapping(*splits):
+    """Use the dataset's explicit schema, never the classes seen in a sample."""
+    mapping = None
+    for split in splits:
+        if "semantic_class_to_id" not in getattr(split, "column_names", ()):
+            continue
+        for raw in split["semantic_class_to_id"]:
+            if not isinstance(raw, dict) or not raw:
+                raise ValueError("invalid semantic_class_to_id mapping")
+            current = {str(name): int(value) for name, value in raw.items()}
+            if sorted(current.values()) != list(range(len(current))):
+                raise ValueError("semantic_class_to_id must contain contiguous zero-based IDs")
+            if mapping is not None and current != mapping:
+                raise ValueError("semantic_class_to_id changes across selected records")
+            mapping = current
+    return mapping
 
 
 def _to_numpy_mask(mask_like, *, dataset_id=None):
@@ -489,6 +515,24 @@ def _build_detection_class_id_map(*, hf_model_id, category_names):
     return np.asarray(resolved, dtype=np.int64)
 
 
+def _close_failed_image_stores(function):
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        stores = kwargs.pop("_stores", None)
+        if stores is None:
+            stores = []
+        try:
+            return function(*args, **kwargs, _stores=stores)
+        except BaseException:
+            # Tracebacks can retain temporary pools after a later split or
+            # metadata validation fails. Close all pools from this preparation.
+            for store in stores:
+                store.close()
+            raise
+    return wrapped
+
+
+@_close_failed_image_stores
 def _process_split(
     ds,
     *,
@@ -504,6 +548,7 @@ def _process_split(
     dataset_id=None,
     on_decode_error="skip",
     report_decode_errors=False,
+    _stores=None,
 ):
     if task_type == "detection":
         LOGGER.info(
@@ -513,6 +558,10 @@ def _process_split(
             bool(training),
         )
     images = []
+    image_bytes = 0
+    max_image_shape = (3, 0, 0)
+    progress_at = time.monotonic()
+    print(f"Image preparation: split={split_name} examples={len(ds)}", flush=True)
     labels = []
     decode_errors = []
     processor_call = getattr(image_processor, "__call__", None)
@@ -608,6 +657,10 @@ def _process_split(
         return image_processor([image_array], segmentation_maps=[mask_array])
 
     for idx in range(len(ds)):
+        if time.monotonic() - progress_at >= 10:
+            print(f"Image preparation: split={split_name} processed={idx}/{len(ds)} "
+                  f"accepted={len(images)}", flush=True)
+            progress_at = time.monotonic()
         if task_type == "detection" and (idx == 0 or idx % 25 == 0):
             LOGGER.info(
                 "[detection preprocessing] split=%s progress idx=%d/%d",
@@ -702,6 +755,37 @@ def _process_split(
                 labels.append(None)
             continue
 
+        # Spill before either the per-image list or the padded stack can exceed
+        # the memory budget. Once spilled, only one processed image is retained.
+        if task_type == "segmentation" and isinstance(images, list):
+            image_bytes += pix.nbytes + label.nbytes
+            projected_bytes = len(ds) * (pix.nbytes + label.nbytes)
+            if max(image_bytes, projected_bytes) > IMAGE_MEMORY_LIMIT_BYTES:
+                image_store = DiskArraySequence()
+                _stores.append(image_store)
+                label_store = DiskArraySequence(dtype="int64", sample_ndim=2)
+                _stores.append(label_store)
+                for previous_image, previous_label in zip(images, labels):
+                    image_store.append(previous_image)
+                    label_store.append(previous_label)
+                images, labels = image_store, label_store
+                previous_image = previous_label = None
+                print(f"Image preparation: split={split_name} storage=disk images_and_masks "
+                      f"estimated_GiB={projected_bytes / 2**30:.2f}", flush=True)
+        if task_type == "classification" and on_decode_error != "report" and isinstance(images, list):
+            image_bytes += pix.nbytes
+            max_image_shape = tuple(max(a, b) for a, b in zip(max_image_shape, pix.shape))
+            projected_bytes = len(ds) * int(np.prod(max_image_shape)) * 4
+            if max(image_bytes, projected_bytes) > IMAGE_MEMORY_LIMIT_BYTES:
+                store = DiskImageArray()
+                _stores.append(store)
+                for previous_image in images:
+                    store.append(previous_image)
+                images = store
+                # The migration loop must not keep a previous image alive.
+                previous_image = None
+                print(f"Image preparation: split={split_name} storage=disk "
+                      f"estimated_GiB={projected_bytes / 2**30:.2f}", flush=True)
         images.append(pix)
         labels.append(label)
 
@@ -718,9 +802,9 @@ def _process_split(
         # Stacking the full split into one contiguous NCHW tensor eagerly allocates
         # all pixel storage at once and can exhaust host RAM before batching.
         #
-        # Keep pixel values as a per-sample list and let the training loop
-        # materialize tensor batches lazily in HFCore._batch_iter/encode_batch.
-        if task_type in {"detection", "segmentation"}:
+        # Segmentation spills both pixels and masks, preserving per-sample
+        # shapes and the existing task encoder's batch semantics.
+        if isinstance(images, DiskImageArray) or task_type in {"detection", "segmentation"}:
             x = {"pixel_values": images}
         else:
             try:
@@ -754,12 +838,17 @@ def _process_split(
     else:
         y = labels
 
-    report = {"total": len(ds), "failed": len(decode_errors), "survived": len(images)}
+    failed_positions = {item["index"] for item in decode_errors}
+    report = {"total": len(ds), "failed": len(decode_errors), "survived": len(images),
+              "accepted_positions": [i for i in range(len(ds)) if i not in failed_positions]}
+    print(f"Image preparation: split={split_name} completed={len(images)}/{len(ds)} "
+          f"failed={len(decode_errors)}", flush=True)
     if report_decode_errors:
         report["errors"] = decode_errors
     return x, y, report
 
 
+@_close_failed_image_stores
 def preprocess_hf_image(
     train,
     test,
@@ -776,6 +865,8 @@ def preprocess_hf_image(
     eval_augmentations=False,
     on_decode_error="skip",
     report_decode_errors=False,
+    processor_size=None,
+    _stores=None,
 ):
     if (task_type or meta.get("task_type", "classification")).strip().lower() == "detection":
         LOGGER.info("[detection preprocessing] entering detection preprocessing in preprocess_hf_image")
@@ -812,8 +903,17 @@ def preprocess_hf_image(
         media_columns.append(resolved_mask_column)
     ds_train = with_hf_columns_decode_disabled(ds_train, *media_columns)
     ds_test = with_hf_columns_decode_disabled(ds_test, *media_columns)
+    declared_segmentation_labels = (
+        _declared_segmentation_label_mapping(ds_train, ds_test) if task_type == "segmentation" else None
+    )
 
     processor_kwargs = {"use_fast": False} if task_type == "segmentation" else {}
+    if processor_size is not None:
+        if not isinstance(processor_size, dict) or set(processor_size) != {"height", "width"}:
+            raise ValueError("processor_size must declare height and width")
+        if any(isinstance(v, bool) or not isinstance(v, int) or v < 32 for v in processor_size.values()):
+            raise ValueError("processor_size dimensions must be integers of at least 32 pixels")
+        processor_kwargs["size"] = dict(processor_size)
     segmentation_model_num_labels = None
     segmentation_ignore_index = None
     if task_type == "segmentation":
@@ -837,7 +937,7 @@ def preprocess_hf_image(
     processor_timer = time.perf_counter()
     processor = AutoImageProcessor.from_pretrained(hf_model_id, **processor_kwargs)
     processor_load_s = float(time.perf_counter() - processor_timer)
-    print(
+    debug_print(
         f"[ServiceTiming] model={hf_model_id} | stage=image processor load | elapsed_s={processor_load_s:.3f}",
         flush=True,
     )
@@ -851,7 +951,10 @@ def preprocess_hf_image(
             resolved_mask_column,
             dataset_id=dataset_id,
         )
-        if (
+        if declared_segmentation_labels is not None:
+            # Zero is a valid declared class here, not ADE20K's void label.
+            processor.do_reduce_labels = False
+        elif (
             raw_min == 0
             and raw_max is not None
             and segmentation_model_num_labels is not None
@@ -859,6 +962,8 @@ def preprocess_hf_image(
         ):
             processor.do_reduce_labels = True
 
+    if task_type == "segmentation":
+        meta["processor_config"] = processor.to_dict()
     train_process_timer = time.perf_counter()
     x_train, y_train, train_report = _process_split(
         ds_train,
@@ -874,9 +979,10 @@ def preprocess_hf_image(
         dataset_id=dataset_id,
         on_decode_error=on_decode_error,
         report_decode_errors=report_decode_errors,
+        _stores=_stores,
     )
     train_process_s = float(time.perf_counter() - train_process_timer)
-    print(
+    debug_print(
         f"[ServiceTiming] model={hf_model_id} | stage=_process_split train | elapsed_s={train_process_s:.3f} "
         f"| samples={len(x_train)}",
         flush=True,
@@ -896,9 +1002,10 @@ def preprocess_hf_image(
         dataset_id=dataset_id,
         on_decode_error=on_decode_error,
         report_decode_errors=report_decode_errors,
+        _stores=_stores,
     )
     test_process_s = float(time.perf_counter() - test_process_timer)
-    print(
+    debug_print(
         f"[ServiceTiming] model={hf_model_id} | stage=_process_split test | elapsed_s={test_process_s:.3f} "
         f"| samples={len(x_test)}",
         flush=True,
@@ -942,6 +1049,10 @@ def preprocess_hf_image(
         metric_instance_count=len(y_test),
     )
     meta = finalize_accounting(meta)
+    meta["accepted_train_positions"] = train_report["accepted_positions"]
+    from ..tokenization_selection import select_metadata
+    for split, report in (("train", train_report), ("test", test_report)):
+        meta = select_metadata(meta, report["accepted_positions"], report["total"], split=split)
     inferred_input_shape = ()
     pixel_values = x_train.get("pixel_values") if isinstance(x_train, dict) else None
     if pixel_values is not None and len(pixel_values) > 0:
@@ -950,6 +1061,7 @@ def preprocess_hf_image(
     if task_type == "classification" and len(y_train) > 0:
         inferred_num_classes = int(np.unique(np.asarray(y_train)).size)
     feature_num_classes = None
+    label_mapping = None
     if task_type == "classification":
         try:
             label_feature = (getattr(ds_train, "features", None) or {}).get(label_column)
@@ -957,6 +1069,7 @@ def preprocess_hf_image(
                 class_names = getattr(label_feature, "names", None)
                 if class_names:
                     feature_num_classes = int(len(class_names))
+                    label_mapping = {str(name): int(index) for index, name in enumerate(class_names)}
                 else:
                     num_classes_attr = getattr(label_feature, "num_classes", None)
                     if num_classes_attr is not None:
@@ -979,7 +1092,7 @@ def preprocess_hf_image(
         resolved_num_classes = int(max(candidates)) if candidates else None
     elif task_type == "segmentation":
         inferred_segmentation_num_classes = _infer_segmentation_num_classes(
-            list(y_train) + list(y_test),
+            chain(y_train, y_test),
             ignore_index=segmentation_ignore_index,
         )
         candidates = []
@@ -993,6 +1106,12 @@ def preprocess_hf_image(
             if value > 0:
                 candidates.append(value)
         resolved_num_classes = int(max(candidates)) if candidates else None
+        if declared_segmentation_labels is not None:
+            if inferred_segmentation_num_classes and inferred_segmentation_num_classes > len(declared_segmentation_labels):
+                raise ValueError("segmentation masks contain IDs outside semantic_class_to_id")
+            label_mapping = declared_segmentation_labels
+            if not meta.get("inference_only", False):
+                resolved_num_classes = len(declared_segmentation_labels)
     meta.update(
         {
             "input_shape": inferred_input_shape,
@@ -1007,6 +1126,7 @@ def preprocess_hf_image(
             "channel_order": "CHW",
             "num_classes": resolved_num_classes,
             "num_labels": resolved_num_classes,
+            "label_mapping": label_mapping,
             "training_augmentations": bool(training_augmentations),
             "eval_augmentations": bool(eval_augmentations),
             "decode_error_policy": on_decode_error,
@@ -1030,6 +1150,9 @@ def preprocess_hf_image(
         if segmentation_ignore_index is not None:
             meta["label_pad_value"] = segmentation_ignore_index
             meta["ignore_index"] = segmentation_ignore_index
+        if not meta.get("inference_only", False):
+            from ...segmentation_policy import validate_ade20k_mini_metadata
+            validate_ade20k_mini_metadata(meta)
     else:
         meta.pop("label_pad_value", None)
         meta.pop("ignore_index", None)

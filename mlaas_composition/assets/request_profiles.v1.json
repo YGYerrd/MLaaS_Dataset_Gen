@@ -1,0 +1,13 @@
+{
+  "schema_version": "1.0.0",
+  "library_id": "request_profiles.v1",
+  "profiles": {
+    "controlled_collaborative_v1": {
+      "description": "Controlled synthetic collaborative requests with feasible reference-derived bounds.",
+      "composition_size": {"minimum": 2, "maximum": 4},
+      "preference_weight_dirichlet_alpha": 1.0,
+      "constraint_penalty_dirichlet_alpha": 1.0,
+      "request_schema_version": "1.0.0"
+    }
+  }
+}

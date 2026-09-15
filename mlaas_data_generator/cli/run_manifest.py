@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+from ..diagnostic_json import diagnostic_json, bounded_text
+from ..execution_state import (persist_terminal, queue_services, recover_service_states,
+                               register_manifest_roster, reconcile_manifest_roster, FEDAVG_OBSERVATION_STATUSES)
+
+
+from mlaas_data_generator.terminal import debug_print, debug_enabled, terminal_scope, print_results
+
 import argparse
 import concurrent.futures
 import importlib
@@ -20,9 +27,13 @@ from typing import Any, Mapping
 
 import pandas as pd
 
+from ..fedavg_run import execute_fedavg_run, recover_abandoned_fedavg_runs
+from ..fedavg_manifest import PARTITION_GENERATOR_VERSION
 from ..compatibility import known_bad_row_reason
+from ..family_preflight import manifest_family_error
 from ..config import CONFIG, FAILED_MANIFEST_PATH, FAILURE_LOG_PATH, MANIFEST_RESULTS_PATH
 from ..data.sources.generic import KERAS_DATASETS
+from ..data.runtime_cache import preparation_cache_scope, start_preparation_cache
 from ..hf_auth import load_hf_token_from_file
 from ..registry.datasets import DATASET_REGISTRY
 from ..models.label_schema import infer_label_format, infer_num_labels
@@ -47,6 +58,7 @@ BASE_DEFAULTS: dict[str, Any] = {
 }
 
 BOOL_COLUMNS = {
+    "checkpoint_measure_full",
     "enabled",
     "measure_system_metrics",
     "mixed_precision",
@@ -55,17 +67,25 @@ BOOL_COLUMNS = {
     "perturbation_stage_logging",
     "perturbation_progress_logging",
     "save_weights",
+    "no_save_weights",
+    "smoke_test",
     "update_signature_enabled",
     "dynamic_padding",
     "report_decode_errors",
+    "scheduled_to_participate",
 }
 INT_COLUMNS = {
+    "checkpoint_reduced_compression_level", "checkpoint_validation_samples",
+    "initialization_seed",
+    "evaluation_seed",
+    "effective_batch_size",
+    "cohort_size",
+    "max_client_quantity",
     "seed",
     "sample_seed",
     "training_epochs",
     "batch_size",
     "sample_size",
-    "max_samples",
     "max_length",
     "num_workers",
     "timeout_s",
@@ -90,8 +110,25 @@ INT_COLUMNS = {
     "update_signature_dim",
     "update_signature_max_source_elements",
     "gradient_accumulation_steps",
+    "checkpoint_patch_compression_level",
+    "round_id",
+    "run_partition_seed",
+    "benchmark_sample_seed",
+    "client_partition_index",
+    "fedavg_run_index",
+    "benchmark_sample_size",
+    "run_train_pool_size",
+    "fedavg_source_pool_cap",
+    "requested_total_samples",
+    "training_seed",
+    "participation_schedule_seed",
+    "fedavg_clients_per_run",
+    "fedavg_rounds",
+    "requested_quota",
 }
 FLOAT_COLUMNS = {
+    "max_grad_norm",
+    "checkpoint_quality_tolerance",
     "learning_rate",
     "weight_decay",
     "momentum",
@@ -101,18 +138,42 @@ FLOAT_COLUMNS = {
     "clustering_tol",
     "realism_score",
     "perturbation_random_strength",
+    "fedavg_client_participation_rate",
+    "heterogeneity_intensity",
+    "shard_support_quantile",
+    "min_target_bin_fraction",
 }
 ENUM_COLUMNS = {"training_regime", "resource_tier", "optimizer", "device", "model_type", "hf_task", "task_type", "modality", "split_strategy", "distribution_type", "skew_axis", "precision_type"}
-JSON_COLUMNS = {"column_mapping", "service_config", "custom_distributions", "skew_axis_config"}
+JSON_COLUMNS = {
+    "preprocessing_identity",
+    "processor_size",
+    "task_contract", "task_source_groups", "generation_config",
+    "checkpoint_storage_options",
+    "_frozen_manifest_defaults",
+    "training_policy",
+    "client_recipe",
+    "hidden_layers",
+    "column_mapping",
+    "service_config",
+    "custom_distributions",
+    "skew_axis_config",
+    "requested_partition_params",
+}
+LINEAGE_COLUMNS = {"fl_run_id", "client_id", "round_id", "lineage_id"}
 
 MULTIMODAL_TASKS = {"image_captioning", "text_image_retrieval", "visual_question_answering"}
 MULTIMODAL_AUDIT_PATH = MANIFEST_RESULTS_PATH.parent / "service_manifest_multimodal_audit.csv"
 MISSING_MULTIMODAL_MANIFEST_PATH = MANIFEST_RESULTS_PATH.parent / "service_manifest_missing_multimodal.csv"
+FEDAVG_RUN_RESULTS_PATH = MANIFEST_RESULTS_PATH.parent / "fedavg_run_results.csv"
 
 DATASET_ARG_COLUMNS = {
+    "source_group_column",
+    "processor_size",
     "dataset_name",
     "dataset_config",
+    "hf_dataset_revision",
     "hf_model_id",
+    "hf_model_revision",
     "hf_task",
     "max_length",
     "train_split",
@@ -129,11 +190,12 @@ DATASET_ARG_COLUMNS = {
     "missing_pair_handling",
     "on_decode_error",
     "report_decode_errors",
-    "vqa_label_mode",
+    "vqa_label_mode", "label_mode",
     "vqa_answer_vocab_size",
     "vqa_unseen_answer_policy",
     "retrieval_positive_policy",
-    "max_samples",
+    "benchmark_sample_size",
+    "benchmark_sample_seed",
     "source_max_length",
     "target_max_length",
     "dynamic_padding",
@@ -268,13 +330,14 @@ class ManifestProgressTracker:
     completed: int = 0
     succeeded: int = 0
     failed: int = 0
+    skipped: int = 0
     _running: dict[str, str] | None = None
-    _initialized: bool = False
-    _lines_rendered: int = 0
 
     def __post_init__(self) -> None:
         if self._running is None:
             self._running = {}
+        self._last_render = None
+        self._finished = False
 
     def start(self, worker_label: str, description: str) -> None:
         self._running[worker_label] = description
@@ -285,60 +348,34 @@ class ManifestProgressTracker:
             self._running.pop(worker_label, None)
             self.render()
 
-    def record(self, status: str) -> None:
+    def record(self, status: str, *, render: bool = True) -> None:
         self.completed += 1
-        if str(status).strip().lower() == "success":
+        normalized = str(status).strip().lower()
+        if normalized == "success":
             self.succeeded += 1
+        elif normalized in {"skipped", "not_participating"}:
+            self.skipped += 1
         else:
             self.failed += 1
-        self.render()
+        if render:
+            self.render()
 
-    def render(self) -> None:
-        if not sys.stdout.isatty():
-            queued = max(self.total - self.completed - len(self._running), 0)
-            print(
-                "Manifest progress: "
-                f"{self.completed}/{self.total} complete | "
-                f"running={len(self._running)} queued={queued} "
-                f"success={self.succeeded} failed={self.failed}"
-            )
+    def render(self, *, force: bool = False) -> None:
+        if self._finished:
             return
-
-        lines = self._build_lines()
-        if not self._initialized:
-            sys.stdout.write("\n" * len(lines))
-            self._initialized = True
-            self._lines_rendered = len(lines)
-        sys.stdout.write(f"\x1b[{self._lines_rendered}A")
-        for line in lines:
-            sys.stdout.write("\x1b[2K")
-            sys.stdout.write(line + "\n")
-        extra = self._lines_rendered - len(lines)
-        for _ in range(max(0, extra)):
-            sys.stdout.write("\x1b[2K\n")
-        self._lines_rendered = len(lines)
-        sys.stdout.flush()
+        now = time.monotonic()
+        if not force and self._last_render is not None and now - self._last_render < 10:
+            return
+        self._last_render = now
+        queued = max(self.total - self.completed - len(self._running), 0)
+        print(f"Manifest progress: {self.completed}/{self.total} complete | "
+              f"running={len(self._running)} queued={queued} "
+              f"success={self.succeeded} skipped={self.skipped} failed={self.failed}", flush=True)
 
     def finish(self) -> None:
-        self.render()
-        if sys.stdout.isatty():
-            sys.stdout.write("\n")
-            sys.stdout.flush()
-
-    def _build_lines(self) -> list[str]:
-        running_count = len(self._running)
-        queued = max(self.total - self.completed - running_count, 0)
-        width = shutil.get_terminal_size((120, 20)).columns
-        percent = 100.0 if self.total <= 0 else (self.completed / self.total) * 100.0
-        header = (
-            "Manifest progress "
-            f"[{self.completed}/{self.total} {percent:5.1f}%] "
-            f"running={running_count} queued={queued} "
-            f"success={self.succeeded} failed={self.failed}"
-        )
-        running_items = " | ".join(f"{label}:{desc}" for label, desc in sorted(self._running.items())) or "idle"
-        running_line = f"Workers: {running_items}"
-        return [header[:width], running_line[:width]]
+        if not self._finished:
+            self.render(force=True)
+            self._finished = True
 
 
 _ACTIVE_MANIFEST_PROGRESS: ManifestProgressTracker | None = None
@@ -368,7 +405,7 @@ def _worker_label_for_gpu(gpu_id: int | None) -> str:
 def _describe_entry(entry: ManifestEntry) -> str:
     resolved = entry.resolved
     total = int(resolved.get("_manifest_total") or entry.ordinal)
-    return f"row {entry.ordinal}/{total} {resolved.get('service_id')}"
+    return f"{resolved.get('service_id')} ({entry.ordinal}/{total})"
 
 
 def _describe_group(entries: list[ManifestEntry]) -> str:
@@ -385,6 +422,9 @@ def _manifest_progress() -> ManifestProgressTracker | None:
 
 
 def _manifest_progress_start(worker_label: str, description: str) -> None:
+    if _WORKER_PROGRESS_QUEUE is not None:
+        _WORKER_PROGRESS_QUEUE.put({"event": "start", "worker_label": _WORKER_LABEL, "description": description})
+        return
     tracker = _manifest_progress()
     if tracker is not None:
         tracker.start(worker_label, description)
@@ -397,6 +437,7 @@ def _manifest_progress_clear(worker_label: str) -> None:
 
 
 def _record_manifest_progress_result(result: dict[str, Any]) -> None:
+    render = not result.pop("_terminal_defer_progress", False)
     if _WORKER_PROGRESS_QUEUE is not None:
         try:
             _WORKER_PROGRESS_QUEUE.put(
@@ -404,6 +445,7 @@ def _record_manifest_progress_result(result: dict[str, Any]) -> None:
                     "event": "result",
                     "worker_label": _WORKER_LABEL,
                     "status": result.get("status"),
+                    "render": render,
                 }
             )
         except Exception:
@@ -412,7 +454,7 @@ def _record_manifest_progress_result(result: dict[str, Any]) -> None:
 
     tracker = _manifest_progress()
     if tracker is not None:
-        tracker.record(str(result.get("status") or "failed"))
+        tracker.record(str(result.get("status") or "failed"), render=render)
 
 
 def _drain_progress_queue(progress_queue: Any) -> None:
@@ -426,8 +468,10 @@ def _drain_progress_queue(progress_queue: Any) -> None:
             return
         except Exception:
             return
-        if event.get("event") == "result":
-            tracker.record(str(event.get("status") or "failed"))
+        if event.get("event") == "start":
+            tracker.start(str(event.get("worker_label")), str(event.get("description")))
+        elif event.get("event") == "result":
+            tracker.record(str(event.get("status") or "failed"), render=event.get("render", True))
 
 
 def _normalize_value(value: Any) -> Any:
@@ -444,7 +488,27 @@ def _to_bool(value: Any) -> bool:
     return str(value).strip().lower() not in {"", "0", "false", "no", "off"}
 
 
+def _safe_int(value: Any) -> int | None:
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_float(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _coerce_by_column(column: str, value: Any) -> Any:
+    if column == "optimizer" and isinstance(value, str) and value.strip().lower() == "none":
+        return "none"  # An explicit estimator setting, not a missing CSV value.
     value = _normalize_value(value)
     if value is None:
         return None
@@ -496,11 +560,17 @@ def load_manifest(file_path: Path, sheet: str = "services") -> tuple[pd.DataFram
     suffix = file_path.suffix.lower()
     if suffix == ".csv":
         df = _normalize_manifest_columns(pd.read_csv(file_path))
+        if "family_ref" in df:
+            from .manifest.review import expand_review_manifest
+            return expand_review_manifest(df, file_path)
         defaults, rows = _extract_defaults_row(df)
         return rows, defaults
     if suffix in {".xlsx", ".xls"}:
         workbook = pd.read_excel(file_path, sheet_name=None)
         service_rows_df = _normalize_manifest_columns(workbook.get(sheet) if sheet in workbook else next(iter(workbook.values())))
+        if "family_ref" in service_rows_df:
+            from .manifest.review import expand_review_manifest
+            return expand_review_manifest(service_rows_df, file_path)
         defaults: dict[str, Any] = {}
         if "defaults" in workbook:
             defaults_df = _normalize_manifest_columns(workbook["defaults"])
@@ -516,15 +586,81 @@ def load_manifest(file_path: Path, sheet: str = "services") -> tuple[pd.DataFram
     raise ValueError(f"Unsupported file extension '{suffix}'. Use .csv or .xlsx")
 
 
+def _database_candidates(db_path: Any) -> list[Path]:
+    """Return the configured SQLite file and any GPU shards derived from it."""
+    raw = str(db_path or CONFIG.get("db_path") or "").strip()
+    if not raw:
+        return []
+    path = Path(raw)
+    candidates = [path]
+    suffix = "".join(path.suffixes)
+    stem = path.name[: -len(suffix)] if suffix else path.name
+    candidates.extend(sorted(path.parent.glob(f"{stem}.gpu*{suffix}")))
+    return list(dict.fromkeys(candidates))
+
+
+def _find_existing_service_database(
+    db_path: Any,
+    service_id: Any,
+    cache: dict[str, set[str]],
+) -> str | None:
+    """Find a service by primary ID without creating or migrating a database."""
+    wanted = str(service_id)
+    for candidate in _database_candidates(db_path):
+        if not candidate.is_file():
+            continue
+        cache_key = str(candidate.resolve())
+        if cache_key not in cache:
+            with sqlite3.connect(str(candidate)) as conn:
+                table_exists = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='services'"
+                ).fetchone()
+                columns = {row[1] for row in conn.execute("PRAGMA table_info(services)")}
+                cache[cache_key] = (
+                    {str(row[0]) for row in conn.execute("SELECT service_id FROM services WHERE status='completed'")}
+                    if table_exists and "status" in columns
+                    else set()
+                )
+        if wanted in cache[cache_key]:
+            return str(candidate)
+    return None
+
+
 def _resolve_row(row: pd.Series, manifest_defaults: dict[str, Any]) -> dict[str, Any]:
-    resolved = dict(CONFIG)
-    resolved.update(BASE_DEFAULTS)
-    resolved.update(manifest_defaults)
+    # Compact manifests snapshot defaults when generated. Failed-row exports
+    # retain that snapshot as a JSON column, so they remain self-contained.
+    frozen_key = "_frozen_manifest_defaults"
+    frozen = _coerce_by_column(frozen_key, row.get(frozen_key))
+    if frozen is None:
+        frozen = manifest_defaults.get(frozen_key)
+    if frozen is not None and not isinstance(frozen, dict):
+        raise ValueError("frozen manifest defaults must be an object")
+    resolved = dict(frozen) if frozen is not None else {
+        **CONFIG, **BASE_DEFAULTS,
+        # Old expanded manifests did not snapshot these fields. New exports do.
+        "checkpoint_patch_operation_policy": "adaptive",
+        "checkpoint_measure_full": True, "checkpoint_weight_format": "native",
+    }
+    resolved.update({key: value for key, value in manifest_defaults.items() if key != frozen_key})
     for column, raw in row.items():
+        if column == frozen_key:
+            continue
         value = _coerce_by_column(column, raw)
         if value is not None:
             resolved[column] = value
 
+    # Retired source caps in old manifests must not limit client sample_size.
+    resolved.pop("max_samples", None)
+    resolved.pop("fedavg_source_pool_cap", None)
+
+    if resolved.get("generation_mode") == "shared_parent" and isinstance(resolved.get("client_recipe"), dict):
+        for key, value in resolved["client_recipe"].items():
+            if value is None:
+                resolved[key] = None
+    if (resolved.get("optimizer") == "none" and isinstance(resolved.get("training_policy"), dict)
+            and resolved["training_policy"].get("optimizers") == ["none"]
+            and _is_blank(row.get("learning_rate"))):
+        resolved["learning_rate"] = None  # Preserve the frozen non-gradient policy's null rate.
     if resolved.get("benchmark_split") and not resolved.get("test_split"):
         resolved["test_split"] = resolved["benchmark_split"]
     if resolved.get("test_split") and not resolved.get("benchmark_split"):
@@ -534,10 +670,32 @@ def _resolve_row(row: pd.Series, manifest_defaults: dict[str, Any]) -> dict[str,
         resolved["mixed_precision"] = False
         resolved["precision_type"] = "fp16"
     _apply_final_multimodal_runtime_defaults(resolved)
+    from ..task_contract import resolve_sentence_pair_contract
+    from ..precision_policy import apply_precision_policy
+    resolve_sentence_pair_contract(resolved)
+    apply_precision_policy(resolved)
+    from ..segmentation_policy import apply_segmentation_label_policy
+    apply_segmentation_label_policy(resolved)
     if _is_blank(resolved.get("service_id")):
         resolved["service_id"] = resolve_service_id(resolved)
     resolved["dataset_args"] = _build_dataset_args(resolved)
+    from ..debug_mode import apply_debug_mode
+    apply_debug_mode(resolved)
     return resolved
+
+
+def _resolve_execution_row(row: pd.Series, manifest_defaults: dict[str, Any]) -> dict[str, Any]:
+    """Retain a row identity so malformed settings can be recorded as failed."""
+    try:
+        return _resolve_row(row, manifest_defaults)
+    except (ValueError, TypeError, KeyError, OverflowError) as exc:
+        config = {**CONFIG, **BASE_DEFAULTS, **manifest_defaults}
+        config.update({key: value for key, value in row.items() if not _is_blank(value)})
+        config["service_id"] = resolve_service_id(config)
+        from ..debug_mode import apply_debug_mode
+        apply_debug_mode(config)
+        config["_row_resolution_error"] = bounded_text(f"Invalid manifest settings: {exc}")
+        return config
 
 
 def _apply_final_multimodal_runtime_defaults(resolved: dict[str, Any]) -> None:
@@ -557,21 +715,71 @@ def _apply_final_multimodal_runtime_defaults(resolved: dict[str, Any]) -> None:
 
 
 def _build_dataset_args(resolved: dict[str, Any]) -> dict[str, Any]:
-    args: dict[str, Any] = {}
+    args: dict[str, Any] = {"seed": resolved.get("seed", 42)}
     for key in DATASET_ARG_COLUMNS:
         value = resolved.get(key)
         if value is not None:
             args[key] = value
     if args.get("benchmark_split") and not args.get("test_split"):
         args["test_split"] = args["benchmark_split"]
+    if resolved.get("partition_generator_version") == PARTITION_GENERATOR_VERSION:
+        args["benchmark_sample_size"] = resolved.get("benchmark_sample_size")
+        args["benchmark_sample_seed"] = resolved.get("benchmark_sample_seed")
     return args
 
 
+def _resolve_manifest_hf_revisions(
+    resolved: dict[str, Any],
+    cache: dict[tuple[str, str, str | None], tuple[str | None, str | None]],
+) -> None:
+    """Resolve each Hub identity once before grouped dataset/model loading."""
+    if not _is_hf_resolved(resolved):
+        return
+    requests = (
+        ("model", "hf_model_id", "hf_model_revision"),
+        ("dataset", "dataset_name", "hf_dataset_revision"),
+    )
+    errors: list[str] = []
+    for kind, identity_key, revision_key in requests:
+        identity = resolved.get(identity_key)
+        if _is_blank(identity):
+            continue
+        requested = None if _is_blank(resolved.get(revision_key)) else str(resolved[revision_key])
+        cache_key = (kind, str(identity), requested)
+        if cache_key not in cache:
+            probe: dict[str, Any]
+            if kind == "model":
+                probe = {"hf_model_id": identity, revision_key: requested}
+            else:
+                probe = {
+                    "dataset": "hf",
+                    "dataset_name": identity,
+                    revision_key: requested,
+                }
+            service_runner._resolve_hf_revisions(probe)
+            cache[cache_key] = (
+                probe.get(revision_key),
+                probe.get("hf_revision_resolution_error"),
+            )
+        revision, error = cache[cache_key]
+        if revision:
+            resolved[revision_key] = revision
+        if error:
+            errors.append(f"{kind}: {error}")
+    if errors:
+        resolved["hf_revision_resolution_error"] = "; ".join(errors)
+
+
 def _validate_row(resolved: dict[str, Any]) -> RowValidation:
+    from ..debug_mode import debug_mode_error
+    if error := debug_mode_error(resolved):
+        return RowValidation(False, error)
+    if str(resolved.get("log_mode") or "concise").strip().lower() not in {"concise", "debug"}:
+        return RowValidation(False, "log_mode must be concise or debug")
     federated_columns = [
         key
         for key, value in resolved.items()
-        if (key in FEDERATED_COLUMNS or str(key).startswith("global_")) and not _is_blank(value)
+        if (key in FEDERATED_COLUMNS or str(key).startswith("global_")) and key not in LINEAGE_COLUMNS and not _is_blank(value)
     ]
     if federated_columns:
         return RowValidation(
@@ -579,6 +787,29 @@ def _validate_row(resolved: dict[str, Any]) -> RowValidation:
             "Federated columns are not accepted in service manifests: "
             + ", ".join(sorted(federated_columns)),
         )
+    generation_mode = str(resolved.get("generation_mode") or "independent").strip().lower()
+    if generation_mode == "fedavg" or not _is_blank(resolved.get("fl_run_id")):
+        return RowValidation(False, "FedAvg generation is retired; use select-parent-configs -> train-parents -> cohort-manifest")
+    if generation_mode not in {"independent", "shared_parent"}:
+        return RowValidation(False, "generation_mode must be independent or shared_parent")
+    if generation_mode == "shared_parent":
+        from ..cohort_manifest import validate_client_recipe
+        try:
+            validate_client_recipe(resolved)
+        except (ValueError, TypeError, KeyError) as exc:
+            return RowValidation(False, str(exc))
+    elif any(not _is_blank(resolved.get(key)) for key in ("client_id", "round_id")):
+        return RowValidation(False, "client_id requires shared_parent generation; round_id is retired")
+    elif not _is_blank(resolved.get("recipe_sampler_version")):
+        from ..clients.training import validate_training_recipe
+        from ..clients.partitioning import SUPPORTED_PARTITION_VERSIONS, validate_partition_config
+        try:
+            validate_training_recipe(resolved)
+            if resolved.get("partition_generator_version") not in SUPPORTED_PARTITION_VERSIONS:
+                raise ValueError("client recipe requires its versioned partitioner")
+            validate_partition_config(resolved)
+        except (ValueError, TypeError, KeyError) as exc:
+            return RowValidation(False, str(exc))
 
     for col in REQUIRED_COLUMNS:
         if _is_blank(resolved.get(col)):
@@ -596,8 +827,23 @@ def _validate_row(resolved: dict[str, Any]) -> RowValidation:
     if int(resolved.get("batch_size", 0) or 0) <= 0:
         return RowValidation(False, "batch_size must be > 0")
     precision_type = _normalize_precision_type(resolved.get("precision_type"))
-    if precision_type not in {"fp16", "bf16"}:
+    if precision_type not in {"fp16", "bf16", "fp32"}:
         return RowValidation(False, "precision_type must be one of fp16 or bf16")
+    from ..weight_precision import normalize_weight_format
+    try:
+        normalize_weight_format(resolved.get("checkpoint_weight_format"))
+        service_runner._checkpoint_compression(resolved)
+        from ..checkpoint_store import CompressionSpec
+        CompressionSpec(resolved.get("checkpoint_reduced_compression", "none"), resolved.get("checkpoint_reduced_compression_level", 1))
+        if int(resolved.get("checkpoint_validation_samples", 256)) < 1:
+            raise ValueError("checkpoint_validation_samples must be positive")
+        tolerance = float(resolved.get("checkpoint_quality_tolerance", 0.01))
+        if not 0 <= tolerance < float("inf"):
+            raise ValueError("checkpoint_quality_tolerance must be finite and nonnegative")
+    except (TypeError, ValueError) as exc:
+        return RowValidation(False, str(exc))
+    if resolved.get("checkpoint_patch_operation_policy", "adaptive") not in {"adaptive", "fixed_xor", "fixed_replace"}:
+        return RowValidation(False, "invalid checkpoint_patch_operation_policy")
     task_family = canonical_task_family(resolved.get("task_type"), resolved.get("hf_task"))
     vision_error = _validate_vision_row_requirements(resolved, task_family=task_family, training_regime=training_regime)
     if vision_error:
@@ -605,6 +851,9 @@ def _validate_row(resolved: dict[str, Any]) -> RowValidation:
     blocked_reason = known_bad_row_reason(resolved)
     if blocked_reason:
         return RowValidation(False, blocked_reason)
+    family_error = manifest_family_error(resolved)
+    if family_error:
+        return RowValidation(False, family_error)
     final_blocked_reason = _final_multimodal_row_reason(resolved)
     if final_blocked_reason:
         return RowValidation(False, final_blocked_reason)
@@ -760,7 +1009,7 @@ def _is_enabled(row: pd.Series) -> bool:
 def _format_traceback(exc) -> str | None:
     if exc is None:
         return None
-    return "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)).strip()
+    return bounded_text("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)).strip())
 
 
 def _write_failure_log(log_path: Path, *, row_index, service_id, case_name, manifest_group_id, failure_stage, error_message, resolved, exc=None) -> None:
@@ -773,9 +1022,9 @@ def _write_failure_log(log_path: Path, *, row_index, service_id, case_name, mani
         f"case_name: {case_name}",
         f"manifest_group_id: {manifest_group_id}",
         f"failure_stage: {failure_stage}",
-        f"error_message: {error_message}",
+        f"error_message: {bounded_text(str(error_message))}",
         "resolved_config:",
-        json.dumps(resolved, indent=2, default=str),
+        diagnostic_json(resolved),
     ]
     if exc is not None:
         lines.extend(["traceback:", _format_traceback(exc) or ""])
@@ -785,23 +1034,13 @@ def _write_failure_log(log_path: Path, *, row_index, service_id, case_name, mani
 
 
 def _write_failure_db(resolved: dict[str, Any], *, row_index, service_id, case_name, manifest_group_id, failure_stage, error_message, exc=None) -> None:
-    db_path = resolved.get("db_path") or CONFIG.get("db_path")
-    try:
-        writer = make_writer("sqlite", db_path=db_path)
-        writer.start()
-        writer.write_service_failure(
-            service_id=str(service_id) if service_id is not None else None,
-            row_index=int(row_index) if row_index is not None else None,
-            case_name=str(case_name) if case_name is not None else None,
-            manifest_group_id=str(manifest_group_id) if manifest_group_id is not None else None,
-            failure_stage=str(failure_stage),
-            error_message=str(error_message) if error_message is not None else None,
-            resolved_config_json=json.dumps(resolved, default=str),
-            traceback_text=_format_traceback(exc),
-        )
-        writer.finish()
-    except Exception as db_exc:  # noqa: BLE001
-        print(f"Warning: failed to persist service failure to SQLite: {db_exc}")
+    if service_id is None or not str(service_id):
+        # Manifest-level preflight errors have no service identity.
+        return
+    config = {**resolved, "service_id": str(service_id), "row_index": _safe_int(row_index),
+              "case_name": case_name, "manifest_group_id": manifest_group_id}
+    persist_terminal(config, status="failed", reason=error_message,
+                     failure_stage=str(failure_stage), exc=exc)
 
 
 def _clear_cuda_runtime_state() -> None:
@@ -826,21 +1065,23 @@ def _clear_cuda_runtime_state() -> None:
                 pass
 
 
-def _record_entry_failure(entry: ManifestEntry, *, failure_stage: str, error_message: Any, exc=None) -> dict[str, Any]:
+def _record_entry_failure(entry: ManifestEntry, *, failure_stage: str, error_message: Any, exc=None,
+                          write_log: bool = True) -> dict[str, Any]:
     resolved = entry.resolved
     service_id = resolved.get("service_id")
     error_text = str(error_message) if error_message is not None else ""
-    _write_failure_log(
-        FAILURE_LOG_PATH,
-        row_index=entry.idx,
-        service_id=service_id,
-        case_name=resolved.get("case_name"),
-        manifest_group_id=resolved.get("manifest_group_id"),
-        failure_stage=failure_stage,
-        error_message=error_text,
-        resolved=resolved,
-        exc=exc,
-    )
+    if write_log:
+        _write_failure_log(
+            FAILURE_LOG_PATH,
+            row_index=entry.idx,
+            service_id=service_id,
+            case_name=resolved.get("case_name"),
+            manifest_group_id=resolved.get("manifest_group_id"),
+            failure_stage=failure_stage,
+            error_message=error_text,
+            resolved=resolved,
+            exc=exc,
+        )
     _write_failure_db(
         resolved,
         row_index=entry.idx,
@@ -867,7 +1108,7 @@ def _failed_result_row_indexes(results: list[dict[str, Any]]) -> list[int]:
     failed: list[int] = []
     seen: set[int] = set()
     for result in _sort_result_rows(results):
-        if str(result.get("status") or "").strip().lower() == "success":
+        if str(result.get("status") or "").strip().lower() in {"success", "skipped"}:
             continue
         row_index = result.get("row_index")
         if row_index is None or _is_blank(row_index):
@@ -903,6 +1144,9 @@ def _write_failed_manifest_csv(
 ) -> Path | None:
     output_path = output_path or FAILED_MANIFEST_PATH
     failed_indexes = _failed_result_row_indexes(results)
+    if failed_indexes and "cohort_id" in rows_df:
+        cohorts = set(rows_df.loc[rows_df.index.intersection(failed_indexes), "cohort_id"].dropna())
+        failed_indexes = sorted(set(failed_indexes) | set(rows_df.index[rows_df["cohort_id"].isin(cohorts)]))
     if not failed_indexes:
         if output_path.exists():
             output_path.unlink()
@@ -920,6 +1164,9 @@ def _write_failed_manifest_csv(
             continue
 
     columns = list(rows_df.columns)
+    family_reference_fields = ("family_document_ref", "family_document_hash", "hf_model_revision", "hf_dataset_revision")
+    if any(_resolved_from_result(result).get("family_document_ref") for result in results):
+        columns.extend(field for field in family_reference_fields if field not in columns)
     for column in manifest_defaults:
         if column not in columns:
             columns.append(column)
@@ -937,6 +1184,8 @@ def _write_failed_manifest_csv(
         retry_row: dict[str, Any] = {}
         for column in columns:
             value = source.get(column)
+            if column in family_reference_fields and _is_blank(value):
+                value = resolved.get(column)
             if _is_blank(value) and column in manifest_defaults:
                 value = manifest_defaults[column]
             if column == "service_id" and _is_blank(value):
@@ -1149,6 +1398,8 @@ def _write_missing_multimodal_manifest_csv(
     return output_path
 
 
+@terminal_scope(lambda *args, **kwargs: {"log_mode": kwargs.get("log_mode")})
+@preparation_cache_scope()
 def run_manifest(
     file: str,
     sheet: str = "services",
@@ -1157,12 +1408,27 @@ def run_manifest(
     *,
     grouped_hf: bool = True,
     workers: int = 1,
+    rerun_existing: bool = False,
+    log_mode: str | None = None,
+    no_save_weights: bool = False,
+    smoke_test: bool = False,
 ) -> Path:
     global _ACTIVE_MANIFEST_PROGRESS
     manifest_path = Path(file)
     load_hf_token_from_file()
     print(f"Loading manifest file: {manifest_path}")
     rows_df, manifest_defaults = load_manifest(manifest_path, sheet=sheet)
+    if smoke_test:
+        rows_df = rows_df.copy()
+        rows_df["smoke_test"] = True
+        print("Smoke test: perturbation and update signatures disabled; service IDs use __smoke_test.")
+    if no_save_weights:
+        rows_df = rows_df.copy()
+        rows_df["no_save_weights"] = True
+        print("Debug mode: no weight checkpoints; metrics retained; service IDs use __debug_no_weights.")
+    shared_manifest = "generation_mode" in rows_df and rows_df["generation_mode"].eq("shared_parent").any()
+    results_path = manifest_path.with_name(manifest_path.stem + "_results.csv") if shared_manifest else MANIFEST_RESULTS_PATH
+    failed_path = manifest_path.with_name(manifest_path.stem + "_failed.csv") if shared_manifest else FAILED_MANIFEST_PATH
 
     enabled_df = rows_df[rows_df.apply(_is_enabled, axis=1)].copy()
     print(f"Loaded manifest: {manifest_path}")
@@ -1171,81 +1437,143 @@ def run_manifest(
 
     manifest_group_id = str(uuid.uuid4())
     results: list[dict[str, Any]] = []
+    entries: list[ManifestEntry] = []
     _ACTIVE_MANIFEST_PROGRESS = ManifestProgressTracker(total=len(enabled_df))
+    recovery_db_paths = _fedavg_recovery_db_paths(
+        enabled_df,
+        manifest_defaults,
+        db_path_override=db_path,
+    )
 
     try:
+        if not dry_run:
+            for recovery_path in _service_recovery_paths(recovery_db_paths):
+                recover_service_states(recovery_path)
+                reconcile_manifest_roster(recovery_path)
+            _recover_fedavg_databases(
+                recovery_db_paths,
+                reason="interrupted process detected during manifest startup recovery",
+            )
+        if not dry_run:
+            roster = []
+            for idx, row in enabled_df.iterrows():
+                config = _resolve_execution_row(row, manifest_defaults)
+                config.update(db_path=db_path or config.get("db_path"), manifest_group_id=manifest_group_id,
+                              _execution_run_id=manifest_group_id, row_index=int(idx))
+                roster.append(config)
+            register_manifest_roster(roster, run_id=manifest_group_id, manifest_path=manifest_path, rerun_existing=rerun_existing)
         if not dry_run:
             try:
                 _ensure_manifest_preflight(enabled_df)
             except ManifestPreflightError as exc:
-                resolved = {
-                    "db_path": db_path or CONFIG.get("db_path"),
-                    "manifest_group_id": manifest_group_id,
-                    "manifest_path": str(manifest_path),
-                    "sheet": sheet,
-                }
-                results.append(
-                    {
-                        "service_id": "",
-                        "row_index": None,
-                        "manifest_group_id": manifest_group_id,
-                        "case_name": "__manifest_preflight__",
-                        "status": "failed",
-                        "error_message": str(exc),
-                        "resolved_config_json": json.dumps(resolved, default=str),
-                    }
-                )
-                _write_failure_log(
-                    FAILURE_LOG_PATH,
-                    row_index=None,
-                    service_id=None,
-                    case_name="__manifest_preflight__",
-                    manifest_group_id=manifest_group_id,
-                    failure_stage="manifest_preflight",
-                    error_message=str(exc),
-                    resolved=resolved,
-                    exc=exc,
-                )
-                _write_failure_db(
-                    resolved,
-                    row_index=None,
-                    service_id=None,
-                    case_name="__manifest_preflight__",
-                    manifest_group_id=manifest_group_id,
-                    failure_stage="manifest_preflight",
-                    error_message=str(exc),
-                    exc=exc,
-                )
-                output_path = MANIFEST_RESULTS_PATH
+                preflight_cache = {}
+                for index, (idx, row) in enumerate(enabled_df.iterrows()):
+                    resolved = _resolve_execution_row(row, manifest_defaults)
+                    resolved.update(db_path=db_path or resolved.get("db_path"), manifest_group_id=manifest_group_id,
+                                    _execution_run_id=manifest_group_id, row_index=int(idx))
+                    existing = None if rerun_existing else _find_existing_service_database(resolved["db_path"], resolved["service_id"], preflight_cache)
+                    if existing:
+                        results.append(_result_row(resolved, int(idx), "skipped", "already completed", service_id=resolved["service_id"]))
+                        continue
+                    entry = ManifestEntry(idx=int(idx), ordinal=index + 1, resolved=resolved, validation=RowValidation(False, str(exc)))
+                    results.append(_record_entry_failure(entry, failure_stage="manifest_preflight", error_message=str(exc), exc=exc, write_log=index == 0))
+                output_path = results_path
                 output_path.parent.mkdir(parents=True, exist_ok=True)
                 pd.DataFrame(results).to_csv(output_path, index=False)
                 _write_failed_manifest_csv(
                     rows_df=rows_df,
                     manifest_defaults=manifest_defaults,
                     results=results,
+                    output_path=failed_path,
                     db_path=db_path,
                 )
+                for recovery_path in _service_recovery_paths(recovery_db_paths):
+                    reconcile_manifest_roster(recovery_path, run_id=manifest_group_id)
                 print(f"Manifest preflight failed: {exc}")
                 print(f"Wrote results: {output_path}")
                 return output_path
 
         entries: list[ManifestEntry] = []
+        hf_revision_cache: dict[tuple[str, str, str | None], tuple[str | None, str | None]] = {}
+        family_reference_cache = {}
+        existing_service_cache: dict[str, set[str]] = {}
+        preparation_update = time.monotonic()
+        print(f"Preparing manifest: 0/{len(enabled_df)} rows checked", flush=True)
         for i, (idx, row) in enumerate(enabled_df.iterrows(), start=1):
-            resolved = _resolve_row(row, manifest_defaults)
+            if time.monotonic() - preparation_update >= 10:
+                print(f"Preparing manifest: {i - 1}/{len(enabled_df)} rows checked", flush=True)
+                preparation_update = time.monotonic()
+            resolved = _resolve_execution_row(row, manifest_defaults)
+            if log_mode is not None:
+                resolved["log_mode"] = log_mode
+            resolved["_execution_run_id"] = manifest_group_id
             resolved["row_index"] = int(idx)
             resolved["_manifest_total"] = len(enabled_df)
+            resolved["_manifest_ordinal"] = i
             if db_path is not None:
                 resolved["db_path"] = db_path
             if _is_blank(resolved.get("manifest_group_id")):
                 resolved["manifest_group_id"] = manifest_group_id
+            if not _is_blank(resolved.get("fl_run_id")) and _is_blank(resolved.get("lineage_id")):
+                resolved["lineage_id"] = f"lineage__{resolved['fl_run_id']}"
+            if not dry_run and not rerun_existing:
+                existing_db = _find_existing_service_database(
+                    resolved.get("db_path"), resolved.get("service_id"), existing_service_cache
+                )
+                if existing_db is not None:
+                    resolved["_existing_service_db_path"] = existing_db
+                    entries.append(ManifestEntry(idx=int(idx), ordinal=i, resolved=resolved, validation=RowValidation(True)))
+                    continue
+            from .manifest.preparation import bind_manifest, freeze_manifest_revisions
+            try:
+                if resolved.get("_row_resolution_error"):
+                    raise ValueError(resolved["_row_resolution_error"])
+                if not dry_run:
+                    bind_manifest(resolved, file, cache=family_reference_cache)
+                if not dry_run and "_existing_service_db_path" not in resolved and resolved.get("generation_mode") != "shared_parent":
+                    if not resolved.get("_family_reference") and not resolved.get("_frozen_revisions"):
+                        _resolve_manifest_hf_revisions(resolved, hf_revision_cache)
+                    freeze_manifest_revisions(resolved)
+                    resolved["dataset_args"] = _build_dataset_args(resolved)
+            except (ValueError, OSError, KeyError, RuntimeError) as exc:
+                entries.append(ManifestEntry(idx=int(idx), ordinal=i, resolved=resolved, validation=RowValidation(False, str(exc))))
+                continue
             entries.append(ManifestEntry(idx=int(idx), ordinal=i, resolved=resolved, validation=_validate_row(resolved)))
+
+        print(f"Preparing manifest: {len(enabled_df)}/{len(enabled_df)} rows checked", flush=True)
+        if shared_manifest:
+            from ..cohort_manifest import validate_cohort_entries
+            shared_entries = [e for e in entries if e.resolved.get("generation_mode") == "shared_parent"
+                              and "_existing_service_db_path" not in e.resolved]
+            for _, group in _group_entries(shared_entries, lambda row: row.get("cohort_id")):
+                try:
+                    validate_cohort_entries(group)
+                except (ValueError, KeyError, TypeError) as exc:
+                    for entry in group:
+                        entry.validation = RowValidation(False, str(exc))
+
+        # FedAvg is stateful across every client-round row. Avoid executing an
+        # incomplete run when any member was protected by the existence check.
+        existing_fedavg_runs = {
+            str(entry.resolved.get("fl_run_id"))
+            for entry in entries
+            if "_existing_service_db_path" in entry.resolved
+            and not _is_blank(entry.resolved.get("fl_run_id"))
+        }
+        for entry in entries:
+            fl_run_id = str(entry.resolved.get("fl_run_id") or "")
+            if fl_run_id in existing_fedavg_runs:
+                entry.resolved.setdefault(
+                    "_existing_service_db_path",
+                    f"FedAvg run {fl_run_id} already has service rows in SQLite",
+                )
 
         valid_entries: list[ManifestEntry] = []
         for entry in entries:
             resolved = entry.resolved
             service_id = resolved["service_id"]
-            print(f"\nService {entry.ordinal}/{len(enabled_df)}: {service_id}")
-            print(
+            debug_print(f"\nService {entry.ordinal}/{len(enabled_df)}: {service_id}")
+            debug_print(
                 f"dataset={resolved.get('dataset')} "
                 f"task={resolved.get('task_type')} "
                 f"model={resolved.get('model_type')} "
@@ -1282,9 +1610,21 @@ def run_manifest(
                 print(f"Skipping row {entry.idx}: {entry.validation.error}")
                 continue
 
+            existing_db = resolved.get("_existing_service_db_path")
+            if existing_db is not None:
+                _manifest_progress_start("main", f"skip existing row {entry.ordinal}/{len(enabled_df)}")
+                message = f"Service already exists in SQLite database: {existing_db}"
+                result = _result_row(resolved, entry.idx, "skipped", message, service_id=service_id)
+                results.append(result)
+                _record_manifest_progress_result(result)
+                _manifest_progress_clear("main")
+                print(f"Skipping existing row {entry.ordinal}: {existing_db}")
+                debug_print(f"service_id={service_id}")
+                continue
+
             if dry_run:
                 _manifest_progress_start("main", f"dry-run row {entry.ordinal}/{len(enabled_df)}")
-                print(json.dumps(resolved, indent=2, default=str))
+                print(diagnostic_json(resolved))
                 result = _result_row(resolved, entry.idx, "success", "", service_id=service_id)
                 results.append(result)
                 _record_manifest_progress_result(result)
@@ -1294,13 +1634,43 @@ def run_manifest(
             valid_entries.append(entry)
 
         if not dry_run:
-            results.extend(
-                _execute_entries_grouped_hf(valid_entries, workers=workers)
-                if grouped_hf
-                else _execute_entries_row_local(valid_entries, workers=workers)
-            )
+            fedavg_entries = [entry for entry in valid_entries if not _is_blank(entry.resolved.get("fl_run_id"))]
+            cohort_entries = [entry for entry in valid_entries if entry.resolved.get("generation_mode") == "shared_parent"]
+            other_entries = [entry for entry in valid_entries if _is_blank(entry.resolved.get("fl_run_id")) and entry.resolved.get("generation_mode") != "shared_parent"]
+            if cohort_entries:
+                from ..shared_parent import execute_cohort
+                for _, group in _group_entries(cohort_entries, lambda row: row.get("cohort_id")):
+                    try:
+                        cohort_results = execute_cohort(group)
+                        by_id = {r["service_id"]: r for r in cohort_results}
+                        for entry in group:
+                            outcome = by_id[entry.resolved["service_id"]]
+                            results.append(_result_row(entry.resolved, entry.idx, outcome["status"], outcome["error_message"], service_id=outcome["service_id"]))
+                            _record_manifest_progress_result(results[-1])
+                    except Exception as exc:
+                        for entry in group:
+                            results.append(_record_entry_failure(entry, failure_stage="cohort_preparation", error_message=str(exc), exc=exc))
+                        print(f"Cohort failed preparation: {exc}")
+            fedavg_summaries: list[dict[str, Any]] = []
+            if fedavg_entries:
+                fedavg_results, fedavg_summaries = _execute_fedavg_entries(fedavg_entries)
+                results.extend(fedavg_results)
+            if other_entries:
+                results.extend(
+                    _execute_entries_grouped_hf(other_entries, workers=workers)
+                    if grouped_hf
+                    else _execute_entries_row_local(other_entries, workers=workers)
+                )
+            if fedavg_summaries:
+                FEDAVG_RUN_RESULTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+                pd.DataFrame(fedavg_summaries).to_csv(FEDAVG_RUN_RESULTS_PATH, index=False)
+                print(f"Wrote fedavg run summaries: {FEDAVG_RUN_RESULTS_PATH}")
 
-        output_path = MANIFEST_RESULTS_PATH
+        if not dry_run:
+            _finalize_manifest_results(entries, results)
+            for recovery_path in _service_recovery_paths(recovery_db_paths):
+                reconcile_manifest_roster(recovery_path, run_id=manifest_group_id)
+        output_path = results_path
         output_path.parent.mkdir(parents=True, exist_ok=True)
         sorted_results = _sort_result_rows(results)
         pd.DataFrame(sorted_results).to_csv(output_path, index=False)
@@ -1308,9 +1678,10 @@ def run_manifest(
             rows_df=rows_df,
             manifest_defaults=manifest_defaults,
             results=sorted_results,
+            output_path=failed_path,
             db_path=db_path,
         )
-        if not dry_run:
+        if not dry_run and not shared_manifest:
             effective_db_path = db_path or CONFIG.get("db_path")
             _write_multimodal_audit_csv(
                 rows_df=rows_df,
@@ -1324,10 +1695,101 @@ def run_manifest(
             )
         print(f"Wrote results: {output_path}")
         return output_path
+    except BaseException as exc:
+        if not dry_run:
+            for recovery_path in _service_recovery_paths(recovery_db_paths):
+                for recover in (recover_service_states, reconcile_manifest_roster):
+                    try:
+                        recover(recovery_path, run_id=manifest_group_id, reason=f"manifest shutdown: {type(exc).__name__}")
+                    except Exception as recovery_error:
+                        # Retain the roster/journals for restart and the original
+                        # exception; continue recovery in the other databases.
+                        print(f"Shutdown recovery deferred for {recovery_path}: {bounded_text(str(recovery_error))}", flush=True)
+            _recover_fedavg_databases(
+                recovery_db_paths,
+                reason=f"manifest shutdown interrupted execution: {type(exc).__name__}",
+                best_effort=True,
+            )
+        raise
     finally:
         if _ACTIVE_MANIFEST_PROGRESS is not None:
             _ACTIVE_MANIFEST_PROGRESS.finish()
         _ACTIVE_MANIFEST_PROGRESS = None
+
+
+def _service_recovery_paths(paths):
+    return sorted({str(candidate) for path in paths for candidate in _database_candidates(path)})
+
+
+def _finalize_manifest_results(entries, results):
+    reported = {r["service_id"]: r for r in results}
+    for entry in entries:
+        outcome = reported.get(entry.resolved["service_id"])
+        if outcome is None:
+            results.append(_record_entry_failure(entry, failure_stage="missing_terminal_result",
+                           error_message="executor returned without a terminal result"))
+            continue
+        if outcome["status"] == "skipped":
+            continue
+        config = {**entry.resolved, **_resolved_from_result(outcome)}
+        expected = "completed" if outcome["status"] == "success" else outcome["status"]
+        db = config.get("db_path") or entry.resolved.get("db_path")
+        actual = None
+        if db and Path(db).is_file():
+            with sqlite3.connect(db) as conn:
+                if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='services'").fetchone():
+                    actual = conn.execute("SELECT status FROM services WHERE service_id=?", (outcome["service_id"],)).fetchone()
+        if actual is None or actual[0] != expected:
+            if expected in FEDAVG_OBSERVATION_STATUSES:
+                service_runner.persist_status_only_service(config, status=expected, reason=outcome.get("error_message"))
+            else:
+                persist_terminal({**config, "service_id": outcome["service_id"]}, status=expected,
+                                 reason=outcome.get("error_message"), failure_stage="executor_result")
+
+
+def _fedavg_recovery_db_paths(
+    rows_df: pd.DataFrame,
+    manifest_defaults: Mapping[str, Any],
+    *,
+    db_path_override: str | None,
+) -> list[str]:
+    """Resolve every database this manifest can write before execution starts."""
+    if db_path_override is not None:
+        return [str(db_path_override)]
+    fallback = manifest_defaults.get("db_path") or CONFIG.get("db_path") or "mlaas.db"
+    paths: set[str] = set()
+    for _, row in rows_df.iterrows():
+        row_path = row.get("db_path") if "db_path" in rows_df.columns else None
+        paths.add(str(fallback if _is_blank(row_path) else row_path))
+    if not paths:
+        paths.add(str(fallback))
+    return sorted(paths)
+
+
+def _recover_fedavg_databases(
+    paths: list[str],
+    *,
+    reason: str,
+    best_effort: bool = False,
+) -> None:
+    for path in paths:
+        try:
+            recovered = recover_abandoned_fedavg_runs(path, reason=reason)
+        except Exception as exc:  # shutdown cleanup must not mask the original exit
+            if not best_effort:
+                raise
+            print(
+                f"[FedAvg recovery] db={path} | cleanup_error={type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            continue
+        if recovered["runs"] or recovered["rounds"]:
+            print(
+                "[FedAvg recovery] "
+                f"db={path} | interrupted_runs={recovered['runs']} "
+                f"| interrupted_rounds={recovered['rounds']} | reason={reason}",
+                flush=True,
+            )
 
 
 def _execute_entries_row_local(entries: list[ManifestEntry], *, workers: int = 1) -> list[dict[str, Any]]:
@@ -1403,6 +1865,7 @@ def _entry_supports_auto_gpu_affinity(resolved: dict[str, Any]) -> bool:
 
 def _worker_initializer(cuda_visible_devices: int | None, progress_queue: Any = None) -> None:
     global _WORKER_PROGRESS_QUEUE, _WORKER_LABEL
+    start_preparation_cache()
     if cuda_visible_devices is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(cuda_visible_devices)
     _WORKER_PROGRESS_QUEUE = progress_queue
@@ -1511,9 +1974,19 @@ def _execute_entries_with_gpu_affinity(entries: list[ManifestEntry], gpu_slots: 
 
 
 def _execute_entry_row_local(entry: ManifestEntry) -> dict[str, Any]:
+    from .miopen_worker import should_isolate
+    if should_isolate(entry.resolved):
+        return _execute_isolated_miopen([entry], grouped=False)[0]
     resolved = entry.resolved
     service_id = resolved["service_id"]
+    queue_services([resolved])
     try:
+        from .manifest.preparation import applies, execute_entries
+        if applies(resolved):
+            outcome = execute_entries([entry])[0]
+            result = _result_row(resolved, entry.idx, outcome["status"], outcome["error_message"], service_id=service_id)
+            _record_manifest_progress_result(result)
+            return result
         summary = execute_service(resolved)
         status = "success" if summary.status == "success" else "failed"
         error = summary.error or ""
@@ -1546,6 +2019,141 @@ def _execute_entry_row_local(entry: ManifestEntry) -> dict[str, Any]:
         )
         print(f"Service failed for row {entry.idx}: {exc}")
         result = _result_row(resolved, entry.idx, "failed", str(exc), service_id=service_id)
+        _record_manifest_progress_result(result)
+        return result
+    finally:
+        if _is_hf_resolved(resolved):
+            _clear_cuda_runtime_state()
+
+
+def _execute_fedavg_entries(entries: list[ManifestEntry]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    results: list[dict[str, Any]] = []
+    summaries: list[dict[str, Any]] = []
+    for _, run_entries in _group_entries(entries, lambda resolved: str(resolved.get("fl_run_id") or "")):
+        first = run_entries[0].resolved
+        debug_print(
+            "\nfedavg run: "
+            f"fl_run_id={first.get('fl_run_id')} "
+            f"model={first.get('hf_model_id') or first.get('model_type')} "
+            f"clients={first.get('fedavg_clients_per_run')} "
+            f"rounds={first.get('fedavg_rounds')} client_rounds={len(run_entries)}"
+        )
+        _manifest_progress_start("main", f"fedavg run {first.get('fl_run_id')}")
+        run_results, summary = execute_fedavg_run(
+            run_entries,
+            execute_entry=_fedavg_execute_entry,
+            build_dataset_args=_build_dataset_args,
+            load_dataset=service_runner._load_dataset,
+            build_model=_build_fedavg_hf_model if _is_hf_resolved(first) else _build_fedavg_generic_model,
+        )
+        results.extend(run_results)
+        summaries.append(summary)
+        _manifest_progress_clear("main")
+    return results, summaries
+
+
+def _build_fedavg_generic_model(config: dict[str, Any], meta: Any, task_family: str):
+    return service_runner.ServiceRunner(config)._build_model(meta=dict(meta or {}), task_family=task_family)
+
+
+def _build_fedavg_hf_model(config: dict[str, Any], meta: Any, task_family: str):
+    del task_family
+    return _build_prepared_hf_model(config, meta)
+
+
+def _fedavg_execute_entry(
+    entry: ManifestEntry,
+    *,
+    prepared: dict[str, Any] | None,
+    failure_message: str | None = None,
+    status_override: str | None = None,
+) -> dict[str, Any]:
+    resolved = dict(entry.resolved)
+    service_id = resolved["service_id"]
+    if failure_message:
+        status = status_override or "failed"
+        try:
+            service_runner.persist_status_only_service(
+                resolved, status=status, reason=failure_message
+            )
+        except Exception as exc:  # noqa: BLE001
+            failure_message = f"{failure_message}; status-only persistence failed: {exc}"
+        if status == "failed":
+            _write_failure_log(
+                FAILURE_LOG_PATH,
+                row_index=entry.idx,
+                service_id=service_id,
+                case_name=resolved.get("case_name"),
+                manifest_group_id=resolved.get("manifest_group_id"),
+                failure_stage="fedavg_run",
+                error_message=failure_message,
+                resolved=resolved,
+            )
+            _write_failure_db(
+                resolved,
+                row_index=entry.idx,
+                service_id=service_id,
+                case_name=resolved.get("case_name"),
+                manifest_group_id=resolved.get("manifest_group_id"),
+                failure_stage="fedavg_run",
+                error_message=failure_message,
+            )
+        result = _result_row(resolved, entry.idx, status, failure_message, service_id=service_id)
+        result["_terminal_defer_progress"] = not debug_enabled(resolved)
+        _record_manifest_progress_result(result)
+        return result
+    if prepared:
+        resolved.update(prepared)
+    _manifest_progress_start(_WORKER_LABEL,
+        f"round {resolved.get('round_id')}/{resolved.get('fedavg_rounds')} {resolved.get('client_id')}")
+    resolved.setdefault("_client_started_perf", time.perf_counter())
+    try:
+        summary = execute_service(resolved)
+        status = "success" if summary.status == "success" else "failed"
+        error = summary.error or ""
+        if status != "success":
+            print(f"fedavg client failed for row {entry.idx}: {error}")
+        result = _result_row(resolved, entry.idx, status, error, service_id=summary.service_id)
+        result["_terminal_metrics"] = summary.metrics or {}
+        result["_terminal_weights_saved"] = bool(getattr(summary, "weights_saved", False))
+        # Training can reduce the effective batch size after an OOM retry.
+        result["_terminal_runtime_config"] = {
+            key: metric.get("value") for key, metric in (summary.metrics or {}).items()
+            if key in {"batch_size", "learning_rate"} and isinstance(metric, dict)
+        }
+        if status == "success" and prepared and prepared.get("_prepared_model") is not None:
+            result["_final_tensor_state"] = getattr(summary, "final_tensor_state", None)
+            if result["_final_tensor_state"] is None:
+                result["_final_tensor_state"] = service_runner.capture_model_tensor_state(prepared["_prepared_model"])
+            result["_checkpoint_integrity_verified"] = True
+        result["_terminal_defer_progress"] = not debug_enabled(resolved)
+        _record_manifest_progress_result(result)
+        return result
+    except Exception as exc:  # noqa: BLE001
+        _write_failure_log(
+            FAILURE_LOG_PATH,
+            row_index=entry.idx,
+            service_id=service_id,
+            case_name=resolved.get("case_name"),
+            manifest_group_id=resolved.get("manifest_group_id"),
+            failure_stage="fedavg_runtime_exception",
+            error_message=str(exc),
+            resolved=resolved,
+            exc=exc,
+        )
+        _write_failure_db(
+            resolved,
+            row_index=entry.idx,
+            service_id=service_id,
+            case_name=resolved.get("case_name"),
+            manifest_group_id=resolved.get("manifest_group_id"),
+            failure_stage="fedavg_runtime_exception",
+            error_message=str(exc),
+            exc=exc,
+        )
+        print(f"fedavg client failed for row {entry.idx}: {exc}")
+        result = _result_row(resolved, entry.idx, "failed", str(exc), service_id=service_id)
+        result["_terminal_defer_progress"] = not debug_enabled(resolved)
         _record_manifest_progress_result(result)
         return result
     finally:
@@ -1705,10 +2313,69 @@ def _execute_hf_groups_with_gpu_affinity(model_groups: list[list[ManifestEntry]]
     return results
 
 
+def _execute_isolated_miopen(entries, *, grouped):
+    from .miopen_worker import run_isolated
+    print("[MIOpen] isolated vision worker | MIOPEN_FIND_MODE=FAST | "
+          f"model={entries[0].resolved.get('hf_model_id')} | services={len(entries)}", flush=True)
+    try:
+        results = run_isolated(_worker_group_payload(entries), grouped=grouped)
+    except Exception as exc:
+        results = []
+        for entry in entries:
+            # A worker may exit after committing some clients. Preserve them.
+            cfg = entry.resolved
+            path = Path(cfg.get("db_path") or CONFIG["db_path"])
+            completed = False
+            if path.is_file():
+                with sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True) as conn:
+                    if conn.execute("SELECT 1 FROM sqlite_master WHERE name='services'").fetchone():
+                        row = conn.execute("SELECT status FROM services WHERE service_id=?", (cfg["service_id"],)).fetchone()
+                        completed = row is not None and row[0] == "completed"
+            if completed:
+                result = _result_row(cfg, entry.idx, "success", "", service_id=cfg["service_id"])
+                _record_manifest_progress_result(result)
+            else:
+                result = _record_entry_failure(entry, failure_stage="miopen_worker",
+                                               error_message=str(exc), exc=exc)
+            results.append(result)
+        return results
+    for result in results:
+        _record_manifest_progress_result(result)
+    return results
+
+
+@terminal_scope(lambda entries: entries[0].resolved if entries else {})
 def _execute_hf_model_group(entries: list[ManifestEntry]) -> list[dict[str, Any]]:
+    from .miopen_worker import should_isolate
+    if entries and should_isolate(entries[0].resolved):
+        return _execute_isolated_miopen(entries, grouped=True)
+    queue_services([entry.resolved for entry in entries])
+    from .manifest.preparation import applies, execute_entries, group_key
+    if entries and applies(entries[0].resolved):
+        results = []
+        for _, group in _group_entries(entries, group_key):
+            reported = set()
+            def on_start(entry):
+                _manifest_progress_start(_WORKER_LABEL, _describe_entry(entry))
+            def on_result(entry, outcome):
+                result = _result_row(entry.resolved, entry.idx, outcome["status"], outcome["error_message"], service_id=outcome["service_id"])
+                reported.add(entry.idx)
+                results.append(result)
+                _record_manifest_progress_result(result)
+            try:
+                execute_entries(group, on_start=on_start, on_result=on_result)
+            except Exception as exc:
+                first = group[0].resolved
+                print(f"Family preparation failed: model={first.get('hf_model_id')} "
+                      f"dataset={first.get('dataset_name')} affected_clients={len(group)} | {exc}")
+                remaining = [entry for entry in group if entry.idx not in reported]
+                results.extend(_record_entry_failure(entry, failure_stage="family_preparation",
+                    error_message=str(exc), exc=exc, write_log=index == 0) for index, entry in enumerate(remaining))
+        return results
     results: list[dict[str, Any]] = []
     model_cache: dict[str, tuple[Any, Any]] = {}
     for _, dataset_entries in _group_entries(entries, _hf_dataset_group_key):
+        prepared_dataset = None
         dataset_entries = sorted(dataset_entries, key=_entry_group_sort_key)
         first = dataset_entries[0].resolved
         dataset_args = _dataset_args_for_group(dataset_entries)
@@ -1720,9 +2387,11 @@ def _execute_hf_model_group(entries: list[ManifestEntry]) -> list[dict[str, Any]
         )
         try:
             dataset_load_start = time.perf_counter()
-            prepared_dataset = service_runner._load_dataset(first.get("dataset", "hf"), **dataset_args)
+            from ..data.tokenization_selection import training_row_selection
+            with training_row_selection([entry.resolved for entry in dataset_entries]) as selection:
+                prepared_dataset = service_runner._load_dataset(first.get("dataset", "hf"), **dataset_args)
             dataset_load_s = float(time.perf_counter() - dataset_load_start)
-            print(
+            debug_print(
                 "[ServiceTiming] "
                 f"model={first.get('hf_model_id') or first.get('model_type')} "
                 f"| stage=dataset load | elapsed_s={dataset_load_s:.3f} "
@@ -1734,7 +2403,7 @@ def _execute_hf_model_group(entries: list[ManifestEntry]) -> list[dict[str, Any]
             results.extend(_execute_entries_row_local(dataset_entries))
             continue
 
-        _, _, meta = prepared_dataset
+        meta = prepared_dataset[2]
         model_key = _hf_prepared_model_key(first, meta)
         if model_key not in model_cache:
             try:
@@ -1742,10 +2411,12 @@ def _execute_hf_model_group(entries: list[ManifestEntry]) -> list[dict[str, Any]
                 base_weights = service_runner.snapshot_model_weights(model)
             except Exception as exc:  # noqa: BLE001
                 print(f"Grouped HF model build failed; falling back to row-local execution: {exc}")
+                prepared_dataset = None
                 results.extend(_execute_entries_row_local(dataset_entries))
                 continue
             if base_weights is None and any(_is_trainable_entry(entry.resolved) for entry in dataset_entries):
                 print("Grouped HF model did not expose resettable weights; falling back to row-local execution.")
+                prepared_dataset = None
                 results.extend(_execute_entries_row_local(dataset_entries))
                 continue
             model_cache[model_key] = (model, base_weights)
@@ -1789,15 +2460,19 @@ def _execute_hf_model_group(entries: list[ManifestEntry]) -> list[dict[str, Any]
                         return results
                     continue
                 model_reset_s = float(time.perf_counter() - reset_start)
-                print(
+                debug_print(
                     "[ServiceTiming] "
                     f"service_id={entry.resolved.get('service_id')} "
                     f"| model={entry.resolved.get('hf_model_id') or entry.resolved.get('model_type')} "
                     f"| stage=model reset | elapsed_s={model_reset_s:.3f}",
                     flush=True,
                 )
+            _manifest_progress_start(_WORKER_LABEL, _describe_entry(entry))
             prepared_config = dict(entry.resolved)
             prepared_config["_prepared_dataset"] = prepared_dataset
+            selected_split = selection.materialize(entry.resolved["service_id"], prepared_dataset[0])
+            if selected_split is not None:
+                prepared_config["_pretokenization_split_info"] = selected_split
             prepared_config["_prepared_model"] = model
             prepared_config["_dataset_load_s"] = dataset_load_s
             if model_reset_s is not None:
@@ -1828,6 +2503,10 @@ def _execute_hf_model_group(entries: list[ManifestEntry]) -> list[dict[str, Any]
                     except Exception:
                         pass
                 continue
+            finally:
+                prepared_config.pop("_prepared_dataset", None)
+                prepared_config.pop("_pretokenization_split_info", None)
+                selected_split = None
             status = "success" if summary.status == "success" else "failed"
             error = summary.error or ""
             if status != "success":
@@ -1839,6 +2518,8 @@ def _execute_hf_model_group(entries: list[ManifestEntry]) -> list[dict[str, Any]
             results.append(result)
             _record_manifest_progress_result(result)
             _clear_cuda_runtime_state()
+        # Release the previous expanded pool before allocating the next dataset.
+        prepared_dataset = None
     model_cache.clear()
     _clear_cuda_runtime_state()
     return results
@@ -1874,6 +2555,8 @@ def _requires_row_local_hf_entry(resolved: dict[str, Any]) -> bool:
 
 
 def _is_groupable_hf_entry(resolved: dict[str, Any]) -> bool:
+    if not _is_blank(resolved.get("fl_run_id")):
+        return False
     return _is_hf_resolved(resolved) and bool(resolved.get("hf_model_id")) and not _requires_row_local_hf_entry(resolved)
 
 
@@ -1895,15 +2578,20 @@ def _group_entries(entries: list[ManifestEntry], key_fn):
 
 
 def _hf_model_group_key(resolved: dict[str, Any]) -> str:
+    from .manifest.preparation import applies, group_key
+    if applies(resolved):
+        return group_key(resolved)
     dataset_args = dict(resolved.get("dataset_args") or {})
     return _json_key(
         {
             "hf_model_id": resolved.get("hf_model_id"),
+            "hf_model_revision": resolved.get("hf_model_revision"),
             "hf_task": resolved.get("hf_task"),
             "model_type": resolved.get("model_type"),
             "device": resolved.get("device"),
             "mixed_precision": resolved.get("mixed_precision"),
             "precision_type": resolved.get("precision_type"),
+            "no_save_weights": resolved.get("no_save_weights", False),
             "loader_template": dataset_args.get("loader_template"),
             "task_tag": resolved.get("task_tag"),
         }
@@ -1914,18 +2602,16 @@ def _hf_dataset_group_key(resolved: dict[str, Any]) -> str:
     args = dict(resolved.get("dataset_args") or {})
     args.pop("max_samples", None)
     args["inference_only"] = not _is_trainable_entry(resolved)
-    return _json_key({"dataset": resolved.get("dataset"), "dataset_args": args})
+    return _json_key({
+        "dataset": resolved.get("dataset"),
+        "hf_dataset_revision": resolved.get("hf_dataset_revision"),
+        "dataset_args": args,
+    })
 
 
 def _dataset_args_for_group(entries: list[ManifestEntry]) -> dict[str, Any]:
     args = dict(entries[0].resolved.get("dataset_args") or {})
-    max_samples = [
-        int(entry.resolved["max_samples"])
-        for entry in entries
-        if entry.resolved.get("max_samples") is not None
-    ]
-    if max_samples:
-        args["max_samples"] = max(max_samples)
+    args.pop("max_samples", None)  # Accept old prepared rows without applying their cap.
     args["inference_only"] = not _is_trainable_entry(entries[0].resolved)
     return args
 
@@ -1935,6 +2621,7 @@ def _hf_prepared_model_key(config: dict[str, Any], meta: Any) -> str:
     return _json_key(
         {
             "hf_model_id": config.get("hf_model_id") or meta_dict.get("hf_model_id"),
+            "hf_model_revision": config.get("hf_model_revision") or meta_dict.get("hf_model_revision"),
             "hf_task": config.get("hf_task") or meta_dict.get("hf_task"),
             "model_type": config.get("model_type"),
             "device": config.get("device"),
@@ -1948,7 +2635,7 @@ def _hf_prepared_model_key(config: dict[str, Any], meta: Any) -> str:
 
 def _normalize_precision_type(value: Any) -> str:
     text = str(value or "fp16").strip().lower()
-    return "bf16" if text == "bf16" else "fp16"
+    return text if text in {"fp16", "bf16", "fp32"} else "fp16"
 
 
 def _entry_group_sort_key(entry: ManifestEntry) -> tuple[Any, ...]:
@@ -1971,6 +2658,9 @@ def _sort_result_rows(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _result_row(resolved: dict[str, Any], idx: int, status: str, error_message: str, *, service_id: str) -> dict[str, Any]:
+    public_resolved = {
+        key: value for key, value in resolved.items() if not str(key).startswith("_")
+    }
     return {
         "service_id": service_id,
         "row_index": int(idx),
@@ -1978,7 +2668,7 @@ def _result_row(resolved: dict[str, Any], idx: int, status: str, error_message: 
         "case_name": resolved.get("case_name"),
         "status": status,
         "error_message": error_message,
-        "resolved_config_json": json.dumps(resolved, default=str),
+        "resolved_config_json": diagnostic_json(public_resolved),
     }
 
 
@@ -1988,7 +2678,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sheet", default="services", help="Sheet name for service rows (xlsx only)")
     parser.add_argument("--dry-run", "--dry_run", dest="dry_run", action="store_true", help="Resolve and validate rows without executing services")
     parser.add_argument("--db", "--db-path", dest="db_path", default=None, help="SQLite database path for service records")
+    parser.add_argument("--log-mode", choices=("concise", "debug"), default=None, help="Terminal output detail (default: concise)")
     parser.add_argument("--workers", type=int, default=1, help="Number of row-level worker processes to run")
+    parser.add_argument("--rerun-existing", action="store_true", help="Execute rows even when their service_id already exists in SQLite")
+    parser.add_argument("--no-save-weights", action="store_true", help="Independent debugging: train/evaluate without saving weight checkpoints")
+    parser.add_argument("--smoke-test", action="store_true", help="Skip perturbation and update signatures; use separate smoke-test service IDs")
     parser.add_argument("--no-grouped-hf", dest="grouped_hf", action="store_false", help="Disable grouped Hugging Face execution")
     parser.set_defaults(grouped_hf=True)
     return parser
@@ -2004,6 +2698,10 @@ def main() -> None:
         db_path=args.db_path,
         grouped_hf=args.grouped_hf,
         workers=args.workers,
+        rerun_existing=args.rerun_existing,
+        log_mode=args.log_mode,
+        no_save_weights=args.no_save_weights,
+        smoke_test=args.smoke_test,
     )
 
 

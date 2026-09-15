@@ -1,6 +1,8 @@
 from ..accounting import append_accounting_stage, update_accounting
 from ..hf_cache_paths import with_hf_image_decode_disabled
 from ..multimodal_columns import resolve_existing_column
+from ...family_preflight import hf_split_error
+from ..runtime_cache import cached_preparation
 
 
 _IMAGE_COLUMN_ALIASES = ("image", "img", "images", "pixel_values")
@@ -38,10 +40,17 @@ def load_huggingface_source(**kwargs):
         raise ValueError("HF source requires dataset_name=<repo_id> in dataset_args.")
 
     dataset_config = kwargs.get("dataset_config", None)
+    dataset_revision = kwargs.get("hf_dataset_revision") or kwargs.get("dataset_revision")
     train_split = kwargs.get("train_split", "train")
     requested_test_split = kwargs.get("test_split", "test")
+    require_official_train_split = _bool_arg(kwargs.get("require_official_train_split", False))
+    if require_official_train_split:
+        error = hf_split_error(train_split, requested_test_split)
+        if error:
+            raise ValueError(error)
 
-    max_samples = kwargs.get("max_samples", None)
+    # Historical manifests may still supply this field; it no longer controls loading.
+    kwargs.pop("max_samples", None)
     seed = int(kwargs.get("seed", 42))
     max_length = int(kwargs.get("max_length", 128))
     inference_only = _bool_arg(kwargs.get("inference_only", False))
@@ -52,11 +61,16 @@ def load_huggingface_source(**kwargs):
         raise ValueError(f"Unsupported HF modality '{modality}'. Expected one of ['text', 'image', 'multimodal']")
     hf_task = kwargs.get("hf_task", "sequence_classification")
 
-    ds_train = load_dataset(dataset_name, dataset_config, split=train_split)
-    raw_train_count = len(ds_train)
-
+    load_kwargs = {"revision": str(dataset_revision)} if dataset_revision else {}
     def _try_load_split(split_name):
-        return load_dataset(dataset_name, dataset_config, split=split_name)
+        value, _ = cached_preparation(
+            "dataset", (dataset_name, dataset_config, dataset_revision, split_name),
+            lambda: load_dataset(dataset_name, dataset_config, split=split_name, **load_kwargs),
+        )
+        return value
+
+    ds_train = _try_load_split(train_split)
+    raw_train_count = len(ds_train)
 
     def _is_unlabelled(ds):
         if modality == "multimodal":
@@ -89,6 +103,11 @@ def load_huggingface_source(**kwargs):
         break
 
     if ds_test is None:
+        if require_official_train_split:
+            raise ValueError(
+                "compatible HF services require a separate labeled official evaluation split; "
+                "none was available, and a training-split holdout is not permitted by this family contract"
+            )
         test_size = float(kwargs.get("test_size", 0.2))
         split = ds_train.train_test_split(test_size=test_size, seed=seed, shuffle=True)
         ds_train = split["train"]
@@ -100,15 +119,23 @@ def load_huggingface_source(**kwargs):
     post_split_train_count = len(ds_train)
     post_split_test_count = len(ds_test)
 
-    if max_samples:
-        n = int(max_samples)
-        if len(ds_train) > 1:
-            ds_train = ds_train.shuffle(seed=seed)
-        if len(ds_test) > 1:
-            ds_test = ds_test.shuffle(seed=seed + 1)
-        ds_train = ds_train.select(range(min(n, len(ds_train))))
-        test_n = n if inference_only else max(1, n // 5)
-        ds_test = ds_test.select(range(min(test_n, len(ds_test))))
+    # Evaluation size is independent of client training quantities.
+    benchmark_size = kwargs.get("benchmark_sample_size")
+    if benchmark_size is not None:
+        benchmark_size = max(1, int(benchmark_size))
+        benchmark_seed = kwargs.get("benchmark_sample_seed")
+        ds_test = ds_test.shuffle(seed=int(benchmark_seed if benchmark_seed is not None else seed + 1))
+        ds_test = ds_test.select(range(min(benchmark_size, len(ds_test))))
+
+    def _selected_rows(ds):
+        indices = getattr(ds, "_indices", None)
+        try:
+            column = indices.column(0).to_pylist() if indices is not None else None
+            return [int(value) for value in column] if column is not None else list(range(len(ds)))
+        except Exception:
+            return list(range(len(ds)))
+    selected_train_rows = _selected_rows(ds_train)
+    selected_test_rows = _selected_rows(ds_test)
 
     schema = None
     def _has_value(value):
@@ -267,11 +294,13 @@ def load_huggingface_source(**kwargs):
 
     dataset_args = dict(kwargs)
     dataset_args.pop("preprocessors", None)
+    dataset_args.pop("require_official_train_split", None)
 
     meta = {
         "dataset_family": "hf",
         "hf_id": dataset_name,
         "hf_subset": dataset_config,
+        "hf_dataset_revision": dataset_revision,
         "train_split": train_split,
         "test_split": chosen_test_split,
         "seed": seed,
@@ -283,8 +312,19 @@ def load_huggingface_source(**kwargs):
         "schema": schema,
         "loader_template": dataset_args.get("loader_template"),
         "dataset_args": dataset_args,
+        "selected_train_rows": selected_train_rows,
+        "selected_test_rows": selected_test_rows,
     }
 
+    group_column = kwargs.get("source_group_column")
+    if group_column:
+        for split, dataset in (("train", ds_train), ("test", ds_test)):
+            if group_column not in dataset.column_names:
+                raise ValueError(f"invalid_source_groups: missing source group column {group_column} in {split}")
+            groups = list(dataset[group_column])
+            if any(value is None or str(value) == "" for value in groups):
+                raise ValueError("invalid_source_groups: every source row must have a group identity")
+            meta[f"{split}_group_ids"] = list(map(str, groups))
     meta = update_accounting(meta, raw_record_count=raw_train_count, post_filter_record_count=len(ds_train))
     meta = append_accounting_stage(
         meta,

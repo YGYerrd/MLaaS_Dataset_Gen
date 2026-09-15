@@ -1,10 +1,14 @@
+
+from mlaas_data_generator.terminal import debug_print
 import contextlib
+from itertools import islice
 import os
 import time
 import numpy as np
 
 from .hf_task import SequenceClassificationSpec
 from .hf_cache import get_cached_tokenizer
+from ...data.prefetch import prefetch_batches
 
 
 class HFCore:
@@ -29,8 +33,13 @@ class HFCore:
         label_pad_value=-100,
         generation_config=None,
         task_tag=None,
+        model_revision=None,
+        mobilebert_head_normalization=None,
+        max_grad_norm=None,
+        dataset_id=None,
     ):
-        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+        if os.name != "nt":
+            os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
         try:
             import torch
             import transformers
@@ -44,6 +53,18 @@ class HFCore:
         self.transformers = transformers
 
         self.model_id = model_id
+        self.dataset_id = dataset_id
+        self.model_revision = model_revision
+        self.max_grad_norm = None if max_grad_norm is None else float(max_grad_norm)
+        if self.max_grad_norm is not None and (not np.isfinite(self.max_grad_norm) or self.max_grad_norm <= 0):
+            raise ValueError("max_grad_norm must be finite and positive")
+        self.model_source = model_id
+        if model_revision and not os.path.exists(str(model_id)):
+            try:
+                from huggingface_hub import snapshot_download
+                self.model_source = snapshot_download(repo_id=str(model_id), revision=str(model_revision))
+            except Exception as exc:
+                raise RuntimeError(f"Unable to resolve pinned Hugging Face model revision {model_id}@{model_revision}") from exc
         self.requested_max_length = int(max_length)
         self.max_length = int(max_length)
         self.model_text_max_length = None
@@ -63,7 +84,7 @@ class HFCore:
         tokenizer_required = bool(getattr(self.task_spec, "requires_tokenizer", True))
         if tokenizer_required:
             self.tokenizer, self.tokenizer_load_s, self.tokenizer_cache_hit = get_cached_tokenizer(
-                hf_model_id=model_id,
+                hf_model_id=self.model_source,
                 task=getattr(self.task_spec, "name", None),
                 device=self.device,
                 transformers_module=transformers,
@@ -86,9 +107,19 @@ class HFCore:
         self.gradient_checkpointing_enabled = False
         needs_num_labels = bool(getattr(self.task_spec, "requires_num_labels", True))
         if num_labels is not None or not needs_num_labels:
-            model_load_start = time.time()
-            self.model = self.task_spec.build_model(transformers, model_id, num_labels)
-            self.model_load_s = float(time.time() - model_load_start)
+            model_load_start = time.perf_counter()
+            self.model = self.task_spec.build_model(transformers, self.model_source, num_labels)
+            saved_normalization = getattr(
+                getattr(self.model, "config", None), "mobilebert_head_normalization", None)
+            if (saved_normalization not in {None, "none"} and mobilebert_head_normalization is not None
+                    and mobilebert_head_normalization != saved_normalization):
+                raise ValueError("MobileBERT normalization differs from the saved checkpoint contract")
+            if mobilebert_head_normalization is None:
+                mobilebert_head_normalization = saved_normalization
+            if mobilebert_head_normalization is not None:
+                from .mobilebert_stability import apply_mobilebert_head_normalization
+                apply_mobilebert_head_normalization(self.model, mobilebert_head_normalization)
+            self.model_load_s = float(time.perf_counter() - model_load_start)
             self.weight_format = getattr(self.task_spec, "weight_format", None)
             self.model.to(self.device)
             self._configure_memory_optimizations()
@@ -128,7 +159,7 @@ class HFCore:
     @staticmethod
     def _normalize_precision_type(value):
         text = str(value or "fp16").strip().lower()
-        return "bf16" if text == "bf16" else "fp16"
+        return text if text in {"fp16", "bf16", "fp32"} else "fp16"
 
     def _cuda_bf16_supported(self):
         cuda = getattr(self.torch, "cuda", None)
@@ -147,12 +178,31 @@ class HFCore:
         self.effective_mixed_precision = False
         self.effective_precision_type = "fp32"
         self.precision_fallback_reason = str(reason) if reason else None
+        self.precision_fallback_error = None
 
     def _configure_precision_mode(self):
         self.requested_mixed_precision = bool(self.mixed_precision)
         self.requested_precision_type = self._normalize_precision_type(getattr(self, "precision_type", "fp16"))
         self.precision_type = self.requested_precision_type
         self._disable_mixed_precision(None)
+        from ...precision_policy import fp32_policy_reason
+        model = getattr(self, "model", None)
+        # Autocast controls compute precision, not parameter storage. Some HF
+        # checkpoints load in FP16; GradScaler cannot unscale their FP16 grads.
+        # Normalize before family/base snapshots as well as before training.
+        if model is not None:
+            model.float()
+        family = getattr(getattr(model, "config", None), "model_type", None)
+        policy_reason = fp32_policy_reason(getattr(self, "model_id", None), family,
+                                          dataset_id=getattr(self, "dataset_id", None))
+        if policy_reason:
+            if model is not None:
+                model.float()
+            self._disable_mixed_precision(policy_reason)
+            return
+        if self.requested_precision_type == "fp32":
+            self._disable_mixed_precision("explicit_fp32")
+            return
         if not self._should_enable_mixed_precision():
             if self.requested_mixed_precision and self._device_type() != "cuda":
                 self.precision_fallback_reason = "mixed_precision_requires_cuda"
@@ -217,12 +267,39 @@ class HFCore:
         except Exception as exc:
             if not self._precision_retryable_exception(exc):
                 raise
-            self._disable_mixed_precision(f"runtime_unsupported_{self.requested_precision_type}")
+            self._fallback_to_fp32(f"runtime_unsupported_{self.requested_precision_type}")
+            self.precision_fallback_error = f"{type(exc).__name__}: {exc}"
             return fn()
+
+    def _fallback_to_fp32(self, reason):
+        # Keep scaling until training finishes: previously accumulated gradients
+        # are still scaled even after autocast is disabled.
+        scaler = getattr(self, "grad_scaler", None)
+        self._disable_mixed_precision(reason)
+        self.grad_scaler = scaler
+
+    def _validate_eval_tensors(self, logits, loss=None, *, require_loss=False):
+        if logits is not None and not bool(self.torch.isfinite(logits).all()):
+            raise ValueError("nonfinite_evaluation_logits: evaluation quality is invalid")
+        if require_loss and loss is None:
+            raise ValueError("missing_evaluation_loss: supervised evaluation requires a loss")
+        if loss is not None and not bool(self.torch.isfinite(loss)):
+            raise ValueError("nonfinite_evaluation_loss: evaluation quality is invalid")
 
     def _configure_memory_optimizations(self):
         if self.model is None:
             return
+
+        from .rocm_batchnorm import configure_native_batchnorm
+        native_bn_count = configure_native_batchnorm(self.model, self.torch, self.device)
+        if native_bn_count:
+            print(f"[HFCore] Windows ROCm: using native GPU BatchNorm for {native_bn_count} layers")
+
+        from .rocm_dpt_layout import configure_rocm_convolution_layout, convolution_layout_family
+        layout_count = configure_rocm_convolution_layout(self.model, self.torch, self.device)
+        if layout_count:
+            family = convolution_layout_family(self.model)
+            print(f"[HFCore] Windows ROCm: using contiguous {family} convolution inputs for {layout_count} layers")
 
         cfg = getattr(self.model, "config", None)
         if cfg is not None:
@@ -290,14 +367,6 @@ class HFCore:
                 except Exception:
                     pass
 
-    def _release_step_memory(self):
-        if self._device_type() != "cuda":
-            return
-        try:
-            self.torch.cuda.empty_cache()
-        except Exception:
-            pass
-
     def _qos_startup(self):
         return {
             "tokenizer_load_s": float(self.tokenizer_load_s),
@@ -310,6 +379,7 @@ class HFCore:
             "mixed_precision_effective": bool(getattr(self, "effective_mixed_precision", False)),
             "precision_type_effective": str(getattr(self, "effective_precision_type", "fp32")),
             "precision_fallback_reason": getattr(self, "precision_fallback_reason", None),
+            "precision_fallback_error": getattr(self, "precision_fallback_error", None),
         }
 
     @staticmethod
@@ -445,23 +515,59 @@ class HFCore:
         if not is_encoder_decoder and getattr(self.tokenizer, "padding_side", None) != "left":
             self.tokenizer.padding_side = "left"
 
-    def _batch_iter(self, xs, ys):
-        bs = self.batch_size
+    @staticmethod
+    def _batch_prefetch_depth(xs):
+        from ...data.image_store import DiskArrayStore
+
+        values = xs.values() if isinstance(xs, dict) else (xs,)
+        if not any(isinstance(value, DiskArrayStore) for value in values):
+            return 0
+        depth = int(os.environ.get("MLAAS_PREFETCH_BATCHES", "2"))
+        if not 0 <= depth <= 8:
+            raise ValueError("MLAAS_PREFETCH_BATCHES must be between 0 and 8")
+        return depth
+
+    def _batch_iter(self, xs, ys, *, indices=None, batch_size=None, contrastive=False):
+        bs = self.batch_size if batch_size is None else batch_size
+
+        def take_batch(value, start, stop):
+            if value is None:
+                return None
+            if indices is None:
+                return value[start:stop]
+            batch_indices = indices[start:stop].tolist()
+            if isinstance(value, tuple):
+                return tuple(value[index] for index in batch_indices)
+            if isinstance(value, list):
+                return [value[index] for index in batch_indices]
+            return value[batch_indices]
+
+        def ranges(n):
+            if contrastive:
+                from ...contrastive_batch import contrastive_ranges
+                return contrastive_ranges(n, bs)
+            return ((i, min(n, i + bs)) for i in range(0, n, bs))
 
         if isinstance(xs, dict):
-            n = len(next(iter(xs.values())))
-            for i in range(0, n, bs):
-                xb = {k: v[i:i + bs] for k, v in xs.items()}
-                yb = None if ys is None else ys[i:i + bs]
+            n = len(next(iter(xs.values()))) if xs else 0
+            for i, stop in ranges(n):
+                xb = {k: take_batch(v, i, stop) for k, v in xs.items()}
+                yb = take_batch(ys, i, stop)
                 xb, span = self._trim_batch_sequence_padding(xb)
-                yb = self._trim_label_padding(yb, span=span)
+                # Seq2seq targets have their own sequence axis.  Trimming them
+                # to the source attention span can silently discard supervised
+                # target tokens when examples in a batch have different source
+                # lengths.  Causal-LM and token-classification labels remain
+                # positionally aligned with their inputs and still use the span.
+                label_span = None if self._targets_have_independent_sequence_axis() else span
+                yb = self._trim_label_padding(yb, span=label_span)
                 yield xb, yb
             return
 
         n = len(xs)
-        for i in range(0, n, bs):
-            xb = xs[i:i + bs]
-            yb = None if ys is None else ys[i:i + bs]
+        for i, stop in ranges(n):
+            xb = take_batch(xs, i, stop)
+            yb = take_batch(ys, i, stop)
             yield xb, yb
 
     @staticmethod
@@ -471,15 +577,6 @@ class HFCore:
                 return 0
             return len(next(iter(xb.values())))
         return len(xb)
-
-    def _should_skip_singleton_train_batch(self, xb):
-        task_name = str(getattr(self.task_spec, "name", "") or "")
-        model_id = str(getattr(self, "model_id", "") or "").lower()
-        return (
-            task_name == "image_segmentation"
-            and model_id.startswith("openmmlab/upernet-")
-            and int(self._batch_item_count(xb)) == 1
-        )
 
     @staticmethod
     def _active_column_span(mask, *, inactive_value=0):
@@ -530,6 +627,10 @@ class HFCore:
         if start == 0 and end == int(yb.shape[1]):
             return yb
         return yb[:, start:end]
+
+    def _targets_have_independent_sequence_axis(self):
+        """Whether source-input trimming must not change the target sequence."""
+        return str(getattr(getattr(self, "task_spec", None), "name", "") or "") == "seq2seq_generation"
 
     def _labels_to_numpy(self, labels_t):
         if labels_t is None:
@@ -806,7 +907,7 @@ class HFCore:
     def _training_timed_out(self, train_start_ts, max_train_time_s):
         if max_train_time_s is None:
             return False
-        return (time.time() - float(train_start_ts)) > float(max_train_time_s)
+        return (time.perf_counter() - float(train_start_ts)) > float(max_train_time_s)
 
     def _build_optimizer(self, *, optimizer, lr, weight_decay):
         torch = self.torch
@@ -821,6 +922,67 @@ class HFCore:
         if name == "rmsprop":
             return torch.optim.RMSprop(params, lr=float(lr), weight_decay=float(weight_decay))
         return torch.optim.AdamW(params, lr=float(lr), weight_decay=float(weight_decay))
+
+    def _backward_microbatch(self, xb, yb, *, loss_weight):
+        """One disposable forward/backward frame; returns CPU scalar statistics."""
+        if self.task_spec.name == "text_image_retrieval" and self._batch_item_count(xb) < 2:
+            raise ValueError("insufficient_contrastive_batch: refusing a forward with fewer than two pairs")
+        torch = self.torch
+        enc, labels_t, extra = self.task_spec.encode_batch(
+            self.tokenizer, xb, yb, self.max_length, torch, self.device,
+            ignore_index=self.label_pad_value, inference_only=False,
+        )
+        if self.task_spec.name in {"token_classification", "image_segmentation", "seq2seq_generation"}:
+            if labels_t is None or not bool((labels_t != self.label_pad_value).any()):
+                raise ValueError("insufficient_supervision: training batch has no supervised positions")
+        model_inputs = self.task_spec.build_forward_inputs(enc, labels_t=labels_t, inference_only=False)
+
+        # A rejected AMP forward can corrupt running statistics even though no
+        # optimizer update occurred. Restore them before every precision retry.
+        batchnorm_state = [
+            (buffer, buffer.detach().clone())
+            for module in self.model.modules()
+            if isinstance(module, torch.nn.modules.batchnorm._BatchNorm)
+            for buffer in (module.running_mean, module.running_var, module.num_batches_tracked)
+            if buffer is not None
+        ]
+        forward_calls = 0
+
+        def restore_batchnorm():
+            with torch.no_grad():
+                for buffer, original in batchnorm_state:
+                    buffer.copy_(original)
+
+        def forward():
+            nonlocal forward_calls
+            if forward_calls:
+                restore_batchnorm()
+            forward_calls += 1
+            outputs = self.model(**model_inputs)
+            logits = self._extract_logits(outputs)
+            return self.task_spec.extract_loss(torch, outputs, logits, labels_t, extra)
+
+        loss = self._run_with_precision_context(forward)
+        if loss is None:
+            raise ValueError("Supervised fine-tune mode requires labels/loss-capable batch")
+        fp32_retries = 0
+        if not bool(torch.isfinite(loss)) and getattr(self, "autocast_enabled", False):
+            loss = None
+            self._fallback_to_fp32("nonfinite_training_loss_fallback_fp32")
+            with torch.autocast(device_type=self._device_type(), enabled=False):
+                loss = forward()
+            fp32_retries = 1
+        if not bool(torch.isfinite(loss)):
+            restore_batchnorm()
+            raise ValueError("nonfinite_training_loss: no optimizer update was applied for this batch")
+        scaled_loss = loss * loss_weight
+        scaler = getattr(self, "grad_scaler", None)
+        (scaler.scale(scaled_loss) if scaler is not None else scaled_loss).backward()
+        tokens = self._count_supervised_tokens(labels_t, self.label_pad_value)
+        sequences = self._batch_item_count(xb)
+        denominator = tokens if hasattr(labels_t, "ndim") and labels_t.ndim >= 2 else sequences
+        return (float(loss.detach().cpu().item()) * max(1, denominator),
+                max(1, denominator), tokens, sequences, fp32_retries)
 
     def finetune(
         self,
@@ -837,12 +999,12 @@ class HFCore:
     ):
         torch = self.torch
 
-        def _is_dense_label_tensor(value):
-            return hasattr(value, "ndim") and not isinstance(value, (list, tuple, dict))
-
         y_local = ys
 
+        self.model.float()
         self.model.train()
+        from .singleton_batchnorm import configure_singleton_batchnorm
+        configure_singleton_batchnorm(self.model, torch)
         optimizer_name = str(optimizer or "adamw").strip().lower()
         weight_decay = float(weight_decay or 0.0)
         warmup_ratio = max(0.0, float(warmup_ratio or 0.0))
@@ -854,7 +1016,7 @@ class HFCore:
         train_supervised_token_count = 0
         train_sequence_count = 0
         step_lat_ms = []
-        t_start = time.time()
+        t_start = time.perf_counter()
         timeout_hit = False
         epochs = int(epochs)
         progress_log_interval = int(progress_log_interval) if progress_log_interval is not None else 0
@@ -862,13 +1024,29 @@ class HFCore:
             total_sequence_count = len(next(iter(xs.values()))) if xs else 0
         else:
             total_sequence_count = len(xs)
+        contrastive = getattr(self.task_spec, "name", None) == "text_image_retrieval"
+        train_batch_size = int(self.batch_size)
+        if contrastive:
+            from ...contrastive_batch import contrastive_ranges, retrieval_batch_target
+            params_m = sum(p.numel() for p in self.model.parameters()) / 1e6
+            pixels = xs.get("pixel_values") if isinstance(xs, dict) else None
+            image_size = max(pixels.shape[-2:]) if pixels is not None else 224
+            preferred = retrieval_batch_target(params_m, image_size)
+            train_batch_size = min(total_sequence_count, max(train_batch_size, preferred))
+            # Even full batches can always fall back to pairs without sample loss.
+            if train_batch_size > 3 and train_batch_size % 2:
+                train_batch_size -= 1
+            contrastive_ranges(total_sequence_count, train_batch_size)
+            print(f"[HFCore.finetune] contrastive policy | vram_basis_gib=16 "
+                  f"| requested_batch={self.batch_size} | preferred_batch={preferred} "
+                  f"| physical_batch={train_batch_size} | minimum_pairs=2", flush=True)
         batches_per_epoch = (
-            int(np.ceil(float(total_sequence_count) / float(max(1, self.batch_size))))
+            int(np.ceil(float(total_sequence_count) / float(max(1, train_batch_size))))
             if total_sequence_count
             else 0
         )
         total_batches = int(max(0, epochs) * max(0, batches_per_epoch))
-        optimizer_steps_total = int(np.ceil(float(total_batches) / float(gradient_accumulation_steps))) if total_batches else 0
+        optimizer_steps_total = epochs * int(np.ceil(batches_per_epoch / gradient_accumulation_steps))
         warmup_steps = int(round(float(optimizer_steps_total) * warmup_ratio)) if optimizer_steps_total else 0
         scheduler = None
         if warmup_steps > 0 or warmup_ratio > 0.0:
@@ -880,132 +1058,136 @@ class HFCore:
             scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer_obj, lr_lambda=_lr_lambda)
         global_batch_idx = 0
         optimizer_step_count = 0
+        successful_optimizer_step_count = 0
 
+        def record_successful_step(*_args):
+            nonlocal successful_optimizer_step_count
+            successful_optimizer_step_count += 1
+
+        # GradScaler can skip an attempted update. Count actual optimizer calls
+        # without changing historical scheduler or optimization behavior.
+        step_counter = optimizer_obj.register_step_post_hook(record_successful_step)
+
+        prefetch_depth = self._batch_prefetch_depth(xs)
         print(
-            f"[HFCore.finetune] starts | epochs={epochs} | batch_size={self.batch_size} "
+            f"[HFCore.finetune] starts | epochs={epochs} | batch_size={train_batch_size} "
             f"| sequence_count={total_sequence_count} | batches_per_epoch={batches_per_epoch} "
             f"| optimizer={optimizer_name} | weight_decay={weight_decay} "
             f"| warmup_ratio={warmup_ratio} | gradient_accumulation_steps={gradient_accumulation_steps} "
-            f"| max_train_time_s={max_train_time_s}"
+            f"| max_train_time_s={max_train_time_s} | prefetch_batches={prefetch_depth}", flush=True,
         )
-        first_batch_logged = False
+        completed_epochs = 0
+        fp32_loss_retry_count = 0
+        last_progress_at = t_start
         optimizer_obj.zero_grad(set_to_none=True)
+        from .microbatch import backward_window, TrainingBudgetExpired
+        memory_state = {
+            "batch_size_requested": int(self.batch_size),
+            "micro_batch_size_effective": train_batch_size,
+            "logical_batch_size": train_batch_size,
+            "gradient_accumulation_steps_requested": gradient_accumulation_steps,
+            "gradient_accumulation_steps_effective": gradient_accumulation_steps,
+            "effective_optimizer_batch_size": train_batch_size * gradient_accumulation_steps,
+            "oom_retry_count": 0,
+            "memory_fallback_applied": False,
+            "optimizer_step_count": 0,
+            "successful_optimizer_step_count": 0,
+            "skipped_optimizer_step_count": 0,
+        }
+        if contrastive:
+            memory_state.update(contrastive_min_pairs=2, contrastive_preferred_batch_size=preferred,
+                                contrastive_vram_basis_gib=16,
+                                contrastive_batch_adjusted=train_batch_size != self.batch_size)
+        self.training_memory_metadata = memory_state
 
-        for epoch_idx in range(epochs):
-            for batch_idx, (xb, yb) in enumerate(self._batch_iter(xs, y_local), start=1):
-                if self._training_timed_out(t_start, max_train_time_s):
-                    timeout_hit = True
-                    break
-                if self._should_skip_singleton_train_batch(xb):
-                    continue
-
-                global_batch_idx += 1
-                t0 = time.time()
-                if not first_batch_logged:
-                    print("[HFCore.finetune] first batch pulled")
-
-                enc, labels_t, extra = self.task_spec.encode_batch(
-                    self.tokenizer,
-                    xb,
-                    yb,
-                    self.max_length,
-                    torch,
-                    self.device,
-                    ignore_index=self.label_pad_value,
-                    inference_only=False,
-                )
-
-                model_inputs = self.task_spec.build_forward_inputs(enc, labels_t=labels_t, inference_only=False)
-                if not first_batch_logged:
-                    print("[HFCore.finetune] model forward starts")
-                try:
-                    def _forward():
-                        outputs = self.model(**model_inputs)
-                        logits = self._extract_logits(outputs)
-                        return outputs, logits, self.task_spec.extract_loss(torch, outputs, logits, labels_t, extra)
-
-                    outputs, logits, loss = self._run_with_precision_context(_forward)
-                except Exception as exc:
-                    if not first_batch_logged:
-                        print(
-                            "[HFCore.finetune] first batch forward failed "
-                            f"| error_type={type(exc).__name__} | error={exc}"
-                        )
-                    raise
-                if not first_batch_logged:
-                    print("[HFCore.finetune] first batch forward ends")
-                if loss is None:
-                    raise ValueError("Supervised fine-tune mode requires labels/loss-capable batch")
-                loss_for_backward = loss / float(gradient_accumulation_steps)
-                should_step = (
-                    (global_batch_idx % gradient_accumulation_steps == 0)
-                    or (global_batch_idx == total_batches)
-                    or (batch_idx == batches_per_epoch)
-                )
-                grad_scaler = getattr(self, "grad_scaler", None)
-                if grad_scaler is not None and getattr(self, "autocast_enabled", False):
-                    grad_scaler.scale(loss_for_backward).backward()
-                    if should_step:
-                        grad_scaler.step(optimizer_obj)
-                        grad_scaler.update()
+        try:
+            for epoch_idx in range(epochs):
+                # Local-update preparation seeds NumPy with the client's training_seed.
+                # Draw a fresh order each epoch without changing partition membership
+                # or the source arrays used for provenance and evaluation.
+                epoch_indices = np.random.permutation(total_sequence_count)
+                with prefetch_batches(
+                    self._batch_iter(xs, y_local, indices=epoch_indices, batch_size=train_batch_size,
+                                     contrastive=contrastive), depth=prefetch_depth
+                ) as batches:
+                    batch_idx = 0
+                    while window := list(islice(batches, gradient_accumulation_steps)):
+                        t0 = time.perf_counter()
+                        try:
+                            totals = backward_window(self, window, optimizer_obj, memory_state,
+                                                     t_start, max_train_time_s)
+                        except TrainingBudgetExpired:
+                            timeout_hit = True
+                            break
+                        # A step can allocate optimizer state and partially update parameters.
+                        # Never replay it after OOM without a complete transactional snapshot.
+                        grad_scaler = getattr(self, "grad_scaler", None)
+                        max_grad_norm = getattr(self, "max_grad_norm", None)
+                        if max_grad_norm is not None:
+                            if grad_scaler is not None:
+                                grad_scaler.unscale_(optimizer_obj)
+                            # A finite loss can still have invalid gradients. Fail
+                            # before mutating parameters rather than corrupting the model.
+                            norm = torch.nn.utils.clip_grad_norm_(
+                                self.model.parameters(), max_grad_norm, error_if_nonfinite=True)
+                            memory_state["max_grad_norm"] = max_grad_norm
+                            memory_state["gradient_norm_max"] = max(
+                                memory_state.get("gradient_norm_max", 0.0), float(norm))
+                            memory_state["gradient_clipped_step_count"] = (
+                                memory_state.get("gradient_clipped_step_count", 0) + int(norm > max_grad_norm))
+                        if grad_scaler is not None:
+                            grad_scaler.step(optimizer_obj)
+                            grad_scaler.update()
+                        else:
+                            optimizer_obj.step()
                         optimizer_obj.zero_grad(set_to_none=True)
                         optimizer_step_count += 1
                         if scheduler is not None:
                             scheduler.step()
-                else:
-                    loss_for_backward.backward()
-                    if should_step:
-                        optimizer_obj.step()
-                        optimizer_obj.zero_grad(set_to_none=True)
-                        optimizer_step_count += 1
-                        if scheduler is not None:
-                            scheduler.step()
+                        total_loss += totals[0]
+                        train_loss_denominator_count += totals[1]
+                        train_supervised_token_count += totals[2]
+                        train_sequence_count += totals[3]
+                        fp32_loss_retry_count += totals[4]
+                        global_batch_idx += len(window)
+                        batch_idx += len(window)
+                        memory_state.update(optimizer_step_count=optimizer_step_count,
+                                            successful_optimizer_step_count=successful_optimizer_step_count,
+                                            skipped_optimizer_step_count=optimizer_step_count - successful_optimizer_step_count)
+                        step_lat_ms.append((time.perf_counter() - t0) * 1000.0 / len(window))
+                        if progress_log_interval > 0 and (
+                            global_batch_idx == len(window) or global_batch_idx == total_batches
+                            or time.perf_counter() - last_progress_at >= 10
+                        ):
+                            print(
+                                f"[HFCore.finetune] progress | epoch={epoch_idx + 1}/{max(1, epochs)} "
+                                f"| batch={batch_idx}/{max(1, batches_per_epoch)} "
+                                f"| global_batch={global_batch_idx}/{max(1, total_batches)} "
+                                f"| elapsed_s={time.perf_counter() - t_start:.2f}", flush=True,
+                            )
+                            last_progress_at = time.perf_counter()
 
-                supervised_token_count = self._count_supervised_tokens(labels_t, self.label_pad_value)
-                train_supervised_token_count += supervised_token_count
-
-                if isinstance(xb, dict):
-                    sequence_count = len(next(iter(xb.values())))
-                else:
-                    sequence_count = len(xb)
-                train_sequence_count += int(sequence_count)
-
-                if _is_dense_label_tensor(labels_t) and labels_t.ndim >= 2:
-                    loss_denominator_count = supervised_token_count
-                else:
-                    loss_denominator_count = sequence_count
-
-                total_loss += float(loss.detach().cpu().item()) * float(max(1, loss_denominator_count))
-                train_loss_denominator_count += int(max(1, loss_denominator_count))
-
-                step_lat_ms.append((time.time() - t0) * 1000.0)
-                if not first_batch_logged:
-                    print("[HFCore.finetune] first batch step ends")
-                    first_batch_logged = True
-                if progress_log_interval > 0 and (
-                    global_batch_idx == total_batches
-                    or global_batch_idx % progress_log_interval == 0
-                ):
-                    print(
-                        f"[HFCore.finetune] progress | epoch={epoch_idx + 1}/{max(1, epochs)} "
-                        f"| batch={batch_idx}/{max(1, batches_per_epoch)} "
-                        f"| global_batch={global_batch_idx}/{max(1, total_batches)} "
-                        f"| elapsed_s={time.time() - t_start:.2f}"
+                if timeout_hit:
+                    debug_print(
+                        f"[HFCore.finetune] timeout | epoch={epoch_idx + 1}/{max(1, epochs)} "
+                        f"| completed_batches={global_batch_idx}/{max(1, total_batches)} "
+                        f"| elapsed_s={time.perf_counter() - t_start:.2f}"
                     )
-                del outputs, logits, loss, model_inputs, enc, labels_t, extra
-                self._release_step_memory()
-            
-            if timeout_hit:
-                print(
-                    f"[HFCore.finetune] timeout | epoch={epoch_idx + 1}/{max(1, epochs)} "
-                    f"| completed_batches={global_batch_idx}/{max(1, total_batches)} "
-                    f"| elapsed_s={time.time() - t_start:.2f}"
-                )
-                break
+                    break
+                completed_epochs += 1
 
-        duration_s = time.time() - t_start
+        finally:
+            optimizer_obj.zero_grad(set_to_none=True)
+            step_counter.remove()
+
+        duration_s = time.perf_counter() - t_start
         self.model.eval()
-        print(
+        if contrastive and successful_optimizer_step_count == 0:
+            raise ValueError(
+                "no_contrastive_optimizer_updates: training completed without a parameter update; "
+                "check the training budget and AMP skipped-step counts."
+            )
+        debug_print(
             f"[HFCore.finetune] ends | completed_batches={global_batch_idx}/{max(1, total_batches)} "
             f"| duration_s={duration_s:.2f} | timeout_hit={timeout_hit}"
         )
@@ -1041,7 +1223,7 @@ class HFCore:
             # Deprecated legacy aliases retained for downstream consumers expecting the
             # old sample-count fields; these now map to the explicit unit-specific keys.
             "train_samples": int(train_loss_denominator_count),
-            "batch_size": int(self.batch_size),
+            "batch_size": train_batch_size,
             "device": str(self.device),
             "hf_model_id": self.model_id,
             "max_length": int(self.max_length),
@@ -1057,22 +1239,84 @@ class HFCore:
             "hf_weights_format": self.weight_format,
             "train_timeout_s": (None if max_train_time_s is None else float(max_train_time_s)),
             "train_stopped_early": bool(timeout_hit),
+            "completed_training_epochs": completed_epochs,
+            "train_stopping_reason": "resource_limit" if timeout_hit else "epochs_completed",
+            "train_prefetch_batches": prefetch_depth,
             "optimizer": optimizer_name,
             "weight_decay": float(weight_decay),
             "warmup_ratio": float(warmup_ratio),
             "warmup_steps": int(warmup_steps),
-            "gradient_accumulation_steps": int(gradient_accumulation_steps),
             "optimizer_step_count": int(optimizer_step_count),
+            "planned_optimizer_step_count": int(optimizer_steps_total),
+            "successful_optimizer_step_count": int(successful_optimizer_step_count),
+            "skipped_optimizer_step_count": int(optimizer_step_count - successful_optimizer_step_count),
+            "train_fp32_loss_retry_count": int(fp32_loss_retry_count),
+            **memory_state,
+            "gradient_accumulation_steps": memory_state["gradient_accumulation_steps_effective"],
+            "gradient_accumulation": memory_state["gradient_accumulation_steps_effective"],
         }
 
     def eval(self, xs, ys, inference_only=False, max_eval_time_s=None, progress_log_interval=None):
+        from .microbatch import is_device_oom, release_failed_attempt
+        started = time.perf_counter()
+        batch_size = int(self.batch_size)
+        state = {"eval_batch_size_requested": batch_size,
+                 "eval_batch_size_effective": batch_size, "eval_oom_retry_count": 0,
+                 "eval_memory_fallback_applied": False, "eval_fp32_retry_count": 0}
+        self.evaluation_memory_metadata = state
+        while True:
+            remaining = (None if max_eval_time_s is None
+                         else float(max_eval_time_s) - (time.perf_counter() - started))
+            if remaining is not None and remaining <= 0:
+                raise TimeoutError("HF evaluation exhausted its time budget during OOM recovery")
+            try:
+                loss, primary, secondary, qos = self._eval_once(
+                    xs, ys, inference_only, remaining, progress_log_interval,
+                    batch_size=state["eval_batch_size_effective"],
+                )
+                elapsed = time.perf_counter() - started
+                qos.update(state)
+                qos["eval_total_time_s"] = elapsed
+                qos["eval_throughput_eps"] = qos["eval_sequence_count"] / max(elapsed, 1e-9)
+                qos["tokens_per_second"] = qos["eval_supervised_token_count"] / max(elapsed, 1e-9)
+                return loss, primary, secondary, qos
+            except Exception as exc:
+                if (
+                    isinstance(exc, ValueError)
+                    and str(exc).startswith(("nonfinite_evaluation_logits:", "nonfinite_evaluation_loss:"))
+                    and getattr(self, "autocast_enabled", False)
+                ):
+                    # Discard all partial metrics and replay within the original
+                    # budget, using FP32 consistently for the entire evaluation.
+                    release_failed_attempt(self, exc)
+                    self._fallback_to_fp32("nonfinite_evaluation_fallback_fp32")
+                    state["eval_fp32_retry_count"] += 1
+                    print("[HFCore.eval] nonfinite result: restarting evaluation in FP32", flush=True)
+                    continue
+                if not is_device_oom(exc) or state["eval_batch_size_effective"] <= 1:
+                    raise
+                release_failed_attempt(self, exc)
+                old = state["eval_batch_size_effective"]
+                state["eval_batch_size_effective"] = max(1, old // 2)
+                state["eval_oom_retry_count"] += 1
+                state["eval_memory_fallback_applied"] = True
+                print(f"[HFCore.eval] OOM retry | batch_size={old}->{state['eval_batch_size_effective']}", flush=True)
+
+    def _eval_once(self, xs, ys, inference_only=False, max_eval_time_s=None,
+                   progress_log_interval=None, *, batch_size=None):
         torch = self.torch
+        batch_size = int(self.batch_size if batch_size is None else batch_size)
+        # Quality for encoder-decoder tasks must use source-only generation,
+        # even after fine-tuning. A separate teacher forward supplies the loss.
+        if self.task_spec.name == "seq2seq_generation":
+            inference_only = True
 
         def _is_dense_label_tensor(value):
             return hasattr(value, "ndim") and not isinstance(value, (list, tuple, dict))
 
         y_true = ys
         self.model.eval()
+        prefetch_depth = self._batch_prefetch_depth(xs)
 
         latencies_ms = []
         total_loss = 0.0
@@ -1087,12 +1331,13 @@ class HFCore:
             eval_sequence_count = len(next(iter(xs.values())))
         else:
             eval_sequence_count = len(xs)
-        eval_batch_count = int(np.ceil(float(eval_sequence_count) / float(max(1, self.batch_size)))) if eval_sequence_count else 0
+        eval_batch_count = int(np.ceil(float(eval_sequence_count) / float(max(1, batch_size)))) if eval_sequence_count else 0
 
-        t_start = time.time()
+        t_start = time.perf_counter()
 
         last_extra = {}
-        eval_batch_count = int((eval_sequence_count + max(1, self.batch_size) - 1) / max(1, self.batch_size))
+        last_progress_at = t_start
+        eval_batch_count = int((eval_sequence_count + max(1, batch_size) - 1) / max(1, batch_size))
         progress_log_interval = int(progress_log_interval) if progress_log_interval is not None else 0
         max_eval_time_s = float(max_eval_time_s) if max_eval_time_s is not None else None
         progress_log_every = max(
@@ -1100,22 +1345,24 @@ class HFCore:
             min(25, eval_batch_count // 4 if eval_batch_count > 4 else eval_batch_count or 1),
         )
 
-        print(
+        debug_print(
             f"[HFCore.eval] dataloader creation starts | inference_only={bool(inference_only)} "
-            f"| batch_size={self.batch_size} | eval_sequence_count={eval_sequence_count} | eval_batch_count={eval_batch_count}"
+            f"| batch_size={batch_size} | eval_sequence_count={eval_sequence_count} | eval_batch_count={eval_batch_count}"
         )
         first_batch_logged = False
 
-        with torch.no_grad():
-            for batch_idx, (xb, yb) in enumerate(self._batch_iter(xs, y_true), start=1):
+        with torch.no_grad(), prefetch_batches(
+            self._batch_iter(xs, y_true, batch_size=batch_size), depth=prefetch_depth
+        ) as batches:
+            for batch_idx, (xb, yb) in enumerate(batches, start=1):
                 if not first_batch_logged:
-                    print("[HFCore.eval] first batch pulled")
-                if max_eval_time_s is not None and (time.time() - t_start) > max_eval_time_s:
+                    debug_print("[HFCore.eval] first batch pulled")
+                if max_eval_time_s is not None and (time.perf_counter() - t_start) > max_eval_time_s:
                     raise TimeoutError(
                         f"HF evaluation exceeded max_eval_time_s={max_eval_time_s} "
                         f"after batch {batch_idx - 1}/{eval_batch_count}"
                     )
-                t0 = time.time()
+                t0 = time.perf_counter()
                 labels_recorded = False
 
                 enc, labels_t, extra = self.task_spec.encode_batch(
@@ -1155,7 +1402,7 @@ class HFCore:
                 if bool(inference_only) and bool(getattr(self.task_spec, "supports_generation", False)):
                     self._ensure_left_padding_for_decoder_only_generation()
                     if not first_batch_logged:
-                        print("[HFCore.eval] model forward starts")
+                        debug_print("[HFCore.eval] model forward starts")
                     with self._generation_inference_mode():
                         def _generate():
                             pred_t = self.task_spec.generate_predictions(
@@ -1168,8 +1415,13 @@ class HFCore:
                             return pred_t
 
                         pred_t = self._run_with_precision_context(_generate)
+                    if self.task_spec.name == "seq2seq_generation" and (
+                        pred_t is None or getattr(pred_t, "ndim", 0) != 2
+                        or pred_t.shape[0] != len(enc["input_ids"]) or pred_t.shape[1] == 0
+                    ):
+                        raise ValueError("invalid_evaluation_predictions: generation must return tokens for every source")
                     if not first_batch_logged:
-                        print("[HFCore.eval] first batch forward ends")
+                        debug_print("[HFCore.eval] first batch forward ends")
                     if hasattr(pred_t, "detach"):
                         preds_all.append(self._tensor_to_numpy(pred_t))
                     else:
@@ -1188,6 +1440,13 @@ class HFCore:
                             return outputs, logits
 
                         outputs, logits = self._run_with_precision_context(_teacher_forward)
+                        if self.task_spec.name == "seq2seq_generation" and (
+                            logits is None or logits.ndim != 3
+                            or tuple(logits.shape[:2]) != tuple(teacher_labels_t.shape)
+                        ):
+                            raise ValueError("invalid_evaluation_alignment: logits must align to all reference positions")
+                        loss = self.task_spec.extract_loss(torch, outputs, logits, teacher_labels_t, teacher_extra)
+                        self._validate_eval_tensors(logits, loss, require_loss=True)
                         stat = self.task_spec.batch_metric_statistics(torch, logits, teacher_labels_t, teacher_extra)
                         if stat:
                             stats_accum = self._accumulate_metric_statistics(stats_accum, stat)
@@ -1210,7 +1469,7 @@ class HFCore:
                 else:
                     model_inputs = self.task_spec.build_forward_inputs(enc, labels_t=labels_t, inference_only=bool(inference_only))
                     if not first_batch_logged:
-                        print("[HFCore.eval] model forward starts")
+                        debug_print("[HFCore.eval] model forward starts")
                     def _eval_forward():
                         outputs = self.model(**model_inputs)
                         logits = self._extract_logits(outputs)
@@ -1218,8 +1477,9 @@ class HFCore:
                         return outputs, logits, pred_t
 
                     outputs, logits, pred_t = self._run_with_precision_context(_eval_forward)
+                    self._validate_eval_tensors(logits)
                     if not first_batch_logged:
-                        print("[HFCore.eval] first batch forward ends")
+                        debug_print("[HFCore.eval] first batch forward ends")
                     if hasattr(pred_t, "detach"):
                         preds_all.append(self._tensor_to_numpy(pred_t))
                     else:
@@ -1235,8 +1495,9 @@ class HFCore:
                         if stat_out:
                             stats_accum = self._accumulate_metric_statistics(stats_accum, stat_out)
 
-                    if not bool(inference_only):
+                    if not bool(inference_only) and self.task_spec.name != "text_image_retrieval":
                         loss = self.task_spec.extract_loss(torch, outputs, logits, labels_t, extra)
+                        self._validate_eval_tensors(logits, loss, require_loss=labels_t is not None)
                         if loss is not None and labels_t is not None:
                             labels_all.append(self._labels_to_numpy(labels_t))
                             labels_recorded = True
@@ -1256,22 +1517,30 @@ class HFCore:
                 if labels_t is not None and bool(inference_only) and yb is not None and not labels_recorded:
                     labels_all.append(self._labels_to_numpy(labels_t))
 
-                latencies_ms.append((time.time() - t0) * 1000.0)
+                latencies_ms.append((time.perf_counter() - t0) * 1000.0)
                 if eval_batch_count and (
                     batch_idx == 1
                     or batch_idx == eval_batch_count
                     or batch_idx % progress_log_every == 0
+                    or (progress_log_interval > 0 and time.perf_counter() - last_progress_at >= 10)
                 ):
-                    progress_units_done = min(batch_idx * self.batch_size, eval_sequence_count)
+                    progress_units_done = min(batch_idx * batch_size, eval_sequence_count)
                     progress_units_label = (
                         "examples_done" if self._has_metric_statistics(stats_accum) else "sequences_done"
                     )
-                    print(
+                    visible = progress_log_interval > 0 and (
+                        batch_idx == 1 or batch_idx == eval_batch_count
+                        or time.perf_counter() - last_progress_at >= 10
+                    )
+                    emit = print if visible else debug_print
+                    emit(
                         "[HFCore.eval] progress | "
                         f"batch={batch_idx}/{eval_batch_count} | "
                         f"{progress_units_label}={progress_units_done}/{eval_sequence_count} | "
-                        f"last_batch_ms={latencies_ms[-1]:.2f}"
+                        f"last_batch_ms={latencies_ms[-1]:.2f}", flush=True,
                     )
+                    if visible:
+                        last_progress_at = time.perf_counter()
                 first_batch_logged = True
                 del enc, labels_t, extra
                 if 'outputs' in locals():
@@ -1286,9 +1555,8 @@ class HFCore:
                     del model_inputs
                 if 'teacher_forced' in locals():
                     del teacher_forced
-                self._release_step_memory()
 
-        duration_s = time.time() - t_start
+        duration_s = time.perf_counter() - t_start
 
         y_true_np = self._concat_or_pad_batches(
             labels_all,
@@ -1347,20 +1615,27 @@ class HFCore:
             if eval_loss_denominator_count > 0
             else np.nan
         )
+        retrieval_loss_candidates = None
+        if self.task_spec.name == "text_image_retrieval" and not inference_only:
+            loss_mean, retrieval_loss_candidates = self.task_spec.pooled_evaluation_loss(
+                torch, stats_accum, self.model)
+            eval_loss_denominator_count = retrieval_loss_candidates
+            # Include pooled loss calculation in evaluation runtime.
+            duration_s = time.perf_counter() - t_start
 
         stats_summary = self._metric_statistics_summary(stats_accum)
         m_stats = self.task_spec.metrics_from_statistics(stats_accum) if self._has_metric_statistics(stats_accum) else None
         metric_start = None
         metric_mode = None
         if isinstance(m_stats, dict) and m_stats:
-            metric_start = time.time()
+            metric_start = time.perf_counter()
             metric_mode = "statistics"
-            print("[HFCore.eval] metric computation starts | mode=statistics", flush=True)
+            debug_print("[HFCore.eval] metric computation starts | mode=statistics", flush=True)
             primary = float(m_stats.get("primary", np.nan))
             secondary = float(m_stats.get("secondary", np.nan))
             named_metrics = m_stats.get("named_metrics") if isinstance(m_stats, dict) else None
         elif y_true_np.size == 0 or y_pred_np.size == 0:
-            print(
+            debug_print(
                 "[HFCore.eval] metric computation skipped | "
                 f"reason=empty_arrays | y_true_size={y_true_np.size} | y_pred_size={y_pred_np.size}",
                 flush=True,
@@ -1368,9 +1643,9 @@ class HFCore:
             primary = np.nan
             secondary = np.nan
         else:
-            metric_start = time.time()
+            metric_start = time.perf_counter()
             metric_mode = "arrays"
-            print(
+            debug_print(
                 "[HFCore.eval] metric computation starts | "
                 f"mode=arrays | y_true_shape={getattr(y_true_np, 'shape', None)} "
                 f"| y_pred_shape={getattr(y_pred_np, 'shape', None)}",
@@ -1393,10 +1668,10 @@ class HFCore:
                     secondary = np.nan
 
         if metric_start is not None:
-            print(
+            debug_print(
                 "[HFCore.eval] metric computation ends | "
                 f"mode={metric_mode} | primary={primary} | secondary={secondary} "
-                f"| metric_s={time.time() - metric_start:.2f}",
+                f"| metric_s={time.perf_counter() - metric_start:.2f}",
                 flush=True,
             )
 
@@ -1429,6 +1704,7 @@ class HFCore:
             **self._qos_startup(),
             "eval_sequence_count": int(eval_sequence_count),
             "eval_batch_count": int(eval_batch_count),
+            "eval_prefetch_batches": prefetch_depth,
             "eval_supervised_token_count": int(eval_supervised_token_count),
             "tokens_total": int(eval_supervised_token_count),
             "tokens_per_second": token_throughput,
@@ -1453,6 +1729,10 @@ class HFCore:
         }
         if metric_instance_count is not None:
             qos["metric_instance_count"] = int(metric_instance_count)
+        if retrieval_loss_candidates is not None:
+            qos.update(evaluation_loss_protocol="pooled_symmetric_contrastive_v1",
+                       eval_loss_candidate_count=retrieval_loss_candidates,
+                       eval_loss_denominator_count=eval_loss_denominator_count)
         if model_num_labels is not None:
             qos["model_num_labels"] = int(model_num_labels)
         if dataset_label_count is not None:
@@ -1475,6 +1755,9 @@ class HFCore:
 
         if getattr(self.task_spec, "supports_generation", False):
             qos.update({f"generation_{k}": v for k, v in self.generation_config.items()})
+        if self.task_spec.name == "seq2seq_generation":
+            qos["evaluation_protocol"] = "source_only_generation_v1"
+            qos["evaluation_loss_protocol"] = "teacher_forced_v1"
 
         return loss_mean, primary, secondary, qos
     

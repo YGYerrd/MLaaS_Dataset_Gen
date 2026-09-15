@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mlaas.example/schema/composition-request.v2.json",
+  "title": "Versioned collaborative composition request",
+  "type": "object",
+  "required": [
+    "request_id",
+    "request_schema_version",
+    "composition_type",
+    "compatibility_mode",
+    "compatibility_requirements",
+    "functional_requirements",
+    "qos_requirements",
+    "hard_constraints",
+    "composition_size",
+    "preference_weights",
+    "constraint_penalties"
+  ],
+  "properties": {
+    "request_id": {"type": "string", "minLength": 1},
+    "request_schema_version": {"const": "2.0.0"},
+    "composition_type": {"const": "collaborative"},
+    "compatibility_mode": {"enum": ["functional", "strict"]},
+    "compatibility_requirements": {"type": ["object", "string"]},
+    "eligible_pool_snapshot_hash": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "functional_requirements": {"type": ["object", "string"]},
+    "qos_requirements": {"type": ["object", "string"]},
+    "hard_constraints": {"type": ["object", "string"]},
+    "composition_size": {"type": "integer", "minimum": 1},
+    "preference_weights": {"type": ["object", "string"]},
+    "constraint_penalties": {"type": ["object", "string"]},
+    "request_profile_id": {"type": "string"},
+    "principle_id": {"type": "string"},
+    "generation_seed": {"type": "integer"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"compatibility_mode": {"const": "strict"}}},
+      "then": {"required": ["eligible_pool_snapshot_hash"]}
+    }
+  ],
+  "additionalProperties": true
+}

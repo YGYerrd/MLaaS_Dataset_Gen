@@ -1,3 +1,4 @@
+from ...clients.capacity import SYNTHETIC_SAMPLE_COUNT
 import importlib
 import numpy as np
 from sklearn.model_selection import train_test_split
@@ -80,7 +81,7 @@ def load_sklearn_source(name, task, test_size=0.2, seed=42):
     if name == "synthetic":
         if task == "regression":
             X, y = make_regression(
-                n_samples=2000,
+                n_samples=SYNTHETIC_SAMPLE_COUNT,
                 n_features=20,
                 n_informative=12,
                 noise=0.2,
@@ -104,7 +105,7 @@ def load_sklearn_source(name, task, test_size=0.2, seed=42):
 
         if task == "clustering":
             X, y = make_blobs(
-                n_samples=2000,
+                n_samples=SYNTHETIC_SAMPLE_COUNT,
                 n_features=12,
                 centers=5,
                 cluster_std=1.4,

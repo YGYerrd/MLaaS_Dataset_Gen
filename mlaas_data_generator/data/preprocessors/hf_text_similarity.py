@@ -61,6 +61,14 @@ def _encode_categorical_targets(train_labels, test_labels, label_feat):
     if ClassLabel is not None and isinstance(label_feat, ClassLabel):
         num_classes = int(label_feat.num_classes)
         label_mapping = {str(name): int(i) for i, name in enumerate(getattr(label_feat, "names", []))}
+        # ClassLabel integers already index the declared schema. Re-encoding in
+        # encounter order can reverse their meaning or reject a held-out class.
+        def encode(labels):
+            indices = [label_feat.str2int(value) if isinstance(value, str) else int(value) for value in labels]
+            if any(index < 0 or index >= num_classes for index in indices):
+                raise ValueError("Sentence-pair label is outside the dataset ClassLabel contract")
+            return np.asarray(indices, dtype="int32")
+        return encode(train_labels), encode(test_labels), num_classes, label_mapping
 
     uniq = {}
     y_train = []
@@ -136,6 +144,16 @@ def preprocess_hf_text_similarity(
         )
         y_min = y_max = None
         norm_mode = None
+
+    # Preserve the full-pool target normalization and label vocabulary.
+    from ..tokenization_selection import select_training_rows
+    selection_meta = attach_label_schema({**meta, "hf_task": "sentence_similarity",
+        "task_type": "regression" if is_regression else "classification",
+        "num_classes": num_classes, "label_mapping": label_mapping,
+        "label_granularity": "pair_sequence", "is_regression": bool(is_regression)},
+        y_train, default_num_labels=num_classes)
+    ds_train, y_train, meta = select_training_rows(ds_train, y_train, selection_meta,
+                                                  dynamic_padding=dynamic_padding)
 
     try:
         from transformers import AutoTokenizer

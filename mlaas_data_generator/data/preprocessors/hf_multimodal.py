@@ -1,3 +1,5 @@
+
+from mlaas_data_generator.terminal import debug_print
 from ..accounting import append_accounting_stage, finalize_accounting
 from ..hf_cache_paths import (
     load_image_from_bytes,
@@ -518,9 +520,11 @@ def _validate_pair_alignment(ds, *, image_column, text_column, split_name, missi
     report = {
         "split": split_name,
         "missing_pair_rows": len(missing_pairs),
+        "input_rows": len(ds),
         "decode_error_rows": len(decode_error_rows),
         "aligned_rows": len(valid_indices),
         "output_rows": len(filtered),
+        "accepted_positions": valid_indices,
         "policy": missing_pair_handling,
     }
     return filtered, report
@@ -547,6 +551,7 @@ def _encode_split(
     caption_lengths = []
     image_sizes = []
     decode_errors = []
+    accepted_positions = []
     image_target_hw = _resolve_image_target_hw(image_processor)
 
     def _process_image(image_value):
@@ -632,6 +637,7 @@ def _encode_split(
             continue
 
         input_ids.append(ids)
+        accepted_positions.append(idx)
         attention_masks.append(mask)
         pixel_values.append(pix)
         if hf_task == "text_image_retrieval":
@@ -670,6 +676,7 @@ def _encode_split(
         "policy": on_decode_error,
         "failed": len(decode_errors),
         "survived": len(input_ids),
+        "accepted_positions": accepted_positions,
     }
     if report_decode_errors:
         report["errors"] = decode_errors
@@ -798,7 +805,7 @@ def preprocess_hf_multimodal(
     image_processor_timer = time.perf_counter()
     image_processor = AutoImageProcessor.from_pretrained(hf_model_id)
     image_processor_load_s = float(time.perf_counter() - image_processor_timer)
-    print(
+    debug_print(
         f"[ServiceTiming] model={hf_model_id} | stage=image processor load | elapsed_s={image_processor_load_s:.3f}",
         flush=True,
     )
@@ -840,7 +847,7 @@ def preprocess_hf_multimodal(
         report_decode_errors=bool(report_decode_errors),
     )
     train_encode_s = float(time.perf_counter() - train_encode_timer)
-    print(
+    debug_print(
         f"[ServiceTiming] model={hf_model_id} | stage=multimodal encode train | elapsed_s={train_encode_s:.3f} "
         f"| samples={train_survived}",
         flush=True,
@@ -860,12 +867,18 @@ def preprocess_hf_multimodal(
         report_decode_errors=bool(report_decode_errors),
     )
     test_encode_s = float(time.perf_counter() - test_encode_timer)
-    print(
+    debug_print(
         f"[ServiceTiming] model={hf_model_id} | stage=multimodal encode test | elapsed_s={test_encode_s:.3f} "
         f"| samples={test_survived}",
         flush=True,
     )
 
+    from ..tokenization_selection import select_metadata
+    for split, alignment, decoded in (("train", train_report, train_decode_report), ("test", test_report, test_decode_report)):
+        positions = [alignment["accepted_positions"][i] for i in decoded["accepted_positions"]]
+        meta = select_metadata(meta, positions, alignment["input_rows"], split=split)
+        if split == "train":
+            meta["accepted_train_positions"] = positions
     vqa_meta = {}
     if hf_task == "visual_question_answering":
         if bool(meta.get("inference_only")):
@@ -880,20 +893,21 @@ def preprocess_hf_multimodal(
         vqa_meta["vqa_unseen_answer_policy"] = str(vqa_unseen_answer_policy or "ignore").strip().lower()
 
         if resolved_vqa_mode == "classification":
+            source_answers = meta.get("_vqa_source_answers", y_train)
             model_label2id, model_id2label = _config_label_maps(model_config)
             model_train_labels, model_train_unseen = (
-                _encode_vqa_class_labels(y_train, model_label2id, unseen_policy="ignore")
+                _encode_vqa_class_labels(source_answers, model_label2id, unseen_policy="ignore")
                 if model_label2id
-                else (None, len(y_train))
+                else (None, len(source_answers))
             )
-            use_model_vocab = bool(model_label2id) and model_train_labels is not None and int(model_train_unseen) < len(y_train)
+            use_model_vocab = bool(model_label2id) and model_train_labels is not None and int(model_train_unseen) < len(source_answers)
             if use_model_vocab:
                 label2id = model_label2id
                 id2label = model_id2label
                 vocab_source = "model_config"
             else:
                 label2id, id2label, answer_counts = _build_vqa_train_vocab(
-                    y_train,
+                    source_answers,
                     max_vocab_size=vqa_answer_vocab_size,
                 )
                 vocab_source = "train_split"

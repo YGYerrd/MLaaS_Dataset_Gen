@@ -1,0 +1,2 @@
+# Optional: install only to rebuild the PowerPoint deck
+python-pptx>=1.0,<2

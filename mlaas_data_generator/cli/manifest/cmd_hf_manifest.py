@@ -7,7 +7,7 @@ import pandas as pd
 
 from mlaas_data_generator.config import DEFAULT_MANIFEST_PATH
 
-from .hf_manifest_builder import MANIFEST_PROFILES, RESOURCE_TIERS, build_hf_manifest, save_manifest
+from .hf_manifest_builder import MANIFEST_PROFILES, build_hf_manifest, save_manifest
 
 
 def _parse_csv_arg(value: str | list[str] | None) -> list[str] | None:
@@ -48,6 +48,8 @@ def register_hf_manifest(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument("--input-json", help="Optional HF audit JSON used only for metadata enrichment")
     p.add_argument("--output", default=str(DEFAULT_MANIFEST_PATH), help="Output .csv or .xlsx path")
     p.add_argument("--sheet", default="services", help="Sheet name for xlsx output")
+    p.add_argument("--manifest-format", choices=("review", "expanded"), default="review",
+                   help="Compact client review table (default), or legacy expanded rows")
     p.add_argument(
         "--task-keys",
         nargs="+",
@@ -61,16 +63,33 @@ def register_hf_manifest(subparsers: argparse._SubParsersAction) -> None:
         nargs="+",
         help="Training regimes. Accepts comma-separated values, space-separated values, or both.",
     )
-    p.add_argument("--dataset-variants-per-pair", type=int, default=1)
-    p.add_argument("--split-variants-per-pair", type=int, default=1)
-    p.add_argument("--knob-variants-per-pair", type=int, default=1)
+    p.add_argument("--dataset-variants-per-pair", type=int)
+    p.add_argument("--split-variants-per-pair", type=int)
+    p.add_argument("--knob-variants-per-pair", type=int)
+    p.add_argument("--clients-per-family", type=int, help="Training recipes per model/dataset/task contract (default: 100; mutually exclusive with variant counts)")
+    p.add_argument("--initialization-seed", type=int, help="Optional initialization override; defaults to --seed.")
+    p.add_argument("--evaluation-seed", type=int, help="Optional evaluation override; defaults to --seed.")
+    p.add_argument("--heterogeneity-intensity", type=float, default=0.5,
+                   help="Shared client distribution skew intensity in [0,1] (default: 0.5)")
     p.add_argument("--total-services", type=int, help="Total service rows to emit")
+    p.add_argument("--regression-support-policy", choices=("general", "specialist"), default="general",
+                   help="General regressors cover outer target bins; specialist preserves restricted support")
+    p.add_argument("--min-target-bin-fraction", type=float, default=0.6,
+                   help="Minimum target-bin coverage for general regressors in [0.6,1]")
+    p.add_argument("--timeout-s", type=int, default=1800, help="Per-service timeout in seconds")
+    p.add_argument("--max-train-time-s", type=int, default=120, help="Training time budget in seconds")
+    p.add_argument("--max-eval-time-s", type=int, default=120, help="Evaluation time budget in seconds")
     p.add_argument("--manifest-profile", choices=sorted(MANIFEST_PROFILES), default="balanced")
-    p.add_argument("--resource-tier", choices=sorted(RESOURCE_TIERS), help="Workload budget. Defaults from --manifest-profile.")
-    p.add_argument("--avg-sample-size", type=int, help="Target average max_samples across emitted service rows")
+    p.add_argument("--average-samples", "--avg-sample-size", dest="avg_sample_size", type=int,
+                   help="Average client sample count; fixed +/-75% stratified spread")
     p.add_argument("--exclude-failures-csv", help="Drop manifest rows matching known failures from this CSV")
-    p.add_argument("--seed", type=int, help="Optional seed. Omit for a fresh randomized manifest on each run.")
-
+    p.add_argument("--seed", type=int, help="Global seed for recipes, initialization, evaluation, and derived client seeds. Omit to generate and record a fresh seed.")
+    p.add_argument(
+        "--generation-mode",
+        choices=("independent",),
+        default="independent",
+        help="Independent services from a frozen base. Existing trained parents remain available through cohort-manifest.",
+    )
     def _run(args: argparse.Namespace) -> None:
         df = build_hf_manifest(
             json_path=args.input_json,
@@ -84,16 +103,28 @@ def register_hf_manifest(subparsers: argparse._SubParsersAction) -> None:
             total_services=args.total_services,
             seed=args.seed,
             manifest_profile=args.manifest_profile,
-            resource_tier=args.resource_tier,
+            timeout_s=args.timeout_s, max_train_time_s=args.max_train_time_s, max_eval_time_s=args.max_eval_time_s,
             avg_sample_size=args.avg_sample_size,
             max_models_per_family=args.max_models_per_family,
+            generation_mode=args.generation_mode,
+            clients_per_family=args.clients_per_family,
+            initialization_seed=args.initialization_seed,
+            evaluation_seed=args.evaluation_seed,
+            heterogeneity_intensity=args.heterogeneity_intensity,
+            regression_support_policy=args.regression_support_policy,
+            min_target_bin_fraction=args.min_target_bin_fraction,
         )
         before_filter = len(df)
         df = drop_known_failure_rows(df, args.exclude_failures_csv)
         output_path = Path(args.output)
-        save_manifest(df, output_path, sheet_name=args.sheet)
+        save_manifest(df, output_path, sheet_name=args.sheet, manifest_format=args.manifest_format)
         dropped = before_filter - len(df)
+        excluded = df.attrs.get("family_preflight_exclusions", [])
+        if excluded:
+            print(f"Family preflight excluded {len(excluded)} incompatible dataset contracts; details: {output_path.with_suffix('.preflight.json')}")
         suffix = f", dropped {dropped} known-failure rows" if dropped else ""
-        print(f"Wrote {len(df)} service rows to {output_path}{suffix}")
+        families = df.groupby(["hf_model_id", "dataset_name", "dataset_config", "hf_task", "training_regime"], dropna=False).size()
+        print(f"Wrote {len(df)} service rows across {len(families)} planned contracts to {output_path}{suffix}")
+        print(families.to_string())
 
     p.set_defaults(_handler=_run)

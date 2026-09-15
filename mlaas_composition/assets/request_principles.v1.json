@@ -1,0 +1,11 @@
+{
+  "schema_version": "1.0.0",
+  "library_id": "request_principles.v1",
+  "principles": {
+    "feasible_reference_bounds_v1": {
+      "description": "Sample a compatible reference group, then derive feasible hard and composition-level QoS bounds from it.",
+      "minimum_target_multiplier": [0.8, 1.0],
+      "maximum_target_multiplier": [1.0, 1.25]
+    }
+  }
+}

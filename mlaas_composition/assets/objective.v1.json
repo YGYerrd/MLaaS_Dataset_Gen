@@ -1,0 +1,18 @@
+{
+  "objective_version": "collaborative_objective.v1",
+  "scope": "collaborative composition only",
+  "utility_range": [0.0, 1.0],
+  "dimensions": [
+    {"request_weight": "data_parameters", "score": "data_parameter_compatibility", "direction": "higher_better"},
+    {"request_weight": "model_parameters", "score": "model_parameter_alignment", "direction": "higher_better"},
+    {"request_weight": "compute_time", "score": "compute_time_compatibility", "direction": "higher_better"},
+    {"request_weight": "latency", "score": "latency_feasibility", "direction": "higher_better"},
+    {"request_weight": "accuracy", "score": "accuracy_compatibility", "direction": "higher_better"},
+    {"request_weight": "reliability", "score": "reliability_compatibility", "direction": "higher_better"},
+    {"request_weight": "explainability", "score": "explainability_score", "direction": "higher_better"},
+    {"request_weight": "resource_cost", "score": "cost_efficiency", "direction": "higher_better"}
+  ],
+  "penalty": "weighted mean of squared, normalized one-sided QoS-target violations",
+  "final_utility": "clip(weighted_dimension_mean - penalty, 0, 1)",
+  "reference_interpretation": "An exhaustive reference is exact only for this frozen surrogate objective and the stated candidate space."
+}

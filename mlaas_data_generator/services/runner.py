@@ -1,11 +1,25 @@
 from __future__ import annotations
 
+from ..clients.legacy import (
+    _canonical_split_strategy, _stable_sample_seed, _sample_service_rows,
+    _strategy_sample_indices, _counts_from_weights, _take_rows,
+    _sample_count, _to_float, _safe_int,
+)
+from ..clients.partitioning import SUPPORTED_PARTITION_VERSIONS
+
+from mlaas_data_generator.terminal import (
+    debug_print, debug_enabled, terminal_scope,
+    print_results, print_partition_notices, print_service_summary,
+)
+
 import hashlib
 import json
 import math
 import os
+import random
 import time
 import traceback
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Mapping
@@ -23,12 +37,40 @@ from ..data.distributions import (
 )
 from ..data.skew_axes import axis_supports_strategy, bucket_distribution, resolve_skew_axis
 from ..models.label_schema import infer_label_format, infer_num_labels
-from ..models.train_eval import evaluate_model, train_local_model
-from ..federated.update_signature import compute_and_store_update_signature
+from ..models.train_eval import evaluate_model, evaluate_regression_model, train_local_model, resolve_fit_kwargs
+from .update_signature import compute_and_store_update_signature
 from ..storage.writer import make_writer
+from ..checkpoint_profile import CheckpointProfile
+from ..checkpoint_store import (
+    TENSOR_PATCH_FORMAT,
+    TENSOR_STATE_FORMAT,
+    CheckpointStoreError,
+    CompressionSpec,
+    ContentObjectRef,
+    LineageBaseResult,
+    ServicePatchResult,
+    TensorState,
+    UnsupportedTensorStateError,
+    capture_model_tensor_state,
+    capture_model_tensor_state_or_fallback,
+    ensure_lineage_base,
+    persist_service_patch,
+    persist_service_patch_from_base_state,
+    restore_model_tensor_state,
+)
+from ..provenance import (
+    PROVENANCE_VERSION, dataset_metadata, label_semantics, model_identity,
+    parameter_schema, preprocessing_metadata, runtime_provenance,
+    restore_lineage_initial_weights, restore_model_artifact, save_model_artifact,
+    save_reconstruction_support_artifacts, sha256_file, sha256_json, write_json_artifact,
+)
 from .perturbation import run_perturbation_stage
 from .system_metrics import ResourceTracker, capture_hardware_snapshot
-from .taxonomy import canonical_label_format, canonical_metric_names, canonical_task_family, metric_domain, metric_score_value
+from .taxonomy import (
+    canonical_label_format, canonical_metric_names, canonical_task_family,
+    metric_domain, metric_score_value,
+)
+from ..models.builders import prepare_keras_local_update
 
 load_dataset = None
 create_model = None
@@ -41,12 +83,22 @@ class ServiceExecutionResult:
     db_path: str
     metrics: dict[str, Any]
     error: str | None = None
+    weights_saved: bool = False
+    final_tensor_state: TensorState | None = None
+    checkpoint_storage: dict[str, Any] | None = None
 
 
 class ServiceExecutionError(RuntimeError):
     def __init__(self, message: str, *, failure_stage: str = "service_execution"):
         super().__init__(message)
         self.failure_stage = failure_stage
+
+
+def _checkpoint_profile_metrics(profile: CheckpointProfile) -> dict[str, Any]:
+    return {
+        f"checkpoint_{name}_s": _metric(step["inclusive_s"], "runtime", "s", "lower_better")
+        for name, step in profile.as_dict()["steps"].items()
+    }
 
 
 class _StageTimer:
@@ -90,36 +142,128 @@ def resolve_service_id(config: Mapping[str, Any]) -> str:
     return f"{prefix}_{digest}"
 
 
+from ..diagnostic_json import diagnostic_json, bounded_text
+from ..execution_state import persist_terminal, execution_owner
+
+
 class ServiceRunner:
     def __init__(self, config: Mapping[str, Any]):
+        config = dict(config or {})
         self.config = dict(CONFIG)
         self.config.update(dict(config or {}))
+        self.config.pop("max_samples", None)
+        from ..execution_provenance import configuration_evidence
+        self._requested_configuration = configuration_evidence(self.config)
+        from ..task_contract import resolve_sentence_pair_contract
+        resolve_sentence_pair_contract(self.config)
+        from ..precision_policy import apply_precision_policy
+        apply_precision_policy(self.config)
+        from ..segmentation_policy import apply_segmentation_label_policy
+        apply_segmentation_label_policy(self.config)
+        # Saved configurations predating these options retain their exact policy.
+        # New manifest generation freezes the current CONFIG explicitly.
+        for key, legacy in (("checkpoint_patch_operation_policy", "adaptive"),
+                            ("checkpoint_measure_full", True), ("checkpoint_weight_format", "native")):
+            self.config[key] = config.get(key, legacy)
+        storage_options = config.get("checkpoint_storage_options") or {}
+        if not isinstance(storage_options, Mapping) or any(not key.startswith("checkpoint_") or key not in CONFIG for key in storage_options):
+            raise ValueError("checkpoint_storage_options must contain supported checkpoint settings only")
+        self.config.update(storage_options)
+        from ..weight_precision import normalize_weight_format
+        self.config["checkpoint_weight_format"] = normalize_weight_format(self.config["checkpoint_weight_format"])
         self.config["device"] = _normalize_requested_device(self.config.get("device"))
         self.service_id = resolve_service_id(self.config)
+        from ..debug_mode import apply_debug_mode, debug_mode_error
+        self.config["service_id"] = self.service_id
+        apply_debug_mode(self.config)
+        self.service_id = self.config["service_id"]
+        if error := debug_mode_error(self.config):
+            raise ValueError(error)
 
+    @terminal_scope(lambda self: self.config)
     def run(self) -> ServiceExecutionResult:
         service_id = self.service_id
         db_path = str(self.config.get("db_path") or CONFIG["db_path"])
         started_at = datetime.now(timezone.utc).isoformat()
-        t0 = time.perf_counter()
-        writer = make_writer("sqlite", db_path=db_path)
-        writer.start()
+        t0 = self.config.get("_client_started_perf", time.perf_counter())
+        self._final_tensor_state = None
+        self._resource_tracker = None
+        self._checkpoint_profile = None
+        writer = None
+        self.config["_execution_started_at"] = started_at
+        self.config["_execution_owner"] = execution_owner()
 
         try:
-            record, metrics, artifacts, split_provenance_rows = self._execute_service(started_at=started_at)
+            self._persist_progress("executing", started_at=started_at)
+            _resolve_hf_revisions(self.config)
+            record, metrics, artifacts, split_provenance_rows, generation_provenance = self._execute_service(started_at=started_at)
+            from ..execution_provenance import evidence_value, execution_document
+            generation_evidence = evidence_value(generation_provenance)
             db_timer = _StageTimer()
+            writer = make_writer("sqlite", db_path=db_path)
+            writer.start()
             writer.write_service(record)
             writer.write_service_metrics(service_id, metrics)
             for row in split_provenance_rows:
                 writer.write_service_split_provenance(service_id, **row)
             for artifact in artifacts:
                 writer.write_service_artifact(service_id, **artifact)
-            db_write_pre_commit_s = db_timer.elapsed_s()
-            metrics["db_write_s"] = _metric(db_write_pre_commit_s, "runtime", "s", "lower_better")
-            writer.write_service_metric(
-                service_id,
-                "db_write_s",
-                metrics["db_write_s"],
+            service_checkpoint_storage = None
+            if generation_provenance:
+                lineage = generation_provenance.pop("_lineage", None)
+                lineage_checkpoint_storage = generation_provenance.pop(
+                    "_lineage_checkpoint_storage", None
+                )
+                service_checkpoint_storage = generation_provenance.pop(
+                    "_service_checkpoint_storage", None
+                )
+                if lineage:
+                    writer.write_model_lineage(lineage)
+                if lineage_checkpoint_storage:
+                    writer.write_lineage_checkpoint_storage(lineage_checkpoint_storage)
+                writer.write_service_generation_provenance(generation_provenance)
+                if service_checkpoint_storage:
+                    writer.write_service_checkpoint_storage(service_checkpoint_storage)
+            writer.commit()
+            # Include primary persistence and its commit. Only the final timing
+            # bookkeeping transaction and terminal rendering are excluded.
+            total_s = time.perf_counter() - t0
+            completion_metrics = {
+                key: _metric(total_s, "runtime", "s", "lower_better")
+                for key in ("runtime_total_s", "runtime_s", "service_runtime_s")
+            }
+            client_start = self.config.get("_client_started_perf", t0)
+            completion_metrics["client_runtime_s"] = _metric(time.perf_counter() - client_start, "runtime", "s", "lower_better")
+            completion_metrics["db_write_s"] = _metric(db_timer.elapsed_s(), "runtime", "s", "lower_better")
+            completion_metrics["non_training_runtime_s"] = _metric(
+                total_s - float(metrics["training_runtime_s"]["value"]), "runtime", "s", "lower_better"
+            )
+            completion_metrics["timing_scope"] = _metric(
+                "service_start_through_primary_commit_v2; excludes timing-bookkeeping commit and terminal output",
+                "metadata",
+            )
+            old_total = float(metrics["runtime_total_s"]["value"])
+            if "raw_resource_cost" in metrics:
+                cost = float(metrics["raw_resource_cost"]["value"]) + total_s - old_total
+                completion_metrics["raw_resource_cost"] = _metric(cost, "cost", None, "lower_better")
+                completion_metrics["resource_cost_score"] = _metric(1.0 / (1.0 + cost), "cost", "score", "higher_better")
+            metrics.update(completion_metrics)
+            record["metadata_json"]["completed_at"] = datetime.now(timezone.utc).isoformat()
+            writer.write_service_progress(record)
+            writer.write_service_metrics(service_id, completion_metrics)
+            writer.write_service_execution_provenance(
+                service_id=service_id,
+                run_id=self.config.get("_execution_run_id") or self.config.get("manifest_group_id"),
+                started_at=started_at,
+                document=execution_document(
+                    requested=self._requested_configuration, effective=self.config,
+                    metrics=metrics, record=record, splits=split_provenance_rows,
+                    generation=generation_evidence, artifacts=artifacts,
+                    runtime=runtime_provenance(),
+                    training_adjustment=getattr(self, "_training_budget_adjustment", None),
+                    training_config=getattr(self, "_effective_training_configuration", None),
+                    fit_arguments=getattr(self, "_adapter_fit_arguments", None),
+                ),
             )
             writer.finish()
             _log_service_timing(
@@ -129,46 +273,58 @@ class ServiceRunner:
                 db_timer.elapsed_s(),
                 detail=f"db_path={db_path}",
             )
-            return ServiceExecutionResult(service_id=service_id, status="success", db_path=db_path, metrics=metrics)
-        except Exception as exc:  # noqa: BLE001
-            elapsed = time.perf_counter() - t0
-            failure_stage = getattr(exc, "failure_stage", "service_execution")
-            failure_record = self._service_record(
-                status="failed",
-                started_at=started_at,
-                metadata={
-                    "runtime_total_s": elapsed,
-                    "error_type": type(exc).__name__,
-                    "error_message": str(exc),
-                    "failure_stage": failure_stage,
-                },
+            if not self.config.get("_defer_terminal_results"):
+                if not self.config.get("fl_run_id") and not debug_enabled():
+                    print_service_summary({**self.config, "service_id": service_id}, metrics, service_checkpoint_storage)
+                else:
+                    label = "[Service results]"
+                    if self.config.get("fl_run_id"):
+                        label = f"[Client results] round={self.config.get('round_id')} client={self.config.get('client_id')}"
+                    if debug_enabled():
+                        label += f" service={service_id}"
+                    print_results(label, metrics)
+            weights_saved = bool(
+                self.config.get("fl_run_id")
+                and _safe_int(self.config.get("round_id")) is not None
+                and _safe_int(self.config.get("round_id")) == _safe_int(self.config.get("fedavg_rounds"))
+                and service_checkpoint_storage
+                and service_checkpoint_storage.get("round_trip_status") == "passed"
             )
-            try:
-                db_timer = _StageTimer()
-                writer.write_service(failure_record)
-                writer.write_service_failure(
-                    service_id=service_id,
-                    row_index=_safe_int(self.config.get("row_index")),
-                    case_name=_safe_str(self.config.get("case_name")),
-                    manifest_group_id=_safe_str(self.config.get("manifest_group_id")),
-                    failure_stage=failure_stage,
-                    error_message=str(exc),
-                    resolved_config_json=json.dumps(self.config, default=str),
-                    traceback_text="".join(traceback.format_exception(type(exc), exc, exc.__traceback__)).strip(),
+            if weights_saved and not self.config.get("_defer_terminal_results"):
+                print(
+                    f"Round {self.config['round_id']} Client {self.config.get('client_id')} "
+                    "weights have been saved.",
+                    flush=True,
                 )
-                writer.finish()
-                _log_service_timing(
-                    self.config,
-                    service_id,
-                    "DB write",
-                    db_timer.elapsed_s(),
-                    detail=f"db_path={db_path} status=failed",
-                )
-            except Exception:
+            return ServiceExecutionResult(service_id=service_id, status="success", db_path=db_path, metrics=metrics, weights_saved=weights_saved, final_tensor_state=self._final_tensor_state, checkpoint_storage=service_checkpoint_storage)
+        except BaseException as exc:
+            if writer is not None:
                 writer.abort()
-            return ServiceExecutionResult(service_id=service_id, status="failed", db_path=db_path, metrics={}, error=str(exc))
+            elapsed = time.perf_counter() - t0
+            status = "failed" if isinstance(exc, Exception) else "interrupted"
+            failure_metrics = {key: _metric(elapsed, "runtime", "s", "lower_better")
+                               for key in ("runtime_total_s", "runtime_s", "service_runtime_s", "client_runtime_s")}
+            for key in ("training_memory_metadata", "evaluation_memory_metadata"):
+                failure_metrics.update(_specify_metric_dict(self.config.get(key) or {}))
+            failure_stage = getattr(exc, "failure_stage", "service_execution")
+            failure_record = self._service_record(status=status, started_at=started_at,
+                metadata={"started_at": started_at, "runtime_total_s": elapsed,
+                          "error_type": type(exc).__name__, "error_message": bounded_text(str(exc)),
+                          "failure_stage": failure_stage,
+                          "training_budget_adjustment": getattr(self, "_training_budget_adjustment", None),
+                          "checkpoint_profile": self._checkpoint_profile.as_dict() if self._checkpoint_profile else None})
+            persist_terminal(self.config, status=status, reason=str(exc) or type(exc).__name__,
+                             failure_stage=failure_stage, exc=exc, record=failure_record, metrics=failure_metrics)
+            if status == "interrupted":
+                raise
+            return ServiceExecutionResult(service_id=service_id, status="failed", db_path=db_path,
+                                          metrics=failure_metrics, error=bounded_text(str(exc)))
+        finally:
+            if self._resource_tracker is not None:
+                self._resource_tracker.stop()
 
-    def _execute_service(self, *, started_at: str) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    def _execute_service(self, *, started_at: str) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+        _assert_strict_cohort_access(self.config)
         service_start = time.perf_counter()
         stage_timings: dict[str, float] = {}
         training_regime = str(self.config.get("training_regime") or "finetune_transfer").strip().lower()
@@ -177,8 +333,17 @@ class ServiceRunner:
             dataset_args = dict(self.config.get("dataset_args") or {})
             dataset_args.setdefault("task", self.config.get("task") or self.config.get("task_type"))
             dataset_args.setdefault("inference_only", training_regime in {"inference_only", "inference"})
+            dataset_args.setdefault("hf_dataset_revision", self.config.get("hf_dataset_revision"))
+            dataset_args.setdefault("hf_model_revision", self.config.get("hf_model_revision"))
+            dataset_args.pop("max_samples", None)
             dataset_timer = _StageTimer()
-            train, test, meta = _load_dataset(self.config.get("dataset", "hf"), **dataset_args)
+            self.config.pop("_pretokenization_split_info", None)
+            from ..data.tokenization_selection import training_row_selection
+            with training_row_selection([self.config]) as selection:
+                train, test, meta = _load_dataset(self.config.get("dataset", "hf"), **dataset_args)
+            selected_split = selection.materialize(self.service_id, train)
+            if selected_split is not None:
+                self.config["_pretokenization_split_info"] = selected_split
             stage_timings["dataset_load_s"] = dataset_timer.elapsed_s()
             _log_service_timing(
                 self.config,
@@ -204,6 +369,8 @@ class ServiceRunner:
         meta.setdefault("hf_model_id", self.config.get("hf_model_id"))
         meta.setdefault("hf_task", self.config.get("hf_task"))
         meta.setdefault("task_tag", self.config.get("task_tag"))
+        from ..task_contract import resolve_sentence_pair_contract
+        resolve_sentence_pair_contract(self.config, meta)
         resolved_task_type = _resolved_task_type(self.config, meta)
         resolved_hf_task = meta.get("hf_task") or self.config.get("hf_task")
         resolved_task_tag = meta.get("task_tag") or self.config.get("task_tag")
@@ -215,7 +382,11 @@ class ServiceRunner:
                     meta.setdefault(key, value)
 
         split_timer = _StageTimer()
-        split_info = self._resolve_service_split(x_train, y_train, meta)
+        prepared_partition = self.config.get("_prepared_train_partition")
+        if isinstance(prepared_partition, Mapping):
+            split_info = self._split_info_from_prepared_partition(prepared_partition, meta=meta)
+        else:
+            split_info = self._resolve_service_split(x_train, y_train, meta)
         stage_timings["split_selection_s"] = split_timer.elapsed_s()
         _log_service_timing(
             self.config,
@@ -225,11 +396,15 @@ class ServiceRunner:
             detail=f"strategy={split_info['resolved'].get('effective_strategy')}",
         )
         x_train, y_train = split_info["x_train"], split_info["y_train"]
-        x_test, y_test, benchmark_sample_info = _cap_benchmark_split(
-            x_test,
-            y_test,
-            config=self.config,
-        )
+        prepared_benchmark_info = self.config.get("_prepared_benchmark_sample_info")
+        if isinstance(prepared_benchmark_info, Mapping):
+            benchmark_sample_info = dict(prepared_benchmark_info)
+        else:
+            x_test, y_test, benchmark_sample_info = _cap_benchmark_split(
+                x_test,
+                y_test,
+                config=self.config,
+            )
         split_provenance_rows = list(split_info["provenance_rows"])
 
         task_family = canonical_task_family(resolved_task_type, resolved_hf_task)
@@ -244,6 +419,7 @@ class ServiceRunner:
             batch_size=_safe_int(self.config.get("batch_size")),
             train_samples=train_samples,
             benchmark_samples=benchmark_samples,
+            task_contract=self.config.get("task_contract"),
         )
         primary_name, secondary_name = canonical_metric_names(
             task_family,
@@ -278,6 +454,157 @@ class ServiceRunner:
                 detail="not_applicable=row_local_model",
             )
         resolved_device = _resolve_execution_device(model)
+        provenance_root = _provenance_artifact_root(self.config)
+        lineage_id = str(self.config.get("lineage_id") or uuid.uuid4())
+        fl_run_id = _safe_str(self.config.get("fl_run_id"))
+        client_id = _safe_str(self.config.get("client_id"))
+        round_id = _safe_int(self.config.get("round_id"))
+        shared_parent = self.config.get("generation_mode") == "shared_parent"
+        independent_family = self.config.get("_family_document") is not None
+        if shared_parent and (fl_run_id is not None or round_id is not None or any(
+            self.config.get(key) is None for key in (
+                "_parent_state", "_parent_ref", "_parent_lineage_base", "_expected_compatibility",
+                "cohort_id", "parent_checkpoint_id", "parent_state_hash", "client_id",
+            )
+        )):
+            raise ServiceExecutionError(
+                "shared-parent clients require a prepared cohort; use cohort-manifest and run-manifest",
+                failure_stage="parent_contract",
+            )
+        if independent_family:
+            client_id = self.service_id
+        elif fl_run_id is None and not shared_parent:
+            client_id, round_id = None, None
+        initial_state_timer = _StageTimer()
+        parameter_schema_document = parameter_schema(model)
+        parameter_schema_hash = sha256_json(parameter_schema_document)
+        identity = model_identity(model, self.config)
+        labels = label_semantics(meta, task_family=task_family)
+        preprocessing = preprocessing_metadata(meta)
+        dataset_info = dataset_metadata(self.config, meta)
+        expected_compatibility = self.config.get("_expected_compatibility")
+        if expected_compatibility is not None:
+            actual = {"architecture_id": identity["architecture_id"],
+                      "parameter_schema_hash": parameter_schema_hash,
+                      "label_map_hash": labels["label_map_hash"],
+                      "preprocessing_contract_hash": preprocessing["preprocessing_contract_hash"],
+                      "logical_dataset_contract_hash": dataset_info["logical_dataset_contract_hash"]}
+            if self.config.get("task_contract"):
+                from ..tasks.contracts import bind_task_contract
+                task_contract = bind_task_contract(self.config, meta, model)
+                actual.update(task_semantics_hash=task_contract.semantics_hash,
+                              evaluation_protocol_hash=task_contract.protocol_hash)
+            if actual != expected_compatibility:
+                raise ServiceExecutionError("client compatibility differs from its parent", failure_stage="parent_contract")
+        checkpoint_compression = _checkpoint_compression(self.config)
+        lineage_base: LineageBaseResult | None = None
+        native_base_round_trip_verified = False
+        checkpoint_fallback: dict[str, Any] | None = None
+        parent_state = self.config.get("_parent_state", self.config.get("_fedavg_parent_state"))
+        parent_ref = self.config.get("_parent_ref", self.config.get("_fedavg_parent_ref"))
+        parent_round = _safe_int(self.config.get("_parent_round_id", self.config.get("_fedavg_parent_round_id")))
+        from ..debug_mode import weights_disabled
+        no_save_weights = weights_disabled(self.config)
+        if no_save_weights:
+            base_artifact, base_hash = None, None
+        elif parent_state is not None:
+            if not isinstance(parent_state, TensorState) or not isinstance(
+                parent_ref, ContentObjectRef
+            ):
+                raise ServiceExecutionError(
+                    "client requires a canonical parent state and CAS reference",
+                    failure_stage="fedavg_parent_restore",
+                )
+            if parent_ref.content_sha256 != parent_state.sha256:
+                raise ServiceExecutionError(
+                    "parent reference hash does not match the parent state",
+                    failure_stage="fedavg_parent_restore",
+                )
+            declared_parent_hash = _safe_str(self.config.get("parent_state_hash"))
+            if declared_parent_hash and declared_parent_hash != parent_state.sha256:
+                raise ServiceExecutionError(
+                    "manifest parent_state_hash does not match the persisted parent",
+                    failure_stage="fedavg_parent_restore",
+                )
+            lineage_base = self.config.get("_parent_lineage_base", self.config.get("_fedavg_lineage_base"))
+            if not isinstance(lineage_base, LineageBaseResult):
+                raise ServiceExecutionError(
+                    "client is missing its immutable parent lineage record",
+                    failure_stage="fedavg_parent_restore",
+                )
+            restore_timer = _StageTimer()
+            # Reuse the executor's verified restore of this exact parent object.
+            # Standalone services still perform their own verified restore.
+            if not (
+                self.config.get("_restored_parent", self.config.get("_fedavg_restored_parent")) is parent_state
+                and self.config.get("_prepared_model") is model
+            ):
+                restore_model_tensor_state(model, parent_state, verify=True)
+                stage_timings["model_reset_s"] = restore_timer.elapsed_s()
+            base_hash = parent_state.sha256
+            base_artifact = {
+                "artifact_type": "model_initial_checkpoint" if independent_family else "parent_checkpoint" if shared_parent else "fedavg_global_state",
+                "artifact_uri": str(parent_ref.manifest_path),
+                "metadata": {
+                    "sha256": sha256_file(parent_ref.manifest_path),
+                    "size_bytes": parent_ref.manifest_path.stat().st_size,
+                    "format": TENSOR_STATE_FORMAT,
+                    "role": "family_initial_state" if independent_family else "task_parent" if shared_parent else "round_global_parent",
+                    "tensor_state_sha256": parent_state.sha256,
+                    "global_round": parent_round,
+                },
+            }
+            preparation_timer = _StageTimer()
+            try:
+                prepare_model_for_local_update(model, self.config)
+            except Exception as exc:
+                raise ServiceExecutionError(
+                    f"local-update preparation failed: {exc}",
+                    failure_stage="fedavg_local_preparation",
+                ) from exc
+            prepared_hash = capture_model_tensor_state(model).sha256
+            if prepared_hash != parent_state.sha256:
+                raise ServiceExecutionError(
+                    "local-update preparation changed model parameters",
+                    failure_stage="fedavg_local_preparation",
+                )
+            stage_timings["local_preparation_s"] = preparation_timer.elapsed_s()
+        else:
+            try:
+                lineage_base = ensure_lineage_base(
+                    provenance_root,
+                    lineage_id,
+                    model,
+                    parameter_schema_hash=parameter_schema_hash,
+                    compression=checkpoint_compression,
+                )
+                base_artifact = lineage_base.artifact()
+                base_hash = lineage_base.tensor_state_sha256
+            except UnsupportedTensorStateError as exc:
+                checkpoint_fallback = exc.as_fallback_signal()
+                base_artifact = save_model_artifact(
+                    provenance_root,
+                    self.service_id,
+                    "initial",
+                    model,
+                    lineage_id=lineage_id,
+                )
+                if base_artifact is None:
+                    raise ServiceExecutionError(
+                        "model exposes neither an exact tensor state nor a native initial checkpoint",
+                        failure_stage="checkpoint_persistence",
+                    ) from exc
+                native_base_round_trip_verified = restore_lineage_initial_weights(
+                    provenance_root, lineage_id, model
+                )
+                if not native_base_round_trip_verified:
+                    raise ServiceExecutionError(
+                        "native initial checkpoint could not be restored into the constructed model",
+                        failure_stage="checkpoint_round_trip",
+                    ) from exc
+                base_hash = (base_artifact or {}).get("metadata", {}).get("sha256")
+        stage_timings["initial_state_s"] = initial_state_timer.elapsed_s()
+        generated_artifacts = [item for item in (base_artifact,) if item]
         gpu_fallback_warning = _gpu_fallback_warning(self.config.get("device"), resolved_device)
         self._print_run_summary(
             task_family=task_family,
@@ -291,7 +618,10 @@ class ServiceRunner:
         )
 
         tracker = ResourceTracker()
+        self._resource_tracker = tracker
+        tracker_timer = _StageTimer()
         tracker.start()
+        stage_timings["resource_tracker_start_s"] = tracker_timer.elapsed_s()
         train_metrics: dict[str, Any] = {}
         eval_qos: dict[str, Any] = {}
         loss = primary = secondary = math.nan
@@ -300,6 +630,7 @@ class ServiceRunner:
         update_signature_artifact: dict[str, Any] | None = None
 
         workload_start = time.perf_counter()
+        stage_timings["setup_s"] = workload_start - service_start
         if training_regime in {"inference_only", "inference"}:
             stage_timings["finetune_s"] = 0.0
             stage_timings["signature_s"] = 0.0
@@ -321,9 +652,19 @@ class ServiceRunner:
             loss, primary, secondary, eval_qos = self._evaluate_model(model, x_test, y_test, inference_only=True, task_family=task_family)
             eval_runtime_s = time.perf_counter() - eval_start
         else:
-            weights_before_training = _snapshot_model_weights(model)
+            snapshot_timer = _StageTimer()
+            signature_enabled = _config_bool(self.config.get("update_signature_enabled"), True)
+            weights_before_training = _snapshot_model_weights(model) if signature_enabled else None
+            stage_timings["pretrain_snapshot_s"] = snapshot_timer.elapsed_s()
             train_start = time.perf_counter()
             train_metrics = self._train_model(model, x_train, y_train, task_family=task_family)
+            from ..clients.training import OPPORTUNITY_SAMPLER_VERSIONS
+            if self.config.get("recipe_sampler_version") in OPPORTUNITY_SAMPLER_VERSIONS and self.config.get("optimizer") != "none":
+                steps = train_metrics.get("successful_optimizer_step_count", train_metrics.get("optimizer_step_count"))
+                if steps is not None and steps < 1:
+                    raise ServiceExecutionError("client performed no successful optimizer steps", failure_stage="client_training")
+            if shared_parent and train_metrics.get("optimizer_step_count", 1) < 1:
+                raise ServiceExecutionError("client performed no optimizer steps", failure_stage="client_training")
             train_runtime_s = time.perf_counter() - train_start
             stage_timings["finetune_s"] = train_runtime_s
             _log_service_timing(
@@ -336,7 +677,7 @@ class ServiceRunner:
             signature_timer = _StageTimer()
             update_signature_metrics, update_signature_artifact = self._capture_update_signature(
                 weights_before_training,
-                _snapshot_model_weights(model),
+                _snapshot_model_weights(model) if signature_enabled else None,
             )
             stage_timings["signature_s"] = signature_timer.elapsed_s()
             _log_service_timing(
@@ -362,6 +703,7 @@ class ServiceRunner:
         )
         model_size = _count_model_params(model)
         _validate_service_metrics(
+            loss_value=loss,
             task_family=task_family,
             hf_task=resolved_hf_task,
             primary_name=primary_name,
@@ -370,6 +712,13 @@ class ServiceRunner:
             secondary_value=secondary,
             metric_score=primary_score,
         )
+        regression_controls = None
+        if (task_family == "regression" and training_regime == "generic"
+                and not isinstance(x_train, Mapping) and np.ndim(x_train) == 2):
+            from ..models.regression_baselines import regression_baselines
+            baseline_timer = _StageTimer()
+            regression_controls = regression_baselines(x_train, y_train, x_test, y_test)
+            stage_timings["regression_baselines_s"] = baseline_timer.elapsed_s()
         explainability, perturbation_artifact = _service_perturbation_metrics(
             model,
             x_test,
@@ -379,7 +728,10 @@ class ServiceRunner:
             task_family=task_family,
         )
         tracked_runtime_s = time.perf_counter() - workload_start
+        tracker_timer = _StageTimer()
         usage = tracker.stop(tracked_runtime_s)
+        self._resource_tracker = None
+        stage_timings["resource_tracker_stop_s"] = tracker_timer.elapsed_s()
         runtime_total_s = time.perf_counter() - service_start
         perf_metrics = _performance_alias_metrics(
             eval_qos=eval_qos,
@@ -399,7 +751,9 @@ class ServiceRunner:
             usage=usage,
         )
         reliability = _reliability_metrics(status="completed", eval_qos=eval_qos)
+        hardware_timer = _StageTimer()
         hardware_snapshot = capture_hardware_snapshot() if _config_bool(self.config.get("measure_system_metrics"), True) else None
+        stage_timings["hardware_snapshot_s"] = hardware_timer.elapsed_s()
         accounting_meta = finalize_accounting(meta, batch_size=_safe_int(self.config.get("batch_size")))
         accounting = accounting_meta.get("accounting", {}) if isinstance(accounting_meta, Mapping) else {}
         train_distribution = _distribution_summary(x_train, y_train, meta=meta, task_family=task_family, hf_task=resolved_hf_task)
@@ -450,6 +804,11 @@ class ServiceRunner:
             "gpu_requested_cpu_fallback_flag": _metric(bool(gpu_fallback_warning), "reliability", direction="lower_better"),
         }
         metrics.update(_stage_timing_metrics(stage_timings))
+        if regression_controls is not None:
+            metrics["regression_baselines"] = _metric(regression_controls, "metadata")
+            for baseline, values in regression_controls["metrics"].items():
+                for name, value in values.items():
+                    metrics[f"baseline_{baseline}_{name}"] = _metric(value, "quality", direction="lower_better")
         if gpu_fallback_warning:
             metrics["gpu_fallback_warning"] = _metric(gpu_fallback_warning, "reliability")
         metrics.update(_hf_metadata_metrics(hf_metadata))
@@ -503,11 +862,299 @@ class ServiceRunner:
             hf_task=resolved_hf_task,
             registry_metadata={**_registry_metadata(self.config), **hf_metadata},
         )
-        artifacts = []
+        if no_save_weights:
+            # Debug observations intentionally have no reconstructable provider.
+            # Return before checkpoint capture, compression, writes or verification.
+            record["metadata_json"]["checkpoint_persistence"] = {
+                "mode": "debug_no_weights", "weights_saved": False,
+                "composition_compatible": False,
+            }
+            metrics["checkpoint_s"] = _metric(0.0, "runtime", "s", "lower_better")
+            metrics["weights_saved"] = _metric(False, "metadata")
+            split_provenance_rows.append({"split_name": "benchmark", "samples_count": benchmark_samples,
+                "data_distribution": benchmark_distribution,
+                "split_config": {"source": self.config.get("benchmark_split") or self.config.get("test_split"), "role": "benchmark"}})
+            provenance = {
+                "service_id": self.service_id, "provenance_version": PROVENANCE_VERSION,
+                "architecture_id": identity["architecture_id"],
+                "parameter_schema_hash": parameter_schema_hash,
+                "label_map_hash": labels["label_map_hash"],
+                "preprocessing_contract_hash": preprocessing["preprocessing_contract_hash"],
+                "dataset_contract_hash": dataset_info["dataset_contract_hash"],
+                "logical_dataset_contract_hash": dataset_info.get("logical_dataset_contract_hash"),
+                "generation_mode": "debug_no_weights", "composition_compatible": 0,
+                "provenance_json": {"mode": "debug_no_weights", "weights_saved": False,
+                    "reason": "independent training/evaluation diagnostics; checkpoint persistence disabled"},
+            }
+            return record, metrics, [a for a in (perturbation_artifact, update_signature_artifact) if a], split_provenance_rows, provenance
+        checkpoint_timer = _StageTimer()
+        checkpoint_profile = self._checkpoint_profile = CheckpointProfile()
+        if shared_parent and (not math.isfinite(float(primary)) or sha256_json(parameter_schema(model)) != parameter_schema_hash):
+            raise ServiceExecutionError("client evaluation or parameter schema is invalid", failure_stage="client_validation")
+        self._persist_progress("checkpointing", started_at=started_at)
+        retain_trained_weights = True
+        if isinstance(parent_state, TensorState):
+            configured_retention = self.config.get("_retain_client_checkpoint")
+            retain_trained_weights = (
+                _config_bool(configured_retention, False)
+                if configured_retention is not None
+                else round_id == _safe_int(self.config.get("fedavg_rounds"))
+            )
+        if _config_bool(self.config.get("service_stage_timing_logging"), True):
+            debug_print(
+                f"[Checkpoint] service stage starts | service_id={self.service_id} "
+                f"| compression={_checkpoint_compression(self.config).as_dict()}",
+                flush=True,
+            )
+        service_patch: ServicePatchResult | None = None
+        reduced_checkpoint = None
+        final_artifact: dict[str, Any] | None = None
+        fallback_target_state = None
+        native_final_round_trip_verified = False
+        if not retain_trained_weights:
+            # Aggregation consumes this canonical state in memory. Its hash is
+            # durable provenance, but no reconstructable client checkpoint is
+            # published for a historical round.
+            fallback_target_state = capture_model_tensor_state(model)
+        if retain_trained_weights and lineage_base is not None and self.config.get("checkpoint_weight_format") in {"fp16", "int8"}:
+            from ..reduced_checkpoint import persist_reduced_checkpoint, ReducedPrecisionRejected
+            try:
+                fallback_target_state = capture_model_tensor_state(model)
+                reduced_base = parent_ref if isinstance(parent_ref, ContentObjectRef) else lineage_base.base
+                if fallback_target_state.sha256 != reduced_base.content_sha256:
+                    reduced_checkpoint = checkpoint_profile.call("reduced_save", persist_reduced_checkpoint,
+                        provenance_root, self.service_id, lineage_id, fallback_target_state,
+                        base_ref=parent_ref if isinstance(parent_ref, ContentObjectRef) else lineage_base.base,
+                        parameter_schema_hash=parameter_schema_hash,
+                        representation=self.config["checkpoint_weight_format"],
+                        compression=CompressionSpec(self.config.get("checkpoint_reduced_compression", "none"),
+                            self.config.get("checkpoint_reduced_compression_level", 1)),
+                        measure_full=_config_bool(self.config.get("checkpoint_measure_full", False), False),
+                        validate=lambda state: checkpoint_profile.call("reduced_quality", _validate_reduced_checkpoint,
+                            self, model, fallback_target_state, state, x_test, y_test,
+                            task_family=task_family, primary_name=primary_name))
+                    final_artifact = reduced_checkpoint.artifact()
+            except (UnsupportedTensorStateError, ReducedPrecisionRejected) as exc:
+                checkpoint_fallback = {"requested": self.config["checkpoint_weight_format"], "selected": "exact", "reason": str(exc)}
+        if retain_trained_weights and lineage_base is not None and reduced_checkpoint is None:
+            try:
+                if not shared_parent and not independent_family and isinstance(parent_state, TensorState) and isinstance(
+                    parent_ref, ContentObjectRef
+                ):
+                    service_patch = checkpoint_profile.call("weights", persist_service_patch_from_base_state,
+                        provenance_root,
+                        self.service_id,
+                        lineage_id,
+                        model,
+                        base_state=parent_state,
+                        base_ref=parent_ref,
+                        base_round_id=int(parent_round or 0),
+                        parameter_schema_hash=parameter_schema_hash,
+                        compression=checkpoint_compression,
+                        operation_policy=self.config.get("checkpoint_patch_operation_policy", "adaptive"),
+                        measure_full=_config_bool(self.config.get("checkpoint_measure_full", True), True),
+                    )
+                else:
+                    service_patch = checkpoint_profile.call("weights", persist_service_patch,
+                        provenance_root,
+                        self.service_id,
+                        lineage_id,
+                        model,
+                        parameter_schema_hash=parameter_schema_hash,
+                        compression=checkpoint_compression,
+                        operation_policy=self.config.get("checkpoint_patch_operation_policy", "adaptive"),
+                        measure_full=_config_bool(self.config.get("checkpoint_measure_full", True), True),
+                    )
+                final_artifact = checkpoint_profile.call("artifact_metadata", service_patch.artifact)
+            except UnsupportedTensorStateError as exc:
+                checkpoint_fallback = _checkpoint_fallback_details(exc)
+            except CheckpointStoreError as exc:
+                if isinstance(parent_state, TensorState) and not shared_parent:
+                    checkpoint_fallback = {
+                        "required": True,
+                        "policy": "full_object_v1",
+                        "reason_code": "fedavg_exact_patch_round_trip_failed",
+                        "detail": str(exc),
+                    }
+                else:
+                    raise ServiceExecutionError(
+                        f"exact checkpoint patch failed integrity verification: {exc}",
+                        failure_stage="checkpoint_round_trip",
+                    ) from exc
+        if retain_trained_weights and service_patch is None and reduced_checkpoint is None:
+            fallback_target_state, target_fallback = capture_model_tensor_state_or_fallback(model)
+            if checkpoint_fallback is None and target_fallback is not None:
+                checkpoint_fallback = target_fallback
+            final_artifact = checkpoint_profile.call("native_save", save_model_artifact,
+                provenance_root,
+                self.service_id,
+                "final",
+                model,
+            )
+            if final_artifact is None:
+                raise ServiceExecutionError(
+                    "failed to persist either an exact tensor patch or a native final checkpoint",
+                    failure_stage="checkpoint_persistence",
+                )
+            native_final_round_trip_verified = checkpoint_profile.call(
+                "native_restore_verify", restore_model_artifact, final_artifact, model
+            )
+            if not native_final_round_trip_verified:
+                raise ServiceExecutionError(
+                    "native final checkpoint could not be restored into the trained model",
+                    failure_stage="checkpoint_round_trip",
+                )
+            if fallback_target_state is not None:
+                restored_target_state, restored_fallback = capture_model_tensor_state_or_fallback(model)
+                if (
+                    restored_fallback is not None
+                    or restored_target_state is None
+                    or restored_target_state.sha256 != fallback_target_state.sha256
+                ):
+                    raise ServiceExecutionError(
+                        "native final checkpoint changed the canonical target tensor state",
+                        failure_stage="checkpoint_round_trip",
+                    )
+            final_artifact.setdefault("metadata", {})["round_trip_verified"] = True
+        if final_artifact is not None:
+            generated_artifacts.append(final_artifact)
+        support_artifacts = (
+            checkpoint_profile.call("support_artifacts", save_reconstruction_support_artifacts,
+                provenance_root,
+                self.service_id,
+                model,
+            )
+            if retain_trained_weights
+            else []
+        )
+        generated_artifacts.extend(support_artifacts)
+        provenance_documents = {
+            "model_identity": identity,
+            "parameter_schema": parameter_schema_document,
+            "label_semantics": labels,
+            "preprocessing": preprocessing,
+            "dataset": dataset_info,
+            "partition_manifest": {
+                "tokenization_selection": meta.get("tokenization_selection"),
+                "train_selected_rows": meta.get("selected_train_rows"),
+                "test_selected_rows": meta.get("selected_test_rows"),
+                "split_resolution": split_info["resolved"],
+                "benchmark_sample_resolution": benchmark_sample_info,
+                "fedavg_partition": (
+                    dict(self.config.get("_prepared_train_partition", {}).get("partition_meta") or {})
+                    if isinstance(self.config.get("_prepared_train_partition"), Mapping)
+                    else None
+                ),
+            },
+        }
+        provenance_artifacts: dict[str, dict[str, Any]] = {}
+        for name, document in provenance_documents.items():
+            artifact = checkpoint_profile.call(
+                "provenance_write", write_json_artifact, provenance_root, self.service_id, name, document
+            )
+            provenance_artifacts[name] = artifact
+            generated_artifacts.append(artifact)
+        service_checkpoint_storage = None
+        if retain_trained_weights:
+            checkpoint_storage = checkpoint_profile.call("storage_metadata", _checkpoint_storage_documents,
+                service_id=self.service_id,
+                lineage_id=lineage_id,
+                parameter_schema_hash=parameter_schema_hash,
+                base_artifact=base_artifact,
+                lineage_base=lineage_base,
+                final_artifact=final_artifact,
+                service_patch=service_patch,
+                reduced_checkpoint=reduced_checkpoint,
+                fallback_target_state=fallback_target_state,
+                support_artifacts=support_artifacts,
+                provenance_artifacts=provenance_artifacts,
+                fallback=checkpoint_fallback,
+                compression=checkpoint_compression,
+                provenance_root=provenance_root,
+                native_final_round_trip_verified=native_final_round_trip_verified,
+                parent_global_round=parent_round,
+                explicit_parent_state_hash=(
+                    parent_state.sha256
+                    if isinstance(parent_state, TensorState)
+                    else None
+                ),
+            )
+            reconstruction_artifact = checkpoint_profile.call("reconstruction_manifest_write", write_json_artifact,
+                provenance_root,
+                self.service_id,
+                "checkpoint_reconstruction",
+                checkpoint_storage["reconstruction_manifest"],
+            )
+            generated_artifacts.append(reconstruction_artifact)
+            checkpoint_storage["provenance"]["reconstruction_artifact"] = _artifact_reference(
+                reconstruction_artifact
+            )
+            service_checkpoint_storage = _service_checkpoint_storage_row(
+                service_id=self.service_id,
+                lineage_id=lineage_id,
+                parameter_schema_hash=parameter_schema_hash,
+                final_artifact=final_artifact,
+                service_patch=service_patch,
+                reduced_checkpoint=reduced_checkpoint,
+                lineage_base=lineage_base,
+                fallback_target_state=fallback_target_state,
+                reconstruction_artifact=reconstruction_artifact,
+                fallback=checkpoint_fallback,
+                native_final_round_trip_verified=native_final_round_trip_verified,
+                parent_global_round=parent_round,
+                explicit_parent_state_hash=(
+                    parent_state.sha256
+                    if isinstance(parent_state, TensorState)
+                    else None
+                ),
+                explicit_parent_state_ref=(
+                    str(parent_ref.manifest_path)
+                    if isinstance(parent_ref, ContentObjectRef)
+                    else None
+                ),
+            )
+        else:
+            checkpoint_storage = {
+                "provenance": {
+                    "storage_policy_version": "fedavg_historical_provenance_only_v1",
+                    "storage_mode": "not_retained",
+                    "client_weights_retained": False,
+                    "target_state_sha256": fallback_target_state.sha256,
+                    "parent_global_round": parent_round,
+                    "parent_state_sha256": parent_state.sha256,
+                    "reason": "only final-round FedAvg client weights are retained",
+                },
+                "reconstruction_manifest": None,
+            }
+        lineage_checkpoint_storage = _lineage_checkpoint_storage_row(
+            lineage_id=lineage_id,
+            parameter_schema_hash=parameter_schema_hash,
+            base_artifact=(lineage_base.artifact() if lineage_base is not None else base_artifact),
+            lineage_base=lineage_base,
+            native_base_round_trip_verified=native_base_round_trip_verified,
+            fallback=checkpoint_fallback,
+        )
+        artifacts = generated_artifacts
         if perturbation_artifact:
             artifacts.append(perturbation_artifact)
         if update_signature_artifact:
             artifacts.append(update_signature_artifact)
+        checkpoint_elapsed_s = checkpoint_timer.elapsed_s()
+        stage_timings["checkpoint_s"] = checkpoint_elapsed_s
+        metrics.update(_checkpoint_profile_metrics(checkpoint_profile))
+        metrics["checkpoint_s"] = _metric(
+            checkpoint_elapsed_s, "runtime", "s", "lower_better"
+        )
+        _log_service_timing(
+            self.config,
+            self.service_id,
+            "checkpoint",
+            checkpoint_elapsed_s,
+            detail=(
+                f"compression={checkpoint_compression.as_dict()} "
+                f"storage_mode={('patch' if service_patch is not None else 'full_object') if retain_trained_weights else 'historical_only'}"
+            ),
+        )
         split_provenance_rows.append(
             {
                 "split_name": "benchmark",
@@ -519,11 +1166,140 @@ class ServiceRunner:
                 },
             }
         )
-        return record, metrics, artifacts, split_provenance_rows
+        partition_hash = sha256_json(provenance_documents["partition_manifest"])
+        final_hash = (
+            service_patch.target_state_sha256
+            if service_patch is not None
+            else (
+                fallback_target_state.sha256
+                if fallback_target_state is not None
+                else (final_artifact or {}).get("metadata", {}).get("sha256")
+            )
+        )
+        full_provenance = {
+            "version": PROVENANCE_VERSION,
+            "documents": provenance_documents,
+            "service_id": self.service_id,
+            "created_at": started_at,
+            "resolved_device": resolved_device,
+            "identity": identity,
+            "parameter_schema": parameter_schema_document,
+            "labels": labels,
+            "preprocessing": preprocessing,
+            "dataset": dataset_info,
+            "partition_manifest_hash": partition_hash,
+            "base_model_hash": base_hash,
+            "final_model_hash": final_hash,
+            "checkpoint_storage": checkpoint_storage["provenance"],
+            "checkpoint_profile": checkpoint_profile.as_dict(),
+            "runtime": runtime_provenance(),
+        }
+        if self.config.get("task_contract"):
+            from ..task_capabilities import resolve_capabilities
+            full_provenance["task_contract"] = self.config["task_contract"]
+            full_provenance["task_capabilities"] = resolve_capabilities(self.config, stage="publication",
+                checks={"checkpoint_present": service_checkpoint_storage is not None,
+                        "supervision": True, "training_completed": training_regime not in {"inference", "inference_only"},
+                        "partition_support": True,
+                        "checkpoint_integrity": bool(service_checkpoint_storage and service_checkpoint_storage.get("round_trip_status") == "passed")})
+        if independent_family:
+            full_provenance["independent_family"] = {
+                key: self.config.get(key) for key in ("family_id", "initial_state_hash", "family_document_ref",
+                    "family_document_hash", "manifest_reference", "compatibility_contract_hash", "training_seed")
+            }
+            full_provenance["independent_family"]["source_ids"] = split_info["resolved"]["partition_source_ids"]
+        if shared_parent:
+            full_provenance["shared_parent"] = {
+                key: self.config.get(key) for key in ("family_id", "cohort_id", "parent_checkpoint_id",
+                "parent_state_hash", "client_id", "client_recipe_hash", "training_seed", "compatibility_contract_hash")
+            }
+        if fl_run_id is not None:
+            full_provenance["fedavg"] = {
+                "generation_mode": "fedavg",
+                "fl_run_id": fl_run_id,
+                "client_id": client_id,
+                "round_id": round_id,
+                "run_partition_seed": self.config.get("run_partition_seed"),
+                "client_partition_index": self.config.get("client_partition_index"),
+                "benchmark_sample_seed": self.config.get("benchmark_sample_seed"),
+                "fedavg_clients_per_run": self.config.get("fedavg_clients_per_run"),
+                "fedavg_rounds": self.config.get("fedavg_rounds"),
+                "participation_rate": self.config.get("fedavg_client_participation_rate"),
+                "scheduled_to_participate": self.config.get("scheduled_to_participate"),
+                "participation_schedule_seed": self.config.get("participation_schedule_seed"),
+                "participation_schedule_version": self.config.get("participation_schedule_version"),
+                "training_seed": self.config.get("training_seed"),
+                "parent_global_round": parent_round,
+                "parent_state_hash": base_hash,
+                "compatibility_contract_hash": self.config.get("compatibility_contract_hash"),
+                "client_weights_retained": retain_trained_weights,
+            }
+        generation_provenance = {
+            "service_id": self.service_id,
+            "provenance_version": PROVENANCE_VERSION,
+            "architecture_id": identity["architecture_id"],
+            "model_revision": identity.get("model_revision"),
+            "dataset_revision": dataset_info.get("dataset_revision"),
+            "parameter_schema_hash": parameter_schema_hash,
+            "label_map_hash": labels["label_map_hash"],
+            "preprocessing_contract_hash": preprocessing["preprocessing_contract_hash"],
+            "dataset_contract_hash": dataset_info["dataset_contract_hash"],
+            "logical_dataset_contract_hash": dataset_info.get("logical_dataset_contract_hash"),
+            "partition_manifest_hash": partition_hash,
+            "base_model_id": identity.get("model_id"),
+            "base_model_hash": base_hash,
+            "final_model_hash": final_hash,
+            "lineage_id": lineage_id,
+            "fl_run_id": fl_run_id,
+            "client_id": client_id,
+            "round_id": round_id,
+            "compatibility_contract_hash": self.config.get("compatibility_contract_hash"),
+            "parent_global_round": parent_round,
+            "parent_state_hash": base_hash if fl_run_id is not None or shared_parent or independent_family else None,
+            "generation_mode": self.config.get("generation_mode", "independent"),
+            "family_id": self.config.get("family_id"),
+            "parent_checkpoint_id": self.config.get("parent_checkpoint_id"),
+            "cohort_id": self.config.get("cohort_id"),
+            "training_universe_hash": self.config.get("training_universe_hash"),
+            "benchmark_cohort_hash": self.config.get("benchmark_cohort_hash"),
+            "scheduled_to_participate": (
+                int(bool(self.config.get("scheduled_to_participate")))
+                if fl_run_id is not None
+                else None
+            ),
+            "participated": 1 if fl_run_id is not None else None,
+            "provenance_json": full_provenance,
+            "_lineage": {
+                "lineage_id": lineage_id, "fl_run_id": fl_run_id,
+                "base_model_id": identity.get("model_id"), "base_model_hash": base_hash,
+                "initial_checkpoint_uri": (base_artifact or {}).get("artifact_uri"),
+                "initial_checkpoint_sha256": (base_artifact or {}).get("metadata", {}).get("sha256"),
+                "provenance_json": {"identity": identity, "runtime": full_provenance["runtime"]},
+            },
+            "_lineage_checkpoint_storage": lineage_checkpoint_storage,
+            "_service_checkpoint_storage": service_checkpoint_storage,
+        }
+        final_capture_timer = _StageTimer()
+        if independent_family:
+            generation_provenance.update({key: self.config.get(key) for key in (
+                "family_contract_version", "initial_state_hash", "family_document_ref", "family_document_hash", "manifest_reference")})
+            generation_provenance["composition_compatible"] = 0
+        if isinstance(parent_state, TensorState):
+            self._final_tensor_state = (
+                fallback_target_state if fallback_target_state is not None
+                else capture_model_tensor_state(model)
+            )
+        metrics["final_state_capture_s"] = _metric(final_capture_timer.elapsed_s(), "runtime", "s", "lower_better")
+        metrics["post_checkpoint_s"] = _metric(
+            checkpoint_timer.elapsed_s() - checkpoint_elapsed_s,
+            "runtime", "s", "lower_better",
+        )
+        return record, metrics, artifacts, split_provenance_rows, generation_provenance
 
     def _capture_update_signature(self, before: Any, after: Any) -> tuple[dict[str, Any], dict[str, Any] | None]:
         if not _config_bool(self.config.get("update_signature_enabled"), True):
-            return {}, None
+            return {"update_signature_available": _metric(False, "metadata"),
+                    "update_signature_disabled": _metric(True, "metadata")}, None
         if before is None or after is None:
             return {
                 "update_signature_available": _metric(False, "metadata"),
@@ -577,7 +1353,183 @@ class ServiceRunner:
         }
         return metrics, artifact
 
+    def _split_info_from_prepared_partition(self, prepared_partition: Mapping[str, Any], *, meta: Mapping[str, Any]) -> dict[str, Any]:
+        x_train = prepared_partition.get("x_train")
+        y_train = prepared_partition.get("y_train")
+        split_resolution = dict(prepared_partition.get("split_resolution") or {})
+        partition_meta = dict(prepared_partition.get("partition_meta") or {})
+        hf_task = meta.get("hf_task") or self.config.get("hf_task")
+        task_family = canonical_task_family(_resolved_task_type(self.config, meta), hf_task)
+        train_distribution = _distribution_summary(x_train, y_train, meta=meta, task_family=task_family, hf_task=hf_task)
+        strategy = str(split_resolution.get("strategy") or self.config.get("split_strategy") or "iid")
+        resolved = {
+            "strategy": strategy,
+            "requested_strategy": split_resolution.get("requested_strategy", strategy),
+            "effective_strategy": split_resolution.get("strategy", strategy),
+            "distribution_type": self.config.get("distribution_type") or strategy,
+            "distribution_param": self.config.get("distribution_param"),
+            "sample_frac": self.config.get("sample_frac"),
+            "sample_seed": partition_meta.get("sample_seed", self.config.get("sample_seed")),
+            "requested_sample_size_total": self.config.get("sample_size"),
+            "sample_strategy_effective": strategy,
+            "requested_axis": split_resolution.get("requested_skew_axis") or split_resolution.get("skew_axis") or self.config.get("skew_axis"),
+            "effective_axis": split_resolution.get("skew_axis") or partition_meta.get("skew_axis"),
+            "axis_family": split_resolution.get("axis_family") or partition_meta.get("axis_family"),
+            "bucket_spec": split_resolution.get("bucket_spec") or partition_meta.get("bucket_spec"),
+            "source_fields": split_resolution.get("source_fields") or partition_meta.get("source_fields"),
+            "fallback_reason": split_resolution.get("fallback_reason") or split_resolution.get("axis_fallback_reason") or partition_meta.get("fallback_reason"),
+            "bucket_distribution": split_resolution.get("bucket_distribution") or partition_meta.get("bucket_histogram", {}),
+            "effective_train_samples": _sample_count(x_train, y_train),
+            "original_train_samples": partition_meta.get("source_pool_sample_count"),
+            "provenance_only": False,
+            "fedavg_partition": self.config.get("generation_mode") == "fedavg",
+            "shared_parent_partition": self.config.get("generation_mode") == "shared_parent",
+            "client_partition_index": prepared_partition.get("client_partition_index"),
+            "run_partition_seed": prepared_partition.get("run_partition_seed"),
+            "fl_run_id": prepared_partition.get("fl_run_id"),
+            "client_key": partition_meta.get("client_key"),
+            "partition_indices": partition_meta.get("indices"),
+            "partition_source_ids": partition_meta.get("source_ids"),
+            "partition_hash": partition_meta.get("partition_hash"),
+        }
+        partition_version = partition_meta.get("partition_generator_version") or partition_meta.get("version")
+        if partition_version in SUPPORTED_PARTITION_VERSIONS:
+            resolved.update({key: partition_meta[key] for key in (
+                "source_pool_sample_count", "requested_quota", "effective_quota", "target_bucket_counts",
+                "realised_bucket_counts", "capacity_reduction_count", "normalised_bucket_entropy",
+                "cross_client_overlap_allowed")})
+            resolved["partition_generator_version"] = partition_version
+            for key in ("heterogeneity_intensity", "source_bucket_count", "selected_buckets",
+                        "selected_bucket_count", "represented_bucket_count", "shard_expected_bucket_count",
+                        "shard_support_quantile", "target_deviation_count", "resolution_reason",
+                        "allocation_policy", "redistributed_sample_count", "selected_support_capacity",
+                        "quantity_capacity_policy", "capacity_adjusted_quota", "quantity_scale_factor",
+                        "regression_support_policy", "min_target_bin_fraction", "target_bin_coverage",
+                        "target_extremes_represented", "controlled_specialist", "dirichlet_alpha",
+                        "support_relaxation_count", "quantity_policy"):
+                if key in partition_meta:
+                    resolved[key] = partition_meta[key]
+        if partition_version in {"joint_target_allocator_v2", "source_pool_sampler_v3"}:
+            for key in (
+                "partition_generator_version",
+                "heterogeneity_intensity",
+                "requested_partition_strategy",
+                "requested_partition_params",
+                "requested_quota",
+                "effective_quota",
+                "quota_shortfall",
+                "initial_target_bucket_counts",
+                "capacity_redraw_count",
+                "source_pool_sample_count",
+                "client_samples_used",
+                "unused_source_samples",
+                "target_bucket_counts",
+                "target_bucket_proportions",
+                "realised_bucket_counts",
+                "realised_bucket_proportions",
+                "majority_bucket_share",
+                "normalised_bucket_entropy",
+                "represented_bucket_count",
+                "l1_allocation_deviation",
+                "total_variation_distance",
+                "target_deviation_count",
+                "resolution_reason",
+                "partition_bucket_unit",
+            ):
+                resolved[key] = partition_meta.get(key)
+        elif "backfill_count" in partition_meta:
+            # Historical v1 provenance remains readable without introducing
+            # its terminology into newly generated v2 records.
+            resolved["backfill_count"] = partition_meta.get("backfill_count")
+        distribution_map = {
+            "train": train_distribution,
+            "provenance": {
+                "requested_strategy": resolved["requested_strategy"],
+                "effective_strategy": resolved["effective_strategy"],
+                "requested_axis": resolved["requested_axis"],
+                "effective_axis": resolved["effective_axis"],
+                "axis_family": resolved["axis_family"],
+                "distribution_param": self.config.get("distribution_param"),
+                "bucket_spec": resolved["bucket_spec"],
+                "source_fields": resolved["source_fields"],
+                "fallback_reason": resolved["fallback_reason"],
+                "bucket_distribution": resolved["bucket_distribution"],
+                "fedavg_partition": self.config.get("generation_mode") == "fedavg",
+            "shared_parent_partition": self.config.get("generation_mode") == "shared_parent",
+                "client_partition_index": resolved["client_partition_index"],
+                "run_partition_seed": resolved["run_partition_seed"],
+                "fl_run_id": resolved["fl_run_id"],
+            },
+        }
+        if partition_version in {"joint_target_allocator_v2", "source_pool_sampler_v3"}:
+            distribution_map["provenance"]["partition_summary"] = {
+                key: resolved.get(key)
+                for key in (
+                    "partition_generator_version",
+                    "heterogeneity_intensity",
+                    "requested_partition_strategy",
+                    "requested_partition_params",
+                    "requested_quota",
+                    "effective_quota",
+                    "quota_shortfall",
+                    "initial_target_bucket_counts",
+                    "capacity_redraw_count",
+                    "source_pool_sample_count",
+                    "client_samples_used",
+                    "unused_source_samples",
+                    "target_bucket_counts",
+                    "target_bucket_proportions",
+                    "realised_bucket_counts",
+                    "realised_bucket_proportions",
+                    "majority_bucket_share",
+                    "normalised_bucket_entropy",
+                    "represented_bucket_count",
+                    "l1_allocation_deviation",
+                    "total_variation_distance",
+                    "target_deviation_count",
+                    "resolution_reason",
+                    "partition_hash",
+                    "partition_bucket_unit",
+                )
+            }
+        return {
+            "x_train": x_train,
+            "y_train": y_train,
+            "resolved": resolved,
+            "distribution_map": distribution_map,
+            "provenance_rows": [
+                {
+                    "split_name": "train",
+                    "samples_count": _sample_count(x_train, y_train),
+                    "data_distribution": train_distribution,
+                    "split_config": resolved,
+                }
+            ],
+        }
+
     def _resolve_service_split(self, x_train, y_train, meta: Mapping[str, Any]) -> dict[str, Any]:
+        selected_split = self.config.get("_pretokenization_split_info")
+        if selected_split is not None:
+            return selected_split
+        if self.config.get("generation_mode", "independent") == "independent":
+            from ..clients import partitioning
+            partitioning.validate_partition_config(self.config)
+            family = self.config.get("_family_document")
+            hf_task = meta.get("hf_task") or self.config.get("hf_task")
+            config = dict(self.config)
+            if config.get("sample_seed") is None:
+                config["sample_seed"] = _stable_sample_seed(config)
+            config.setdefault("client_partition_index", 0)
+            total = _sample_count(x_train, y_train)
+            if config.get("sample_size") is None:
+                config["sample_size"] = max(1, round(total * float(config.get("sample_frac") or 1)))
+            config["split_strategy"] = _canonical_split_strategy(config.get("split_strategy") or config.get("distribution_type") or "iid")
+            partition = partitioning.client_partition(x_train, y_train, config,
+                source_ids=(family["reservation"]["training_ids"] if family else
+                            [f"{meta.get('train_split') or 'train'}:{i}" for i in meta.get("selected_train_rows", range(total))]), meta=meta,
+                task_family=canonical_task_family(_resolved_task_type(self.config, meta), hf_task))
+            return self._split_info_from_prepared_partition(
+                partitioning.materialize_partition(x_train, y_train, partition), meta=meta)
         requested_strategy = (
             self.config.get("split_strategy")
             or self.config.get("distribution_type")
@@ -607,13 +1559,10 @@ class ServiceRunner:
             requested_axis=self.config.get("skew_axis"),
             axis_config=_parse_jsonish(self.config.get("skew_axis_config")),
         )
-        sample_cap = self.config.get("sample_size")
-        if sample_cap is None:
-            sample_cap = self.config.get("max_samples")
         x_train, y_train, sample_info = _sample_service_rows(
             x_train,
             y_train,
-            sample_size=sample_cap,
+            sample_size=self.config.get("sample_size"),
             sample_frac=self.config.get("sample_frac"),
             strategy=strategy,
             distribution_param=self.config.get("distribution_param"),
@@ -643,6 +1592,10 @@ class ServiceRunner:
             "effective_train_samples": _sample_count(x_train, y_train),
             "provenance_only": True,
         }
+        if self.config.get("_family_document"):
+            source = self.config["_family_document"]["reservation"]["training_ids"]
+            indices = sample_info.get("_indices")
+            resolved["partition_source_ids"] = list(source) if indices is None else [source[int(i)] for i in indices]
         distribution_map = {
             "train": train_distribution,
             "provenance": {
@@ -695,7 +1648,9 @@ class ServiceRunner:
             y_test=y_test,
             resolved_device=resolved_device,
         )
-        print("========== SERVICE RUN SUMMARY ==========")
+        if not debug_enabled(self.config):
+            return  # Concise results are printed once after completion.
+        print("========== CLIENT SETUP DEBUG ==========" if self.config.get("fl_run_id") else "========== SERVICE RUN SUMMARY ==========")
         for key, value in summary.items():
             print(f"{key}: {_format_summary_value(value)}")
         print("=========================================")
@@ -719,7 +1674,7 @@ class ServiceRunner:
             "task_type": self.config.get("task_type"),
             "dataset_name": self.config.get("dataset_name") or _nested_get(self.config, "dataset_args", "dataset_name"),
             "dataset_config": self.config.get("dataset_config") or _nested_get(self.config, "dataset_args", "dataset_config"),
-            "model_id": self.config.get("hf_model_id") or self.config.get("model_id") or getattr(model, "model_id", None),
+            "model_id": self.config.get("hf_model_id") or self.config.get("model_id") or getattr(model, "model_id", None) or self.config.get("model_type"),
             "training_regime": self.config.get("training_regime"),
             "resource_tier": self.config.get("resource_tier"),
             "dataset_variant": self.config.get("dataset_variant"),
@@ -739,6 +1694,8 @@ class ServiceRunner:
             "mixed_precision": self.config.get("mixed_precision"),
             "precision_type": self.config.get("precision_type"),
             "save_weights": _config_bool(self.config.get("save_weights"), False),
+            "checkpoint_patch_compression": self.config.get("checkpoint_patch_compression"),
+            "checkpoint_patch_compression_level": self.config.get("checkpoint_patch_compression_level"),
             "explainability_enabled": _config_bool(
                 self.config.get("enable_perturbation_metrics", self.config.get("explainability_enabled")),
                 True,
@@ -761,11 +1718,15 @@ class ServiceRunner:
             model_type=self.config.get("model_type"),
             meta=dict(meta),
             hf_model_id=self.config.get("hf_model_id"),
+            hf_model_revision=self.config.get("hf_model_revision"),
+            dataset_name=self.config.get("dataset_name"),
             hf_task=self.config.get("hf_task"),
             max_length=self.config.get("max_length"),
             device=_device_arg_for_model(self.config.get("device")),
             mixed_precision=self.config.get("mixed_precision"),
             precision_type=self.config.get("precision_type"),
+            mobilebert_head_normalization=self.config.get("mobilebert_head_normalization"),
+            max_grad_norm=self.config.get("max_grad_norm"),
             batch_size=_effective_hf_batch_size(self.config, task_family),
             task_tag=self.config.get("task_tag"),
             clustering_k=self.config.get("clustering_k"),
@@ -777,6 +1738,35 @@ class ServiceRunner:
         )
 
     def _train_model(self, model, x_train, y_train, *, task_family: str) -> dict[str, Any]:
+        from ..clients.training import realized_training_recipe
+        requested_config = self.config
+        effective, adjustment = realized_training_recipe(requested_config, _sample_count(x_train, y_train))
+        self._training_budget_adjustment = adjustment
+        self.config = effective
+        try:
+            from ..clients.reviewed_opportunity import validate_realized_coverage, runtime_evidence
+            validate_realized_coverage(effective, y_train)
+            metrics = self._train_model_effective(model, x_train, y_train, task_family=task_family)
+            metrics.update(runtime_evidence(effective, metrics, _sample_count(x_train, y_train)))
+        finally:
+            from ..execution_provenance import configuration_evidence
+            self._effective_training_configuration = configuration_evidence(effective)
+            if "training_memory_metadata" in effective:
+                requested_config["training_memory_metadata"] = effective["training_memory_metadata"]
+            self.config = requested_config
+        if adjustment:
+            metrics["training_budget_adjustment"] = adjustment
+            metrics["effective_training_epochs"] = effective["training_epochs"]
+            metrics["effective_gradient_accumulation_steps"] = metrics.get(
+                "gradient_accumulation_steps_effective", effective["gradient_accumulation_steps"])
+        return metrics
+
+    def _train_model_effective(self, model, x_train, y_train, *, task_family: str) -> dict[str, Any]:
+        from ..clients.training import validate_training_opportunity
+        try:
+            validate_training_opportunity(self.config, sample_size=_sample_count(x_train, y_train))
+        except ValueError as exc:
+            raise ServiceExecutionError(str(exc), failure_stage="client_training") from exc
         epochs = int(self.config.get("training_epochs", self.config.get("epochs", 1)) or 1)
         batch_size = int(self.config.get("batch_size", 32) or 32)
         learning_rate = float(self.config.get("learning_rate", 0.001) or 0.001)
@@ -794,34 +1784,101 @@ class ServiceRunner:
                 "max_train_time_s": self.config.get("max_train_time_s", 60),
                 "progress_log_interval": self.config.get("train_progress_log_interval", 10),
             }
+            frozen_settings = self.config.get("generation_mode") == "shared_parent" or self.config.get("_family_document")
+            fallback_kwargs = None if frozen_settings else {
+                key: fit_kwargs[key]
+                for key in ("epochs", "lr", "max_train_time_s", "progress_log_interval")
+                if key in fit_kwargs
+            }
             try:
-                qos = _fit_transformers_with_cuda_oom_retry(model, x_train, y_train, fit_kwargs, self.config)
-            except TypeError:
-                fallback_kwargs = {
-                    key: fit_kwargs[key]
-                    for key in ("epochs", "lr", "max_train_time_s", "progress_log_interval")
-                    if key in fit_kwargs
-                }
-                qos = _fit_transformers_with_cuda_oom_retry(model, x_train, y_train, fallback_kwargs, self.config)
+                fit_kwargs = resolve_fit_kwargs(model, x_train, y_train, fit_kwargs, legacy_kwargs=fallback_kwargs)
+            except TypeError as exc:
+                if frozen_settings:
+                    raise ServiceExecutionError("adapter cannot apply the frozen client training settings", failure_stage="client_training") from exc
+                raise
+            from ..execution_provenance import evidence_value
+            self._adapter_fit_arguments = evidence_value(fit_kwargs)
+            qos = _fit_transformers_with_memory_metadata(model, x_train, y_train, fit_kwargs, self.config)
             return dict(qos or {}, training_epochs=epochs)
+        if ((self.config.get("generation_mode") == "shared_parent" or self.config.get("_family_document"))
+                and callable(getattr(model, "compile", None)) and getattr(model, "optimizer", None) is not None):
+            import tensorflow as tf
+            started = time.perf_counter()
+            limit = self.config.get("max_train_time_s")
+            counts = {"steps": 0, "epochs": 0, "stopped": False}
+
+            class LocalBudget(tf.keras.callbacks.Callback):
+                last_progress_at = started
+
+                def on_train_batch_end(self, batch, logs=None):
+                    counts["steps"] += 1
+                    now = time.perf_counter()
+                    if counts["steps"] == 1 or now - self.last_progress_at >= 10:
+                        print(f"Training: epoch={counts['epochs'] + 1}/{epochs} "
+                              f"batch={batch + 1} elapsed_s={now - started:.1f}", flush=True)
+                        self.last_progress_at = now
+                    if limit is not None and time.perf_counter() - started >= float(limit):
+                        counts["stopped"] = True
+                        self.model.stop_training = True
+
+                def on_epoch_end(self, epoch, logs=None):
+                    if not counts["stopped"]:
+                        counts["epochs"] += 1
+                    print(f"Training: epoch={epoch + 1}/{epochs} finished "
+                          f"loss={(logs or {}).get('loss')}", flush=True)
+
+            history = model.fit(x_train, y_train, epochs=epochs, batch_size=batch_size, verbose=0,
+                                callbacks=[LocalBudget()])
+            return {"training_epochs": epochs, "completed_training_epochs": counts["epochs"],
+                    "optimizer_step_count": counts["steps"], "train_stopped_early": counts["stopped"],
+                    "train_stopping_reason": "resource_limit" if counts["stopped"] else "epochs_completed",
+                    "train_loss": float(history.history["loss"][-1])}
         train_local_model(model, x_train, y_train, epochs=epochs, batch_size=batch_size, lr=learning_rate)
         return {"training_epochs": epochs}
 
-    def _evaluate_model(self, model, x_test, y_test, *, inference_only: bool, task_family: str) -> tuple[float, float, float, dict[str, Any]]:
-        if hasattr(model, "evaluate") and model.__class__.__name__.lower().startswith("transformers"):
-            loss, primary, secondary, qos = model.evaluate(
-                x_test,
-                y_test,
-                inference_only=inference_only,
-                max_eval_time_s=self.config.get("max_eval_time_s"),
-                progress_log_interval=self.config.get("eval_progress_log_interval", 10),
-            )
-            return loss, primary, secondary, dict(qos or {})
-        if task_family == "clustering" and hasattr(model, "evaluate"):
-            loss, primary, secondary = model.evaluate(x_test, y_test)
+    def _evaluate_model(self, model, x_test, y_test, *, inference_only: bool, task_family: str,
+                        enforce_time_limit: bool = True) -> tuple[float, float, float, dict[str, Any]]:
+        try:
+            if self.config.get("task_contract") and task_family in {"token_classification", "segmentation", "generation"}:
+                from ..tasks.contracts import TaskContract
+                from ..tasks.runtime import evaluate_task_model
+                contract = TaskContract.from_dict(self.config["task_contract"])
+                result = evaluate_task_model(model, x_test, y_test, contract, [str(i) for i in range(len(y_test))],
+                    max_eval_time_s=self.config.get("max_eval_time_s") if enforce_time_limit else None)
+                metrics = result.metrics
+                # The existing runner names primary/secondary independently; provide its historical order.
+                primary, secondary = metrics[contract.evaluation["primary"]], metrics[contract.evaluation["secondary"]]
+                qos = {key: value for key, value in metrics.items() if isinstance(value, (int, float, str))}
+                # Keep already-computed prediction counts for collapse review.
+                # Dropping the nested per-class table otherwise discards this
+                # evidence and forces a second inference pass to recover it.
+                for label, values in metrics.get("per_class", {}).items():
+                    qos[f"metric_stat_class_{label}_pred_total"] = int(values["predicted"])
+                    qos[f"metric_stat_class_{label}_target_total"] = int(values["support"])
+                return metrics["loss"], primary, secondary, qos
+            if hasattr(model, "evaluate") and model.__class__.__name__.lower().startswith("transformers"):
+                loss, primary, secondary, qos = model.evaluate(
+                    x_test,
+                    y_test,
+                    inference_only=inference_only,
+                    max_eval_time_s=self.config.get("max_eval_time_s") if enforce_time_limit else None,
+                    progress_log_interval=self.config.get("eval_progress_log_interval", 10),
+                )
+                return loss, primary, secondary, dict(qos or {})
+            if task_family == "clustering" and hasattr(model, "evaluate"):
+                loss, primary, secondary = model.evaluate(x_test, y_test)
+                return loss, primary, secondary, {}
+            if task_family == "regression":
+                values = evaluate_regression_model(model, x_test, y_test)
+                return values["loss"], values["rmse"], values["mae"], {
+                    name: values[name]
+                    for name in ("mse", "rmse", "mae")}
+            loss, primary, secondary = evaluate_model(model, x_test, y_test, task_type="classification")
             return loss, primary, secondary, {}
-        loss, primary, secondary = evaluate_model(model, x_test, y_test, task_type=("regression" if task_family == "regression" else "classification"))
-        return loss, primary, secondary, {}
+        finally:
+            core = getattr(model, "core", model)
+            self.config["evaluation_memory_metadata"] = dict(getattr(core, "evaluation_memory_metadata", {}))
+
 
     def _service_record(
         self,
@@ -857,15 +1914,82 @@ class ServiceRunner:
             "dataset_variant": self.config.get("dataset_variant"),
             "split_variant": self.config.get("split_variant"),
             "knob_variant": self.config.get("knob_variant"),
-            "service_config_json": self.config.get("service_config") or _service_config(self.config),
+            "service_config_json": {**(self.config.get("service_config") or {}), **_service_config(self.config)},
             "registry_metadata_json": registry_metadata if registry_metadata is not None else _registry_metadata(self.config),
             "functional_attributes_json": functional_attributes or {},
-            "metadata_json": metadata or {"started_at": started_at},
+            "metadata_json": {**(metadata or {"started_at": started_at}),
+                "training_memory_metadata": self.config.get("training_memory_metadata"),
+                "evaluation_memory_metadata": self.config.get("evaluation_memory_metadata"),
+                "execution_owner": self.config.get("_execution_owner"),
+                "execution_run_id": self.config.get("_execution_run_id"),
+                "manifest_group_id": self.config.get("manifest_group_id")},
         }
 
+    def _persist_progress(self, phase: str, *, started_at: str) -> None:
+        """Track execution phase locally; publish only a finished service result."""
+        self.config["_execution_phase"] = str(phase)
+        self.config["_execution_started_at"] = started_at
 
+
+@terminal_scope(lambda config: config)
 def execute_service(config: Mapping[str, Any]) -> ServiceExecutionResult:
-    return ServiceRunner(config).run()
+    try:
+        instance = ServiceRunner(config)
+    except BaseException as exc:
+        resolved = {**CONFIG, **config}
+        resolved["service_id"] = resolve_service_id(resolved)
+        from ..debug_mode import apply_debug_mode
+        apply_debug_mode(resolved)
+        status = "failed" if isinstance(exc, Exception) else "interrupted"
+        persist_terminal(resolved, status=status, reason=str(exc) or type(exc).__name__,
+                         failure_stage="service_initialization", exc=exc)
+        if status == "interrupted":
+            raise
+        return ServiceExecutionResult(service_id=resolved["service_id"], status="failed",
+                                      db_path=str(resolved["db_path"]), metrics={}, error=bounded_text(str(exc)))
+    return instance.run()
+
+
+def persist_status_only_service(
+    config: Mapping[str, Any], *, status: str, reason: str | None = None
+) -> ServiceExecutionResult:
+    """Persist a FedAvg observation that intentionally has no trained model."""
+    resolved = dict(config)
+    runner = ServiceRunner(resolved)
+    db_path = str(resolved.get("db_path") or CONFIG.get("db_path") or "mlaas.db")
+    now = datetime.now(timezone.utc).isoformat()
+    record = runner._service_record(
+        status=str(status),
+        started_at=now,
+        metadata={
+            "started_at": now,
+            "completed_at": now,
+            "status_reason": reason,
+            "fedavg": {
+                "fl_run_id": resolved.get("fl_run_id"),
+                "client_id": resolved.get("client_id"),
+                "round_id": resolved.get("round_id"),
+                "scheduled_to_participate": resolved.get("scheduled_to_participate"),
+                "participation_schedule_seed": resolved.get("participation_schedule_seed"),
+                "participation_schedule_version": resolved.get("participation_schedule_version"),
+            },
+        },
+    )
+    writer = make_writer("sqlite", db_path=db_path)
+    try:
+        writer.start()
+        writer.write_service(record)
+        writer.finish()
+    except Exception:
+        writer.abort()
+        raise
+    return ServiceExecutionResult(
+        service_id=runner.service_id,
+        status=str(status),
+        db_path=db_path,
+        metrics={},
+        error=reason,
+    )
 
 
 def reset_model_to_weights(model: Any, weights: Any) -> bool:
@@ -917,9 +2041,16 @@ def _gpu_fallback_warning(requested_device: Any, resolved_device: Any) -> str | 
 def _apply_runtime_knobs_to_model(model: Any, config: Mapping[str, Any]) -> None:
     batch_size = _safe_int(config.get("batch_size"))
     max_length = _safe_int(config.get("max_length"))
+    max_grad_norm = config.get("max_grad_norm")
+    if max_grad_norm is not None:
+        max_grad_norm = float(max_grad_norm)
+        if not np.isfinite(max_grad_norm) or max_grad_norm <= 0:
+            raise ValueError("max_grad_norm must be finite and positive")
     for candidate in (model, getattr(model, "core", None)):
         if candidate is None:
             continue
+        if hasattr(candidate, "max_grad_norm"):
+            candidate.max_grad_norm = max_grad_norm
         if batch_size is not None and hasattr(candidate, "batch_size"):
             try:
                 setattr(candidate, "batch_size", int(batch_size))
@@ -948,13 +2079,6 @@ def _apply_runtime_knobs_to_model(model: Any, config: Mapping[str, Any]) -> None
                 pass
 
 
-def _is_cuda_oom_error(exc: BaseException) -> bool:
-    text = str(exc).lower()
-    return "cuda out of memory" in text or (
-        exc.__class__.__name__.lower() == "outofmemoryerror" and "cuda" in text
-    )
-
-
 def _clear_cuda_cache_if_available(model: Any = None) -> None:
     torch_mod = None
     core = getattr(model, "core", None) if model is not None else None
@@ -978,37 +2102,26 @@ def _clear_cuda_cache_if_available(model: Any = None) -> None:
             pass
 
 
-def _fit_transformers_with_cuda_oom_retry(
+def _fit_transformers_with_memory_metadata(
     model: Any,
     x_train: Any,
     y_train: Any,
     fit_kwargs: dict[str, Any],
     config: dict[str, Any],
 ) -> Any:
+    # HFCore owns transactional microbatch recovery. Re-running model.fit here
+    # could duplicate already committed updates and silently alter the recipe.
     try:
         return model.fit(x_train, y_train, **fit_kwargs)
-    except Exception as exc:
-        if not _is_cuda_oom_error(exc):
-            raise
-        current_batch_size = _safe_int(config.get("batch_size")) or _safe_int(getattr(model, "batch_size", None)) or 1
-        if current_batch_size <= 1 or bool(config.get("_cuda_oom_retry_attempted")):
-            raise
-        retry_batch_size = max(1, int(current_batch_size) // 2)
-        config["_cuda_oom_retry_attempted"] = True
-        config["batch_size"] = retry_batch_size
-        _apply_runtime_knobs_to_model(model, config)
-        _clear_cuda_cache_if_available(model)
-        print(
-            "[HFCore.finetune] CUDA OOM retry starts | "
-            f"batch_size={current_batch_size} -> {retry_batch_size}"
-        )
-        return model.fit(x_train, y_train, **fit_kwargs)
+    finally:
+        core = getattr(model, "core", model)
+        config["training_memory_metadata"] = dict(getattr(core, "training_memory_metadata", {}))
 
 
 def _clear_model_runtime_state(model: Any) -> None:
     core = getattr(model, "core", None)
     torch = getattr(core, "torch", None)
-    raw_model = getattr(core, "model", None) or getattr(model, "model", None)
+    raw_model = getattr(core, "model", None) or getattr(model, "model", None) or model
     if raw_model is not None:
         zero_grad = getattr(raw_model, "zero_grad", None)
         if callable(zero_grad):
@@ -1037,6 +2150,100 @@ def _clear_model_runtime_state(model: Any) -> None:
                 pass
 
 
+def prepare_model_for_local_update_seed(config: Mapping[str, Any]) -> None:
+    """Seed model construction, independently of later local-update resets."""
+    seed = int(config.get("training_seed", config.get("seed", 42)))
+    random.seed(seed)
+    np.random.seed(seed % (2**32))
+    if config.get("model_type") in {"mlp", "cnn", "logreg"}:
+        try:
+            import tensorflow as tf
+            tf.keras.utils.set_random_seed(seed)
+        except ImportError:
+            pass
+    else:
+        try:
+            import torch
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
+        except ImportError:
+            pass
+
+
+def prepare_model_for_local_update(model: Any, config: Mapping[str, Any]) -> None:
+    """Reset all training-only state without changing model parameters."""
+    seed = _safe_int(config.get("training_seed"))
+    if seed is None:
+        seed = _safe_int(config.get("seed")) or 0
+    random.seed(seed)
+    np.random.seed(seed % (2**32))
+
+    candidates = (model, getattr(model, "core", None), getattr(model, "model", None))
+    keras_like = any(
+        candidate is not None
+        and any(
+            token in str(getattr(candidate.__class__, "__module__", "")).lower()
+            for token in ("keras", "tensorflow")
+        )
+        for candidate in candidates
+    )
+    if keras_like:
+        try:
+            import tensorflow as tf
+
+            tf.keras.utils.set_random_seed(seed)
+            # Existing Keras Dropout/random layers own generators whose counters
+            # survive global seeding and recompilation. Reset those separately
+            # from model weights so execution order cannot transfer randomness.
+            for owner in candidates:
+                flatten = getattr(owner, "_flatten_layers", None)
+                if not callable(flatten):
+                    continue
+                for index, layer in enumerate(flatten(include_self=True, recursive=True)):
+                    for offset, generator in enumerate(getattr(layer, "_seed_generators", ())):
+                        generator.state.assign([(seed + 104729 * index + offset) % (2**31 - 1), 0])
+        except (ImportError, AttributeError):
+            pass
+    torch_like = any(
+        candidate is not None
+        and (
+            callable(getattr(candidate, "state_dict", None))
+            or getattr(candidate, "torch", None) is not None
+        )
+        for candidate in candidates
+    )
+    if torch_like:
+        try:
+            import torch
+
+            torch.manual_seed(seed)
+            if bool(getattr(torch, "cuda", None)) and torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
+        except (ImportError, AttributeError):
+            pass
+
+    _clear_model_runtime_state(model)
+    prepare_keras_local_update(
+        model,
+        optimizer=str(config.get("optimizer") or "adam"),
+        learning_rate=float(config.get("learning_rate") or 0.001),
+        weight_decay=float(config.get("weight_decay") or 0.0),
+    )
+    for candidate in (model, getattr(model, "core", None)):
+        if candidate is None:
+            continue
+        for name in ("optimizer", "scheduler", "scaler", "grad_scaler"):
+            if hasattr(candidate, name) and "keras" not in str(
+                getattr(candidate.__class__, "__module__", "")
+            ).lower():
+                try:
+                    setattr(candidate, name, None)
+                except Exception:
+                    pass
+    _apply_runtime_knobs_to_model(model, config)
+
+
 def _resolve_execution_device(model) -> str:
     candidates = [model, getattr(model, "core", None), getattr(model, "model", None)]
     for obj in candidates:
@@ -1055,35 +2262,6 @@ def _resolve_execution_device(model) -> str:
     return "unknown"
 
 
-def _canonical_split_strategy(value: Any) -> str:
-    strategy = str(value or "iid").strip().lower().replace("-", "_")
-    aliases = {
-        "niid": "dirichlet",
-        "non_iid": "dirichlet",
-        "non_iid_dirichlet": "dirichlet",
-        "shards": "shard",
-        "quantity": "quantity_skew",
-        "quantity_skewed": "quantity_skew",
-    }
-    return aliases.get(strategy, strategy)
-
-
-def _stable_sample_seed(config: Mapping[str, Any]) -> int:
-    parts = [
-        config.get("seed", 42),
-        config.get("service_id"),
-        config.get("hf_model_id") or config.get("model_type"),
-        config.get("dataset_name") or config.get("dataset"),
-        config.get("dataset_config"),
-        config.get("dataset_variant"),
-        config.get("split_variant"),
-        config.get("knob_variant"),
-        config.get("split_strategy") or config.get("distribution_type"),
-    ]
-    raw = "|".join("" if value is None else str(value) for value in parts)
-    return int(hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8], 16)
-
-
 def _parse_jsonish(value: Any) -> Any:
     if value is None or isinstance(value, (dict, list)):
         return value
@@ -1098,85 +2276,11 @@ def _parse_jsonish(value: Any) -> Any:
     return value
 
 
-def _sample_service_rows(
-    x,
-    y,
-    *,
-    sample_size: Any,
-    sample_frac: Any,
-    strategy: str = "iid",
-    distribution_param: Any = None,
-    axis=None,
-    rng,
-) -> tuple[Any, Any, dict[str, Any]]:
-    total = _sample_count(x, y)
-    requested = _safe_int(sample_size)
-    if requested is None and sample_frac is not None:
-        try:
-            requested = int(round(total * float(sample_frac)))
-        except Exception:
-            requested = None
-    if requested is None:
-        return x, y, {
-            "requested_sample_size_total": None,
-            "sample_strategy_effective": "all",
-            "effective_strategy": "all",
-            "effective_axis": getattr(axis, "effective_axis", None),
-            "bucket_distribution": bucket_distribution(getattr(axis, "bucket_ids", None), getattr(axis, "bucket_labels", None)),
-        }
-    requested = max(0, min(total, int(requested)))
-    if requested == total:
-        return x, y, {
-            "requested_sample_size_total": requested,
-            "sample_strategy_effective": "all",
-            "effective_strategy": "all",
-            "effective_axis": getattr(axis, "effective_axis", None),
-            "bucket_distribution": bucket_distribution(getattr(axis, "bucket_ids", None), getattr(axis, "bucket_labels", None)),
-        }
-    strategy = _canonical_split_strategy(strategy)
-    info = {
-        "requested_sample_size_total": requested,
-        "sample_strategy_effective": strategy,
-        "effective_strategy": strategy,
-        "effective_axis": getattr(axis, "effective_axis", None),
-        "bucket_distribution": bucket_distribution(getattr(axis, "bucket_ids", None), getattr(axis, "bucket_labels", None)),
-    }
-    if requested <= 0:
-        idx = np.asarray([], dtype=int)
-    elif strategy in {"dirichlet", "quantity_skew"}:
-        effective_strategy = "dirichlet" if strategy == "quantity_skew" else strategy
-        info["effective_strategy"] = effective_strategy
-        if strategy == "quantity_skew":
-            info["fallback_reason"] = "quantity_skew is a service-local compatibility alias for dirichlet on the resolved skew axis"
-        compatible, reason = axis_supports_strategy(axis, effective_strategy) if axis is not None else (False, "missing skew axis")
-        if not compatible or getattr(axis, "bucket_ids", None) is None:
-            idx = rng.choice(total, size=requested, replace=False)
-            info["sample_strategy_effective"] = "iid"
-            info["effective_strategy"] = "iid"
-            info["fallback_reason"] = reason or info.get("fallback_reason") or f"strategy='{strategy}' requires a resolvable skew axis"
-        else:
-            idx, skew_info = _strategy_sample_indices(
-                getattr(axis, "bucket_ids"),
-                total=total,
-                requested=requested,
-                strategy=effective_strategy,
-                distribution_param=distribution_param,
-                bucket_labels=getattr(axis, "bucket_labels", None),
-                rng=rng,
-            )
-            info.update(skew_info)
-    else:
-        idx = rng.choice(total, size=requested, replace=False)
-    return _take_rows(x, idx), _take_rows(y, idx), info
-
-
 def _cap_benchmark_split(x, y, *, config: Mapping[str, Any]) -> tuple[Any, Any, dict[str, Any]]:
     cap = (
         config.get("benchmark_sample_size")
         or config.get("max_benchmark_samples")
         or config.get("max_eval_samples")
-        or config.get("max_samples")
-        or config.get("sample_size")
     )
     requested = _safe_int(cap)
     total = _sample_count(x, y)
@@ -1194,67 +2298,20 @@ def _cap_benchmark_split(x, y, *, config: Mapping[str, Any]) -> tuple[Any, Any, 
             "sample_strategy_effective": "all",
         }
 
-    seed = _safe_int(config.get("sample_seed"))
+    seed = _safe_int(config.get("benchmark_sample_seed"))
+    if seed is None:
+        seed = _safe_int(config.get("sample_seed"))
     if seed is None:
         seed = _stable_sample_seed(config)
-    rng = np.random.default_rng(int(seed) + 1)
+    benchmark_offset = 1 if config.get("benchmark_sample_seed") is None else 0
+    rng = np.random.default_rng(int(seed) + benchmark_offset)
     idx = rng.choice(total, size=requested, replace=False)
     return _take_rows(x, idx), _take_rows(y, idx), {
         "requested_sample_size_total": requested,
         "effective_sample_size_total": requested,
         "sample_strategy_effective": "iid",
-        "sample_seed": int(seed) + 1,
-    }
-
-
-def _strategy_sample_indices(bucket_ids, *, total: int, requested: int, strategy: str, distribution_param: Any, bucket_labels: Mapping[str, Any] | None, rng) -> tuple[np.ndarray, dict[str, Any]]:
-    labels = np.asarray(bucket_ids, dtype=np.int64).reshape(-1)
-    if len(labels) != total:
-        raise ValueError("bucket_ids length does not match sample count")
-    unique_labels = np.asarray(sorted(np.unique(labels).tolist()), dtype=labels.dtype)
-    if len(unique_labels) <= 1:
-        return (
-            rng.choice(total, size=requested, replace=False),
-            {
-                "sample_strategy_effective": "iid",
-                "fallback_reason": f"strategy='{strategy}' requires at least two axis buckets",
-            },
-        )
-
-    alpha = _to_float(distribution_param)
-    if math.isnan(alpha) or alpha <= 0:
-        alpha = 0.2
-    concentration = max(0.05, min(float(alpha), 10.0))
-
-    weights = rng.dirichlet(np.full(len(unique_labels), concentration, dtype="float64"))
-    counts = _counts_from_weights(weights, requested, labels, unique_labels)
-    chosen: list[int] = []
-    for label, count in zip(unique_labels, counts):
-        if count <= 0:
-            continue
-        pool = np.where(labels == label)[0]
-        if len(pool) == 0:
-            continue
-        chosen.extend(rng.choice(pool, size=min(int(count), len(pool)), replace=False).tolist())
-
-    if len(chosen) < requested:
-        remaining = np.setdiff1d(np.arange(total, dtype=int), np.asarray(chosen, dtype=int), assume_unique=False)
-        if len(remaining) > 0:
-            top_up = rng.choice(remaining, size=min(requested - len(chosen), len(remaining)), replace=False)
-            chosen.extend(top_up.tolist())
-
-    idx = np.asarray(chosen[:requested], dtype=int)
-    rng.shuffle(idx)
-    return idx, {
-        "sample_strategy_effective": strategy,
-        "effective_strategy": strategy,
-        "label_sampling_alpha": float(alpha),
-        "label_sampling_concentration": float(concentration),
-        "label_sampling_weights": {
-            str((bucket_labels or {}).get(str(int(label)), int(label))): float(weight)
-            for label, weight in zip(unique_labels.tolist(), weights.tolist())
-        },
-        "bucket_distribution": bucket_distribution(labels[idx], bucket_labels),
+        "sample_seed": int(seed) + benchmark_offset,
+        "benchmark_sample_seed": config.get("benchmark_sample_seed"),
     }
 
 
@@ -1276,44 +2333,6 @@ def _scalar_label_array(y) -> np.ndarray | None:
     if isinstance(first, (list, tuple, dict, np.ndarray)):
         return None
     return arr
-
-
-def _counts_from_weights(weights: np.ndarray, requested: int, labels: np.ndarray, unique_labels: np.ndarray) -> np.ndarray:
-    capacities = np.asarray([int(np.sum(labels == label)) for label in unique_labels], dtype=int)
-    raw = np.asarray(weights, dtype="float64") * float(requested)
-    counts = np.floor(raw).astype(int)
-    counts = np.minimum(counts, capacities)
-    while counts.sum() < requested and np.any(counts < capacities):
-        remaining_capacity = capacities - counts
-        fractional = raw - np.floor(raw)
-        scores = np.where(remaining_capacity > 0, fractional + weights, -1.0)
-        idx = int(np.argmax(scores))
-        if scores[idx] < 0:
-            break
-        counts[idx] += 1
-    while counts.sum() > requested:
-        idx = int(np.argmax(counts))
-        counts[idx] -= 1
-    return counts
-
-
-def _take_rows(value, idx):
-    if value is None:
-        return None
-    if isinstance(value, Mapping):
-        return {key: _take_rows(child, idx) for key, child in value.items()}
-    if isinstance(value, np.ndarray):
-        return value[idx]
-    if isinstance(value, tuple):
-        idx_list = idx.tolist() if isinstance(idx, np.ndarray) else list(idx)
-        return tuple(value[i] for i in idx_list)
-    if isinstance(value, list):
-        idx_list = idx.tolist() if isinstance(idx, np.ndarray) else list(idx)
-        return [value[i] for i in idx_list]
-    try:
-        return np.asarray(value, dtype=object)[idx]
-    except Exception:
-        return value
 
 
 def _distribution_summary(x, y, *, meta: Mapping[str, Any], task_family: str | None, hf_task: str | None) -> Any:
@@ -1549,17 +2568,23 @@ def _first_number(mapping: Mapping[str, Any], *keys: str) -> float | None:
 
 
 def _service_perturbation_metrics(model, x_eval, y_eval, *, config: Mapping[str, Any], meta: Mapping[str, Any], task_family: str):
-    enabled = _config_bool(config.get("enable_perturbation_metrics", config.get("explainability_enabled")), True)
+    # ``explainability_enabled`` is retained as the user-facing compatibility
+    # switch. Either explicit switch enables the probe; a disabled default must
+    # not erase an explicitly enabled legacy manifest field.
+    enabled = _config_bool(config.get("enable_perturbation_metrics"), False) or _config_bool(
+        config.get("explainability_enabled"), False
+    )
     if not enabled:
         return {
             "perturbation_enabled_flag": _metric(False, "explainability"),
             "explainability_supported_flag": _metric(False, "explainability"),
-            "explainability_score": _metric(0.0, "explainability", "score", "higher_better"),
+            "faithfulness_alignment_supported_flag": _metric(False, "explainability"),
+            "explainability_support_status": _metric("disabled", "explainability"),
         }, None
     log_stage = _config_bool(config.get("perturbation_stage_logging"), True)
     start = time.perf_counter()
     if log_stage:
-        print(
+        debug_print(
             f"[Perturbation] service stage starts | service_id={config.get('service_id') or 'unknown'} "
             f"| task={task_family or 'unknown'} | samples={_sample_count(x_eval, y_eval)}",
             flush=True,
@@ -1581,14 +2606,15 @@ def _service_perturbation_metrics(model, x_eval, y_eval, *, config: Mapping[str,
             "perturbation_enabled_flag": True,
             "perturbation_supported_flag": False,
             "explainability_supported_flag": False,
-            "explainability_score": 0.0,
+            "faithfulness_alignment_supported_flag": False,
+            "explainability_support_status": "unsupported_probe_error",
             "perturbation_error": f"{type(exc).__name__}: {exc}",
             "perturbation_duration_s": elapsed,
         }
     if isinstance(values, dict):
         values.setdefault("perturbation_duration_s", time.perf_counter() - start)
     if log_stage:
-        print(
+        debug_print(
             f"[Perturbation] service stage ends | service_id={config.get('service_id') or 'unknown'} "
             f"| supported={(values or {}).get('perturbation_supported_flag')} "
             f"| samples={(values or {}).get('perturbation_sample_count', 0)} "
@@ -1614,7 +2640,7 @@ def _log_service_timing(config: Mapping[str, Any], service_id: str, stage: str, 
     message = f"[ServiceTiming] service_id={service_id} | model={model_id} | stage={stage} | elapsed_s={elapsed_s:.3f}"
     if detail:
         message = f"{message} | {detail}"
-    print(message, flush=True)
+    debug_print(message, flush=True)
 
 
 def _stage_timing_metrics(stage_timings: Mapping[str, float]) -> dict[str, Any]:
@@ -1647,6 +2673,31 @@ def _load_dataset(name: str, **kwargs):
     return load_dataset(name, **kwargs)
 
 
+def _assert_strict_cohort_access(config: Mapping[str, Any]) -> None:
+    """Guard prepared strict runs from receiving audit examples.
+
+    The composition validator passes only ``training`` or
+    ``catalogue_metric`` IDs into a service execution.  Failing closed here
+    prevents a future caller from accidentally evaluating catalogue metrics on
+    the held-out audit partition.
+    """
+    plan = config.get("_strict_cohort_plan")
+    if plan is None:
+        return
+    if not isinstance(plan, Mapping):
+        raise ServiceExecutionError("_strict_cohort_plan must be a mapping", failure_stage="cohort_isolation")
+    role = str(config.get("_strict_cohort_role") or "").strip().lower()
+    if role not in {"training", "catalogue_metric"}:
+        raise ServiceExecutionError("strict service runs must declare training or catalogue_metric role", failure_stage="cohort_isolation")
+    supplied = {str(item) for item in (config.get("_strict_cohort_example_ids") or [])}
+    expected = {str(item) for item in (plan.get(f"{role}_ids") or [])}
+    audit = {str(item) for item in (plan.get("audit_ids") or [])}
+    if not supplied or supplied != expected:
+        raise ServiceExecutionError("strict run example IDs do not exactly match its declared cohort role", failure_stage="cohort_isolation")
+    if supplied.intersection(audit):
+        raise ServiceExecutionError("audit examples were supplied to a service execution", failure_stage="cohort_isolation")
+
+
 def _create_model(**kwargs):
     global create_model
     if create_model is None:
@@ -1658,6 +2709,18 @@ def _create_model(**kwargs):
 
 def _service_config(config: Mapping[str, Any]) -> dict[str, Any]:
     keys = (
+        "mobilebert_head_normalization",
+        "max_grad_norm",
+        "smoke_test",
+        "miopen_find_mode",
+        "miopen_process_isolated",
+        "training_memory_metadata",
+        "evaluation_memory_metadata",
+        "no_save_weights",
+        "enable_perturbation_metrics",
+        "explainability_enabled",
+        "update_signature_enabled",
+        "precision_policy",
         "resource_tier",
         "batch_size",
         "learning_rate",
@@ -1667,13 +2730,14 @@ def _service_config(config: Mapping[str, Any]) -> dict[str, Any]:
         "momentum",
         "warmup_ratio",
         "gradient_accumulation_steps",
-        "max_samples",
         "sample_size",
         "sample_seed",
         "max_length",
         "device",
         "mixed_precision",
         "precision_type",
+        "checkpoint_patch_compression",
+        "checkpoint_patch_compression_level",
         "num_workers",
         "timeout_s",
         "max_train_time_s",
@@ -1726,23 +2790,6 @@ def _registry_metadata(config: Mapping[str, Any]) -> dict[str, Any]:
         "hf_service_meta_json",
     )
     return {key: config.get(key) for key in keys if config.get(key) is not None}
-
-
-def _sample_count(x, y=None) -> int:
-    source = y if y is not None else x
-    if source is None:
-        return 0
-    if isinstance(source, Mapping):
-        for value in source.values():
-            try:
-                return int(len(value))
-            except Exception:
-                continue
-        return 0
-    try:
-        return int(len(source))
-    except Exception:
-        return 0
 
 
 def _count_model_params(model) -> int:
@@ -1868,6 +2915,8 @@ def _specify_metric_dict(values: Mapping[str, Any]) -> dict[str, Any]:
             out[normalized.replace("_ms_mean", "_s_mean")] = _metric(_to_float(value) / 1000.0, "latency", "s", "lower_better")
         elif normalized.endswith("_ms_p95"):
             out[normalized.replace("_ms_p95", "_s_p95")] = _metric(_to_float(value) / 1000.0, "latency", "s", "lower_better")
+        elif normalized in {"mse", "rmse", "mae"}:
+            out[normalized] = _metric(value, "quality", direction="lower_better")
         else:
             out[normalized] = _metric(value, metric_domain(normalized))
     return out
@@ -1878,7 +2927,7 @@ def _metric(value: Any, domain: str, unit: str | None = None, direction: str = "
 
 
 def _quality_direction(metric_name: str) -> str:
-    return "lower_better" if str(metric_name).lower() in {"loss", "rmse", "mae", "perplexity"} else "higher_better"
+    return "lower_better" if str(metric_name).lower() in {"loss", "mse", "rmse", "mae", "perplexity"} else "higher_better"
 
 
 def _resolved_task_type(config: Mapping[str, Any], meta: Mapping[str, Any]) -> str | None:
@@ -1891,7 +2940,7 @@ def _resolved_task_type(config: Mapping[str, Any], meta: Mapping[str, Any]) -> s
     ):
         return "regression"
     if meta_task_text and canonical_task_family(meta_task_text, hf_task) != "unknown":
-        return meta_task_text
+        return "classification" if canonical_task_family(meta_task_text, hf_task) == "classification" else meta_task_text
     config_task_type = config.get("task_type")
     if _is_blank(config_task_type):
         return None
@@ -1899,7 +2948,7 @@ def _resolved_task_type(config: Mapping[str, Any], meta: Mapping[str, Any]) -> s
     config_task_family = canonical_task_family(config_task_text, hf_task)
     if hf_task_norm == "sentence_similarity" and config_task_family == "regression":
         return "regression"
-    return config_task_text
+    return "classification" if config_task_family == "classification" else config_task_text
 
 
 def _validate_service_compatibility(
@@ -1910,6 +2959,7 @@ def _validate_service_compatibility(
     batch_size: int | None,
     train_samples: int,
     benchmark_samples: int,
+    task_contract: Mapping[str, Any] | None = None,
 ) -> None:
     if training_regime in {"inference_only", "inference"}:
         return
@@ -1917,6 +2967,11 @@ def _validate_service_compatibility(
         "detection": (32, 16),
         "segmentation": (32, 16),
     }
+    if task_contract:
+        from ..tasks import TaskContract
+        contract = TaskContract.from_dict(task_contract)
+        minimums[task_family] = (int(contract.training.get("minimum_examples", 1)),
+                                int(contract.evaluation.get("minimum_examples", 1)))
     if task_family in minimums:
         min_train, min_benchmark = minimums[task_family]
         if train_samples < min_train or benchmark_samples < min_benchmark:
@@ -1939,8 +2994,10 @@ def _validate_service_compatibility(
 def _required_secondary_metrics(task_family: str, hf_task: str | None, primary_name: str | None) -> tuple[str, ...]:
     metric = str(primary_name or "").strip().lower()
     hf_task_norm = str(hf_task or "").strip().lower().replace("-", "_")
-    if hf_task_norm == "sentence_similarity":
+    if hf_task_norm == "sentence_similarity" and task_family == "regression":
         return ("spearman",)
+    if hf_task_norm == "sentence_similarity" and task_family == "classification":
+        return ("f1",)
     if task_family == "detection" and metric == "map":
         return ("map@0.5",)
     if task_family == "segmentation" and metric == "iou":
@@ -2012,7 +3069,13 @@ def _validate_service_metrics(
     secondary_name: str | None,
     secondary_value: Any,
     metric_score: Any,
+    loss_value: Any = None,
 ) -> None:
+    if task_family == "generation" and not _is_finite_numeric_metric(loss_value):
+        raise ServiceExecutionError(
+            f"nonfinite_evaluation_loss: supervised generation loss is missing or non-finite: {loss_value!r}",
+            failure_stage="metric_validation",
+        )
     if not _is_finite_numeric_metric(primary_value):
         if _is_sentence_similarity_metric_fallback(
             hf_task=hf_task,
@@ -2042,22 +3105,6 @@ def _validate_service_metrics(
                 f"Required secondary metric '{required_name}' is not a finite numeric value: {required_value!r}",
                 failure_stage="metric_validation",
             )
-
-
-def _to_float(value: Any) -> float:
-    try:
-        return float(value)
-    except Exception:
-        return math.nan
-
-
-def _safe_int(value: Any) -> int | None:
-    try:
-        if value is None:
-            return None
-        return int(value)
-    except Exception:
-        return None
 
 
 def _safe_str(value: Any) -> str | None:
@@ -2109,6 +3156,506 @@ def _update_signature_output_dir(config: Mapping[str, Any]) -> str:
     return os.path.join("outputs", "update_signatures")
 
 
+def _provenance_artifact_root(config: Mapping[str, Any]) -> str:
+    configured = config.get("provenance_artifact_dir")
+    if configured:
+        return str(configured)
+    db_path = str(config.get("db_path") or CONFIG.get("db_path") or "")
+    folder = os.path.dirname(db_path)
+    return os.path.join(folder or "outputs", "service_artifacts")
+
+
+def _checkpoint_compression(config: Mapping[str, Any]) -> CompressionSpec:
+    algorithm = str(config.get("checkpoint_patch_compression") or "zlib").strip().lower()
+    level = _safe_int(config.get("checkpoint_patch_compression_level"))
+    return CompressionSpec(algorithm=algorithm, level=1 if level is None else level)
+
+
+def _checkpoint_fallback_details(exc: BaseException) -> dict[str, Any]:
+    if isinstance(exc, UnsupportedTensorStateError):
+        return exc.as_fallback_signal()
+    return {
+        "required": True,
+        "policy": "full_object_v1",
+        "reason_code": "exact_patch_round_trip_failed",
+        "detail": f"{type(exc).__name__}: {exc}",
+    }
+
+
+def _artifact_reference(artifact: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    if not artifact:
+        return None
+    metadata = artifact.get("metadata") if isinstance(artifact.get("metadata"), Mapping) else {}
+    return {
+        "artifact_type": artifact.get("artifact_type"),
+        "artifact_uri": artifact.get("artifact_uri"),
+        "artifact_sha256": metadata.get("sha256"),
+        "content_address": metadata.get("content_address"),
+        "size_bytes": metadata.get("size_bytes"),
+        "format": metadata.get("format"),
+        "role": metadata.get("role"),
+        "serialization": metadata.get("serialization"),
+        "immutable": metadata.get("immutable"),
+    }
+
+
+def _compression_settings(compression: CompressionSpec) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in compression.as_dict().items()
+        if key != "algorithm"
+    }
+
+
+def _validate_reduced_checkpoint(service, model, source, reloaded, x, y, *, task_family, primary_name):
+    """Compare both representations on the same deterministic catalogue subset."""
+    from ..data.fedavg_partition import _take_rows
+    count = min(_sample_count(x, y), int(service.config.get("checkpoint_validation_samples", 256)))
+    if count < 1:
+        raise ValueError("checkpoint_validation_samples must be positive")
+    tolerance = float(service.config.get("checkpoint_quality_tolerance", 0.01))
+    if not math.isfinite(tolerance) or tolerance < 0:
+        raise ValueError("checkpoint_quality_tolerance must be finite and nonnegative")
+    seed = int(service.config.get("seed", 42))
+    indexes = np.random.default_rng(seed).choice(_sample_count(x, y), count, replace=False)
+    subset = (_take_rows(x, indexes), _take_rows(y, indexes))
+    try:
+        _, reference, _, _ = service._evaluate_model(model, *subset, inference_only=False,
+            task_family=task_family, enforce_time_limit=False)
+        restore_model_tensor_state(model, reloaded, verify=True)
+        _, candidate, _, _ = service._evaluate_model(model, *subset, inference_only=False,
+            task_family=task_family, enforce_time_limit=False)
+    finally:
+        restore_model_tensor_state(model, source, verify=True)
+    lower = primary_name in {"mae", "mse", "rmse", "loss", "perplexity"}
+    permitted = tolerance * max(abs(float(reference)), 1e-6) if lower else tolerance
+    degradation = float(candidate) - float(reference) if lower else float(reference) - float(candidate)
+    return {"status": "passed" if math.isfinite(degradation) and degradation <= permitted else "failed",
+        "scope": "deterministic catalogue subset; original catalogue metrics unchanged",
+        "sample_count": count, "sample_index_hash": sha256_json(indexes.tolist()), "seed": seed,
+        "metric": primary_name, "reference": float(reference), "reloaded": float(candidate),
+        "degradation": degradation, "permitted_degradation": permitted,
+        "tolerance_kind": "relative" if lower else "absolute"}
+
+
+def _checkpoint_storage_documents(
+    *,
+    service_id: str,
+    lineage_id: str,
+    parameter_schema_hash: str,
+    base_artifact: Mapping[str, Any],
+    lineage_base: LineageBaseResult | None,
+    final_artifact: Mapping[str, Any],
+    service_patch: ServicePatchResult | None,
+    fallback_target_state: Any,
+    support_artifacts: list[dict[str, Any]],
+    provenance_artifacts: Mapping[str, Mapping[str, Any]],
+    fallback: Mapping[str, Any] | None,
+    compression: CompressionSpec,
+    provenance_root: str,
+    native_final_round_trip_verified: bool,
+    parent_global_round: int | None = None,
+    explicit_parent_state_hash: str | None = None,
+    reduced_checkpoint=None,
+) -> dict[str, Any]:
+    del provenance_root  # Artefact references already contain their resolved store paths.
+    exact_patch = service_patch is not None
+    measurements = dict(service_patch.measurements) if exact_patch else {}
+    target_state_hash = (
+        service_patch.target_state_sha256
+        if service_patch is not None
+        else getattr(fallback_target_state, "sha256", None)
+    )
+    document = {
+        "format": "mlaas-checkpoint-reconstruction-v1",
+        "storage_policy_version": (
+            "fedavg_round_base_exact_patch_v1"
+            if exact_patch and parent_global_round is not None
+            else ("shared_base_exact_patch_v1" if exact_patch else "full_object_v1")
+        ),
+        "storage_mode": "shared_base_exact_patch" if exact_patch else "full_object",
+        "service_id": service_id,
+        "lineage_id": lineage_id,
+        "tensor_state_hash_specification": TENSOR_STATE_FORMAT,
+        "parameter_schema": {
+            "hash": parameter_schema_hash,
+            "ownership": "separate_generator_provenance",
+        },
+        "base": {
+            "artifact": _artifact_reference(base_artifact),
+            "tensor_state_sha256": (
+                service_patch.base.content_sha256
+                if service_patch is not None
+                else (
+                    explicit_parent_state_hash
+                    or (lineage_base.tensor_state_sha256 if lineage_base is not None else None)
+                )
+            ),
+            "global_round": parent_global_round,
+        },
+        "target": {
+            "artifact": _artifact_reference(final_artifact),
+            "tensor_state_sha256": target_state_hash,
+        },
+        "patch_semantics": (
+            {
+                "format": TENSOR_PATCH_FORMAT,
+                "operations": (
+                    "ordered changed-tensor byte XOR or REPLACE; omitted tensors inherit "
+                    + ("the round-global base" if parent_global_round is not None else "the lineage base")
+                ),
+                "mode": (
+                    "stored_patch" if service_patch.patch is not None else "base_reference_only"
+                ),
+                "content_sha256": (
+                    service_patch.patch.content_sha256
+                    if service_patch.patch is not None
+                    else None
+                ),
+            }
+            if service_patch is not None
+            else None
+        ),
+        "storage_encoding": {
+            "compression": compression.as_dict() if exact_patch else {"algorithm": "native"},
+            "independent_of_patch_semantics": True,
+        },
+        "operation_selection": dict(service_patch.operation_selection) if exact_patch else None,
+        "support_artifacts": [
+            reference
+            for reference in (_artifact_reference(item) for item in support_artifacts)
+            if reference is not None
+        ],
+        "provenance_artifacts": {
+            name: reference
+            for name, reference in (
+                (name, _artifact_reference(artifact))
+                for name, artifact in sorted(provenance_artifacts.items())
+            )
+            if reference is not None
+        },
+        "storage_measurements": measurements,
+        "measurement_scope": (
+            "model-state objects and required reference manifests; common support artefacts "
+            "are recorded separately and excluded from both alternatives"
+        ),
+        "round_trip_verified": bool(
+            service_patch is not None or native_final_round_trip_verified
+        ),
+        "fallback": dict(fallback) if fallback else None,
+    }
+    if reduced_checkpoint is not None:
+        reduced = reduced_checkpoint.document
+        target_state_hash = reduced["reloaded_state_sha256"]
+        document.update(storage_policy_version="reduced_precision_v1", storage_mode="full_object",
+            round_trip_verified=True, source_state_sha256=reduced["source_state_sha256"],
+            lossy=True, quality_validation=reduced["quality_validation"],
+            storage_encoding={"container": "safetensors", "representation": reduced["representation"],
+                              "compression": reduced["compression"]})
+        document["target"]["tensor_state_sha256"] = target_state_hash
+        document["target"]["source_tensor_state_sha256"] = reduced["source_state_sha256"]
+    return {
+        "reconstruction_manifest": document,
+        "provenance": {
+            "storage_policy_version": document["storage_policy_version"],
+            "storage_mode": document["storage_mode"],
+            "tensor_state_hash_specification": TENSOR_STATE_FORMAT,
+            "parameter_schema_hash": parameter_schema_hash,
+            "base_state_sha256": document["base"]["tensor_state_sha256"],
+            "target_state_sha256": target_state_hash,
+            "patch_semantics": document["patch_semantics"],
+            "storage_encoding": document["storage_encoding"],
+            "operation_selection": document["operation_selection"],
+            "storage_measurements": measurements,
+            "fallback": document["fallback"],
+            **({"source_state_sha256": reduced_checkpoint.document["source_state_sha256"],
+                "lossy": True, "quality_validation": reduced_checkpoint.document["quality_validation"]} if reduced_checkpoint else {}),
+        },
+    }
+
+
+def _lineage_checkpoint_storage_row(
+    *,
+    lineage_id: str,
+    parameter_schema_hash: str,
+    base_artifact: Mapping[str, Any],
+    lineage_base: LineageBaseResult | None,
+    native_base_round_trip_verified: bool,
+    fallback: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    metadata = base_artifact.get("metadata") if isinstance(base_artifact.get("metadata"), Mapping) else {}
+    if not metadata.get("sha256"):
+        raise ServiceExecutionError(
+            "initial checkpoint is missing its artefact hash",
+            failure_stage="checkpoint_persistence",
+        )
+    if lineage_base is not None:
+        compression = lineage_base.base.compression
+        return {
+            "lineage_id": lineage_id,
+            "storage_policy_version": "shared_base_exact_patch_v1",
+            "state_hash_spec_version": TENSOR_STATE_FORMAT,
+            "parameter_schema_hash": parameter_schema_hash,
+            "base_state_sha256": lineage_base.tensor_state_sha256,
+            "base_artifact_ref": str(lineage_base.manifest_path),
+            "base_artifact_sha256": metadata.get("sha256"),
+            "base_compression_codec": compression.algorithm,
+            "base_compression_settings_json": _compression_settings(compression),
+            "base_logical_bytes": lineage_base.base.logical_size_bytes,
+            "base_physical_bytes": (
+                lineage_base.base.physical_size_bytes + lineage_base.manifest_path.stat().st_size
+            ),
+            "metadata_json": {
+                "created": lineage_base.created,
+                "restored_existing_base": lineage_base.restored_existing_base,
+                "semantic_state_and_parameter_schema_are_separate": True,
+            },
+        }
+    return {
+        "lineage_id": lineage_id,
+        "storage_policy_version": "full_object_v1",
+        "state_hash_spec_version": TENSOR_STATE_FORMAT,
+        "parameter_schema_hash": parameter_schema_hash,
+        "base_state_sha256": (
+            lineage_base.tensor_state_sha256 if lineage_base is not None else None
+        ),
+        "base_artifact_ref": str(base_artifact.get("artifact_uri")),
+        "base_artifact_sha256": metadata.get("sha256"),
+        "base_compression_codec": "native",
+        "base_compression_settings_json": {},
+        "base_logical_bytes": None,
+        "base_physical_bytes": _safe_int(metadata.get("size_bytes")),
+        "metadata_json": {
+            "fallback": dict(fallback) if fallback else None,
+            "round_trip_verified": bool(native_base_round_trip_verified),
+            "semantic_state_and_parameter_schema_are_separate": True,
+        },
+    }
+
+
+def _service_checkpoint_storage_row(
+    *,
+    service_id: str,
+    lineage_id: str,
+    parameter_schema_hash: str,
+    final_artifact: Mapping[str, Any],
+    service_patch: ServicePatchResult | None,
+    lineage_base: LineageBaseResult | None,
+    fallback_target_state: Any,
+    reconstruction_artifact: Mapping[str, Any],
+    fallback: Mapping[str, Any] | None,
+    native_final_round_trip_verified: bool,
+    parent_global_round: int | None = None,
+    explicit_parent_state_hash: str | None = None,
+    explicit_parent_state_ref: str | None = None,
+    reduced_checkpoint=None,
+) -> dict[str, Any]:
+    final_metadata = final_artifact.get("metadata") if isinstance(final_artifact.get("metadata"), Mapping) else {}
+    reconstruction_metadata = (
+        reconstruction_artifact.get("metadata")
+        if isinstance(reconstruction_artifact.get("metadata"), Mapping)
+        else {}
+    )
+    reconstruction_size = int(reconstruction_metadata.get("size_bytes") or 0)
+    if not reconstruction_metadata.get("sha256"):
+        raise ServiceExecutionError(
+            "checkpoint reconstruction manifest is missing its artefact hash",
+            failure_stage="checkpoint_persistence",
+        )
+    if reduced_checkpoint is not None:
+        reduced = reduced_checkpoint.document
+        reference_bytes = reconstruction_size + reduced_checkpoint.manifest_path.stat().st_size
+        return {
+            "service_id": service_id, "lineage_id": lineage_id,
+            "storage_policy_version": "reduced_precision_v1", "storage_mode": "full_object",
+            "state_hash_spec_version": TENSOR_STATE_FORMAT, "parameter_schema_hash": parameter_schema_hash,
+            "base_state_sha256": reduced["base_state_sha256"], "target_state_sha256": reduced["reloaded_state_sha256"],
+            "parent_global_round": parent_global_round,
+            "explicit_base_state_ref": explicit_parent_state_ref or str(lineage_base.base.manifest_path),
+            "full_artifact_ref": str(reduced_checkpoint.payload_path), "full_artifact_sha256": reduced["payload_sha256"],
+            "reconstruction_artifact_ref": str(reconstruction_artifact["artifact_uri"]),
+            "reconstruction_artifact_sha256": reconstruction_metadata["sha256"],
+            "target_logical_bytes": reduced["source_tensor_bytes"],
+            "full_checkpoint_physical_bytes": (reduced["full_comparison_payload_bytes"] + reference_bytes
+                if reduced.get("full_comparison_payload_bytes") is not None else None),
+            "reconstruction_physical_bytes": reference_bytes,
+            "selected_physical_bytes": reduced["payload_bytes"] + reference_bytes,
+            "round_trip_status": "passed", "round_trip_verified_at": datetime.now(timezone.utc).isoformat(),
+            "metadata_json": {"source_state_sha256": reduced["source_state_sha256"],
+                "reloaded_state_sha256": reduced["reloaded_state_sha256"], "lossy": True,
+                "representation": reduced["representation_version"], "compression": reduced["compression"],
+                "verification_scope": "stored representation and sampled performance; not source bit equality",
+                "weight_error": reduced["weight_error"], "quality_validation": reduced["quality_validation"]},
+        }
+    if service_patch is not None:
+        measurements = dict(service_patch.measurements)
+        compression_data = dict(measurements.get("compression") or {})
+        patch_reference_size = service_patch.manifest_path.stat().st_size
+        reference_bytes = patch_reference_size + reconstruction_size
+        patch_physical = int(measurements["patch_physical_size_bytes"])
+        full_physical = measurements["full_state_baseline_physical_size_bytes"]
+        selected_physical = patch_physical + reference_bytes
+        full_comparison_physical = int(full_physical) + reference_bytes if full_physical is not None else None
+        return {
+            "service_id": service_id,
+            "lineage_id": lineage_id,
+            "storage_policy_version": (
+                "fedavg_round_base_exact_patch_v1"
+                if parent_global_round is not None
+                else "shared_base_exact_patch_v1"
+            ),
+            "storage_mode": "shared_base_exact_patch",
+            "state_hash_spec_version": TENSOR_STATE_FORMAT,
+            "parameter_schema_hash": parameter_schema_hash,
+            "base_state_sha256": service_patch.base.content_sha256,
+            "parent_global_round": parent_global_round,
+            "explicit_base_state_ref": str(service_patch.base.manifest_path),
+            "target_state_sha256": service_patch.target_state_sha256,
+            "patch_semantics": (
+                "ordered_changed_tensor_byte_xor_or_replace_with_round_global_base_inheritance"
+                if parent_global_round is not None
+                else "ordered_changed_tensor_byte_xor_or_replace_with_base_inheritance"
+            ),
+            "patch_semantics_version": TENSOR_PATCH_FORMAT,
+            "patch_compression_codec": compression_data.get("algorithm"),
+            "patch_compression_settings_json": {
+                key: value for key, value in compression_data.items() if key != "algorithm"
+            },
+            "patch_artifact_ref": (
+                str(service_patch.patch.manifest_path)
+                if service_patch.patch is not None
+                else None
+            ),
+            "patch_artifact_sha256": (
+                sha256_file(service_patch.patch.manifest_path)
+                if service_patch.patch is not None
+                else None
+            ),
+            "full_artifact_ref": None,
+            "full_artifact_sha256": None,
+            "reconstruction_artifact_ref": str(reconstruction_artifact["artifact_uri"]),
+            "reconstruction_artifact_sha256": reconstruction_metadata.get("sha256"),
+            "target_logical_bytes": measurements["full_state_baseline_logical_size_bytes"],
+            "full_checkpoint_physical_bytes": full_comparison_physical,
+            "patch_logical_bytes": measurements["patch_logical_size_bytes"],
+            "patch_physical_bytes": patch_physical,
+            "reconstruction_physical_bytes": reference_bytes,
+            "selected_physical_bytes": selected_physical,
+            "round_trip_status": "passed",
+            "round_trip_verified_at": datetime.now(timezone.utc).isoformat(),
+            "metadata_json": {
+                "semantic_patch_content_sha256": (
+                    service_patch.patch.content_sha256
+                    if service_patch.patch is not None
+                    else None
+                ),
+                "patch_mode": (
+                    "stored_patch" if service_patch.patch is not None else "base_reference_only"
+                ),
+                "operation_counts": dict(service_patch.operation_counts),
+                "operation_selection": dict(service_patch.operation_selection),
+                "raw_measurements": measurements,
+                "common_support_artifacts_excluded_from_both_alternatives": True,
+            },
+        }
+    final_size = int(final_metadata.get("size_bytes") or 0)
+    selected_physical = final_size + reconstruction_size
+    target_hash = getattr(fallback_target_state, "sha256", None)
+    return {
+        "service_id": service_id,
+        "lineage_id": lineage_id,
+        "storage_policy_version": "full_object_v1",
+        "storage_mode": "full_object",
+        "state_hash_spec_version": TENSOR_STATE_FORMAT,
+        "parameter_schema_hash": parameter_schema_hash,
+        "base_state_sha256": (
+            explicit_parent_state_hash
+            or (lineage_base.tensor_state_sha256 if lineage_base is not None else None)
+        ),
+        "parent_global_round": parent_global_round,
+        "explicit_base_state_ref": explicit_parent_state_ref,
+        "target_state_sha256": target_hash,
+        "patch_semantics": None,
+        "patch_semantics_version": None,
+        "patch_compression_codec": None,
+        "patch_compression_settings_json": None,
+        "patch_artifact_ref": None,
+        "patch_artifact_sha256": None,
+        "full_artifact_ref": str(final_artifact.get("artifact_uri")),
+        "full_artifact_sha256": final_metadata.get("sha256"),
+        "reconstruction_artifact_ref": str(reconstruction_artifact["artifact_uri"]),
+        "reconstruction_artifact_sha256": reconstruction_metadata.get("sha256"),
+        "target_logical_bytes": (
+            getattr(fallback_target_state, "raw_tensor_size_bytes", None)
+            if fallback_target_state is not None
+            else None
+        ),
+        "full_checkpoint_physical_bytes": selected_physical,
+        "patch_logical_bytes": None,
+        "patch_physical_bytes": None,
+        "reconstruction_physical_bytes": reconstruction_size,
+        "selected_physical_bytes": selected_physical,
+        "round_trip_status": (
+            "passed" if native_final_round_trip_verified else "not_run"
+        ),
+        "round_trip_verified_at": (
+            datetime.now(timezone.utc).isoformat()
+            if native_final_round_trip_verified
+            else None
+        ),
+        "round_trip_error": None,
+        "metadata_json": {
+            "fallback": dict(fallback) if fallback else None,
+            "common_support_artifacts_excluded_from_both_alternatives": True,
+        },
+    }
+
+
+def _resolve_hf_revisions(config: dict[str, Any]) -> None:
+    """Resolve mutable Hub names once; failures remain visible in provenance."""
+    model_id = config.get("hf_model_id") or config.get("model_id")
+    dataset_id = config.get("dataset_name") if str(config.get("dataset") or "").lower() in {"hf", "huggingface"} else None
+    if not model_id and not dataset_id:
+        return
+    try:
+        from huggingface_hub import HfApi
+        api = HfApi()
+    except Exception as exc:  # Network/auth failures should not prevent a service run.
+        config.setdefault("hf_revision_resolution_error", f"{type(exc).__name__}: {exc}")
+        return
+
+    failures: list[str] = []
+    identities = (
+        ("model", model_id, "hf_model_revision", api.model_info),
+        ("dataset", dataset_id, "hf_dataset_revision", api.dataset_info),
+    )
+    for kind, repo_id, revision_key, resolver in identities:
+        if not repo_id:
+            continue
+        requested = config.get(revision_key)
+        if _is_hf_commit_sha(requested):
+            continue
+        try:
+            kwargs = {"revision": str(requested)} if not _is_blank(requested) else {}
+            resolved = getattr(resolver(str(repo_id), **kwargs), "sha", None)
+            if not resolved:
+                raise RuntimeError("Hub response did not include a commit SHA")
+            if requested is not None:
+                config[f"{revision_key}_requested"] = requested
+            config[revision_key] = resolved
+        except Exception as exc:  # Network/auth failures remain explicit provenance.
+            failures.append(f"{kind} {repo_id}: {type(exc).__name__}: {exc}")
+    if failures:
+        config["hf_revision_resolution_error"] = "; ".join(failures)
+
+
+def _is_hf_commit_sha(value: Any) -> bool:
+    if value is None:
+        return False
+    text = str(value).strip().lower()
+    return len(text) in {40, 64} and all(character in "0123456789abcdef" for character in text)
+
+
 def _nested_get(mapping: Mapping[str, Any], *keys: str) -> Any:
     current: Any = mapping
     for key in keys:
@@ -2119,8 +3666,5 @@ def _nested_get(mapping: Mapping[str, Any], *keys: str) -> Any:
 
 
 def _jsonable(value: Any) -> Any:
-    try:
-        json.dumps(value, default=str)
-        return value
-    except Exception:
-        return str(value)
+    from ..diagnostic_json import diagnostic_value
+    return diagnostic_value(value)

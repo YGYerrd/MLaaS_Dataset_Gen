@@ -1,5 +1,13 @@
 .venv/
+.python312/
+.test-tmp/
 __pycache__/
+*.py[cod]
+.pytest_cache/
+build/
+*.egg-info/
+.DS_Store
+._*
 weights/
 run_config.json
 service_data.csv
@@ -9,3 +17,9 @@ flatten_query.sql
 hf_manifest.xlsx
 outputs/
 .hf_token
+storage.local.json
+*.generated.pptx
+.outputs_cleanup_recovery_20260902_185136/
+.project-archive/
+# Temporary Office lock files
+~$*

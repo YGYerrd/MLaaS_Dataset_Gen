@@ -12,10 +12,10 @@ def normalize_hf_task(hf_task: str | None) -> str:
 
 
 def canonical_task_family(task_type: str | None, hf_task: str | None = None) -> str:
-    base = (task_type or "").strip().lower()
+    base = (task_type or "").strip().lower().replace("-", "_")
     hf = normalize_hf_task(hf_task)
 
-    if base in {"image_classification"}:
+    if base in {"image_classification", "text_classification", "sequence_classification", "single_label_classification"}:
         return "classification"
     if base in {"object_detection", "image_detection", "detection"}:
         return "detection"
@@ -29,8 +29,6 @@ def canonical_task_family(task_type: str | None, hf_task: str | None = None) -> 
         return "vqa"
     if base in {"classification", "regression", "clustering"}:
         if base == "classification":
-            if hf == "sentence_similarity":
-                return "regression"
             if hf == "token_classification":
                 return "token_classification"
             if hf == "fill_mask":
@@ -66,7 +64,7 @@ def canonical_label_format(task_family: str) -> str:
 
 def canonical_metric_names(task_family: str, metric_key: str | None = None, *, hf_task: str | None = None, task_tag: str | None = None) -> tuple[str, str | None]:
     hf = normalize_hf_task(hf_task)
-    if hf == "sentence_similarity" and task_family in {"classification", "regression"}:
+    if hf == "sentence_similarity" and task_family == "regression":
         return ("pearson", "spearman")
     if task_family == "classification":
         return ("accuracy", "f1")
@@ -110,7 +108,7 @@ def metric_score_value(task_family: str, metric_name: str | None, metric_value: 
     metric = (metric_name or "").lower()
     if metric == "pearson":
         return float(np.clip((value + 1.0) / 2.0, 0.0, 1.0))
-    if task_family == "regression" or metric in {"loss", "rmse", "mae", "perplexity", "cross_entropy_loss"}:
+    if task_family == "regression" or metric in {"loss", "mse", "rmse", "mae", "perplexity", "cross_entropy_loss"}:
         return float(1.0 / (1.0 + max(0.0, value)))
     return float(value)
 
@@ -125,10 +123,10 @@ def metric_domain(metric_name: str) -> str:
         return "resource"
     if "cost" in name or "efficiency" in name:
         return "cost"
-    if "explain" in name:
+    if "explain" in name or "faithfulness" in name or "semantic" in name:
         return "explainability"
     if any(part in name for part in ("reliability", "trust", "failure", "error", "retry", "oom", "nan")):
         return "reliability"
-    if any(part in name for part in ("accuracy", "f1", "loss", "rmse", "mae", "perplexity", "rouge", "bleu", "cider", "map", "iou", "dice", "silhouette", "metric_score", "exact_match", "pearson", "spearman")):
+    if any(part in name for part in ("accuracy", "f1", "loss", "mse", "rmse", "mae", "perplexity", "rouge", "bleu", "cider", "map", "iou", "dice", "silhouette", "metric_score", "exact_match", "pearson", "spearman")):
         return "quality"
     return "metadata"

@@ -11,8 +11,30 @@ from typing import Any
 
 import pandas as pd
 
+from mlaas_data_generator.clients import recipes, training
+from mlaas_data_generator.provenance import sha256_json, canonical_json
+from mlaas_data_generator.family_preflight import hf_dataset_error, manifest_family_error
+
+from mlaas_data_generator.clients.resources import (
+    _as_float, _estimated_model_params_m, _unique_ints,
+    _batch_sizes_for, _learning_rates_for, _epochs_for,
+    _weight_decays_for, _optimizers_for, _warmup_ratios_for,
+    _mlm_probabilities_for, _gradient_accumulation_steps_for,
+)
+from mlaas_data_generator.clients.legacy import (
+    _sample_seed_for_variant, _default_skew_axis_for_task,
+    _skew_axis_config_for_task, _split_knobs_for_variant, _training_knobs_for_variant,
+    _precision_knobs_for_variant, _generic_split_knobs_for_variant, _generic_training_knobs_for_variant,
+)
+
 from mlaas_data_generator.compatibility import known_bad_manifest_combo_reason, known_bad_path_reason
-from mlaas_data_generator.config import DEFAULT_MANIFEST_PATH
+from mlaas_data_generator.config import CNN_HIDDEN_LAYER_POOL, DEFAULT_MANIFEST_PATH
+from mlaas_data_generator.fedavg_eligibility import is_fedavg_eligible_row
+from mlaas_data_generator.fedavg_manifest import (
+    expand_fedavg_run,
+    fedavg_client_knobs,
+    stratified_heterogeneity_intensities,
+)
 from mlaas_data_generator.registry import DATASET_REGISTRY, MODEL_REGISTRY
 
 
@@ -30,21 +52,6 @@ class TaskSpec:
 class ManifestProfile:
     name: str
     default_avg_sample_size: int
-    training_epochs: tuple[int, ...]
-    batch_sizes: tuple[int, ...]
-    learning_rates: tuple[float, ...]
-    timeout_s: int
-
-
-@dataclass(frozen=True)
-class ResourceTierSpec:
-    name: str
-    rank: int
-    default_avg_sample_size: int
-    timeout_s: int
-    max_train_time_s: int
-    max_eval_time_s: int
-    perturbation_sample_count: int = 1
 
 
 TASK_SPECS: dict[str, TaskSpec] = {
@@ -64,46 +71,21 @@ TASK_SPECS: dict[str, TaskSpec] = {
 
 
 MANIFEST_PROFILES: dict[str, ManifestProfile] = {
-    "test": ManifestProfile("test", default_avg_sample_size=128, training_epochs=(1,), batch_sizes=(4, 8), learning_rates=(5e-5, 1e-4), timeout_s=900),
-    "balanced": ManifestProfile("balanced", default_avg_sample_size=768, training_epochs=(1, 2), batch_sizes=(8, 16), learning_rates=(2e-5, 5e-5, 1e-4), timeout_s=1800),
-    "benchmark": ManifestProfile("benchmark", default_avg_sample_size=1600, training_epochs=(1, 2, 3), batch_sizes=(8, 16, 32), learning_rates=(2e-5, 5e-5, 1e-4), timeout_s=3600),
-}
-
-RESOURCE_TIERS: dict[str, ResourceTierSpec] = {
-    "smoketest": ResourceTierSpec("smoketest", rank=0, default_avg_sample_size=32, timeout_s=900, max_train_time_s=45, max_eval_time_s=60),
-    "light": ResourceTierSpec("light", rank=0, default_avg_sample_size=128, timeout_s=900, max_train_time_s=45, max_eval_time_s=60),
-    "medium": ResourceTierSpec("medium", rank=1, default_avg_sample_size=768, timeout_s=1800, max_train_time_s=120, max_eval_time_s=120),
-    "heavy": ResourceTierSpec("heavy", rank=2, default_avg_sample_size=1600, timeout_s=3600, max_train_time_s=300, max_eval_time_s=240),
-    "stress_test": ResourceTierSpec(
-        "stress_test",
-        rank=3,
-        default_avg_sample_size=4000,
-        timeout_s=7200,
-        max_train_time_s=900,
-        max_eval_time_s=600,
-        perturbation_sample_count=2,
-    ),
-}
-
-PROFILE_DEFAULT_RESOURCE_TIERS = {
-    "test": "light",
-    "balanced": "medium",
-    "benchmark": "heavy",
-}
-
-RESOURCE_TIER_ALIASES = {
-    "smoke": "smoketest",
-    "smoke_test": "smoketest",
-    "smoke-test": "smoketest",
-    "stress": "stress_test",
-    "stress-test": "stress_test",
-    "stresstest": "stress_test",
-    "benchmark": "heavy",
-    "test": "light",
+    "test": ManifestProfile("test", default_avg_sample_size=128),
+    "balanced": ManifestProfile("balanced", default_avg_sample_size=768),
+    "benchmark": ManifestProfile("benchmark", default_avg_sample_size=1600),
 }
 
 
 MANIFEST_COLUMNS = [
+    "checkpoint_patch_operation_policy", "checkpoint_measure_full", "checkpoint_weight_format",
+    "checkpoint_reduced_compression", "checkpoint_reduced_compression_level", "checkpoint_validation_samples", "checkpoint_quality_tolerance",
+    "recipe_sampler_version", "training_policy", "training_policy_hash",
+    "label_format", "label_mode", "num_labels", "num_classes", "task_resolution_source", "precision_policy",
+    "mobilebert_head_normalization", "max_grad_norm",
+    "calibration_band", "calibration_template_id",
+    "effective_batch_size", "client_partition_index", "max_client_quantity",
+    "unconstrained_sample_size", "quantity_capacity_policy",
     "service_id",
     "enabled",
     "case_name",
@@ -111,12 +93,15 @@ MANIFEST_COLUMNS = [
     "dataset",
     "dataset_name",
     "dataset_config",
+    "hf_dataset_revision",
     "train_split",
     "test_split",
     "benchmark_split",
     "model_type",
+    "hidden_layers",
     "hf_task",
     "hf_model_id",
+    "hf_model_revision",
     "task_type",
     "task",
     "task_tag",
@@ -124,7 +109,6 @@ MANIFEST_COLUMNS = [
     "input_schema",
     "output_schema",
     "training_regime",
-    "resource_tier",
     "dataset_variant",
     "split_variant",
     "knob_variant",
@@ -148,9 +132,11 @@ MANIFEST_COLUMNS = [
     "warmup_ratio",
     "mlm_probability",
     "gradient_accumulation_steps",
+    "seed",
     "sample_seed",
+    "initialization_seed",
+    "evaluation_seed",
     "sample_size",
-    "max_samples",
     "max_length",
     "timeout_s",
     "max_train_time_s",
@@ -159,6 +145,8 @@ MANIFEST_COLUMNS = [
     "mixed_precision",
     "precision_type",
     "save_weights",
+    "checkpoint_patch_compression",
+    "checkpoint_patch_compression_level",
     "num_workers",
     "text_column",
     "image_column",
@@ -195,8 +183,6 @@ MANIFEST_COLUMNS = [
     "fit_decision",
     "fit_reason",
     "fit_quality_score",
-    "model_resource_tier",
-    "dataset_resource_tier",
     "realism_score",
     "domain_alignment",
     "dataset_hint",
@@ -216,6 +202,33 @@ MANIFEST_COLUMNS = [
     "hf_author",
     "hf_url",
     "hf_service_meta_json",
+    "fl_run_id",
+    "client_id",
+    "round_id",
+    "lineage_id",
+    "generation_mode",
+    "run_partition_seed",
+    "benchmark_sample_seed",
+    "benchmark_sample_size",
+    "run_train_pool_size",
+    "fedavg_source_pool_cap",
+    "requested_total_samples",
+    "training_seed",
+    "scheduled_to_participate",
+    "participation_schedule_seed",
+    "participation_schedule_version",
+    "fedavg_run_index",
+    "fedavg_clients_per_run",
+    "fedavg_rounds",
+    "fedavg_client_participation_rate",
+    "heterogeneity_intensity",
+    "shard_support_quantile",
+    "regression_support_policy",
+    "min_target_bin_fraction",
+    "partition_generator_version",
+    "requested_partition_params",
+    "requested_quota",
+    "original_fl_run_id",
 ]
 
 
@@ -230,7 +243,6 @@ GENERIC_MANIFEST_CASES: tuple[dict[str, Any], ...] = (
         "modality": "image",
         "model_type": "cnn",
         "input_schema": "single_image",
-        "max_samples": 5000,
         "batch_size": 32,
         "learning_rate": 1e-3,
         "optimizer": "adam",
@@ -245,7 +257,6 @@ GENERIC_MANIFEST_CASES: tuple[dict[str, Any], ...] = (
         "modality": "image",
         "model_type": "randomforest",
         "input_schema": "single_image_flattened",
-        "max_samples": 5000,
         "batch_size": 64,
         "learning_rate": 1e-3,
         "optimizer": "none",
@@ -260,7 +271,6 @@ GENERIC_MANIFEST_CASES: tuple[dict[str, Any], ...] = (
         "modality": "tabular",
         "model_type": "mlp",
         "input_schema": "tabular_features",
-        "max_samples": 5000,
         "batch_size": 32,
         "learning_rate": 1e-3,
         "optimizer": "adam",
@@ -275,7 +285,6 @@ GENERIC_MANIFEST_CASES: tuple[dict[str, Any], ...] = (
         "modality": "tabular",
         "model_type": "randomforest",
         "input_schema": "tabular_features",
-        "max_samples": 5000,
         "batch_size": 32,
         "learning_rate": 1e-3,
         "optimizer": "none",
@@ -290,7 +299,6 @@ GENERIC_MANIFEST_CASES: tuple[dict[str, Any], ...] = (
         "modality": "tabular",
         "model_type": "randomforest",
         "input_schema": "tabular_features",
-        "max_samples": 5000,
         "batch_size": 32,
         "learning_rate": 1e-3,
         "optimizer": "none",
@@ -305,7 +313,6 @@ GENERIC_MANIFEST_CASES: tuple[dict[str, Any], ...] = (
         "modality": "tabular",
         "model_type": "kmeans",
         "input_schema": "tabular_features",
-        "max_samples": 5000,
         "batch_size": 64,
         "learning_rate": 1e-3,
         "optimizer": "none",
@@ -326,46 +333,6 @@ def _resolve_manifest_profile(profile_name: str | None) -> ManifestProfile:
     return MANIFEST_PROFILES.get(str(profile_name or "balanced").strip().lower(), MANIFEST_PROFILES["balanced"])
 
 
-def _resolve_resource_tier(resource_tier: str | None, profile: ManifestProfile) -> tuple[ResourceTierSpec, bool]:
-    explicit = resource_tier is not None
-    default_name = PROFILE_DEFAULT_RESOURCE_TIERS.get(profile.name, "medium")
-    raw = str(resource_tier or default_name).strip().lower()
-    name = RESOURCE_TIER_ALIASES.get(raw, raw)
-    if name not in RESOURCE_TIERS:
-        valid = ", ".join(RESOURCE_TIERS)
-        raise ValueError(f"Unknown resource_tier '{resource_tier}'. Expected one of: {valid}")
-    return RESOURCE_TIERS[name], explicit
-
-
-def _resource_tier_rank(tier_name: str | None) -> int:
-    name = RESOURCE_TIER_ALIASES.get(str(tier_name or "medium").strip().lower(), str(tier_name or "medium").strip().lower())
-    spec = RESOURCE_TIERS.get(name)
-    return spec.rank if spec else RESOURCE_TIERS["medium"].rank
-
-
-def _resource_tier_by_rank(rank: int) -> ResourceTierSpec:
-    clamped = max(0, min(int(rank), max(spec.rank for spec in RESOURCE_TIERS.values())))
-    ranked = sorted(RESOURCE_TIERS.values(), key=lambda spec: (spec.rank, spec.default_avg_sample_size))
-    selected = None
-    for spec in ranked:
-        if spec.rank == clamped:
-            selected = spec
-    return selected or RESOURCE_TIERS["medium"]
-
-
-def _is_smoketest_tier(resource_tier: ResourceTierSpec) -> bool:
-    return resource_tier.name == "smoketest"
-
-
-def _as_float(value: Any) -> float | None:
-    try:
-        if value is None:
-            return None
-        return float(value)
-    except Exception:
-        return None
-
-
 def _normalise_positive_int(value: int | None, *, minimum: int = 1) -> int:
     if value is None:
         return minimum
@@ -374,7 +341,8 @@ def _normalise_positive_int(value: int | None, *, minimum: int = 1) -> int:
 
 def _resolve_manifest_seed(seed: int | None) -> int:
     if seed is None:
-        return secrets.randbits(63)
+        # The global seed also reaches NumPy/sklearn, which require 32 bits.
+        return secrets.randbits(32)
     return int(seed)
 
 
@@ -402,7 +370,20 @@ def _training_regime_defaults(training_regime: str) -> dict[str, str]:
 
 def _service_config(row: dict[str, Any]) -> str:
     payload = {
-        "resource_tier": row.get("resource_tier"),
+        **{key: row[key] for key in (
+            "hidden_layers",
+            "checkpoint_patch_operation_policy", "checkpoint_measure_full", "checkpoint_weight_format",
+            "checkpoint_reduced_compression", "checkpoint_reduced_compression_level",
+            "checkpoint_validation_samples", "checkpoint_quality_tolerance",
+            "checkpoint_patch_compression", "checkpoint_patch_compression_level",
+        ) if key in row},
+        "label_mode": row.get("label_mode"),
+        "label_format": row.get("label_format"),
+        "task_type": row.get("task_type"),
+        "num_labels": row.get("num_labels"),
+        "precision_policy": row.get("precision_policy"),
+        "mobilebert_head_normalization": row.get("mobilebert_head_normalization"),
+        "max_grad_norm": row.get("max_grad_norm"),
         "training_epochs": row.get("training_epochs"),
         "split_strategy": row.get("split_strategy"),
         "skew_axis": row.get("skew_axis"),
@@ -421,9 +402,11 @@ def _service_config(row: dict[str, Any]) -> str:
         "clustering_n_init": row.get("clustering_n_init"),
         "clustering_max_iter": row.get("clustering_max_iter"),
         "clustering_tol": row.get("clustering_tol"),
-        "max_samples": row.get("max_samples"),
         "sample_size": row.get("sample_size"),
         "sample_seed": row.get("sample_seed"),
+        "initialization_seed": row.get("initialization_seed"),
+        "evaluation_seed": row.get("evaluation_seed"),
+        "training_seed": row.get("training_seed"),
         "max_length": row.get("max_length"),
         "timeout_s": row.get("timeout_s"),
         "max_train_time_s": row.get("max_train_time_s"),
@@ -435,6 +418,34 @@ def _service_config(row: dict[str, Any]) -> str:
         "enable_perturbation_metrics": row.get("enable_perturbation_metrics"),
         "perturbation_sample_count": row.get("perturbation_sample_count"),
     }
+    if str(row.get("generation_mode") or "independent").strip().lower() == "fedavg":
+        payload.update(
+            {
+                "training_seed": row.get("training_seed"),
+                "generation_mode": "fedavg",
+                "fl_run_id": row.get("fl_run_id"),
+                "client_id": row.get("client_id"),
+                "round_id": row.get("round_id"),
+                "scheduled_to_participate": row.get("scheduled_to_participate"),
+                "fedavg_client_participation_rate": row.get("fedavg_client_participation_rate"),
+                "participation_schedule_seed": row.get("participation_schedule_seed"),
+                "participation_schedule_version": row.get("participation_schedule_version"),
+                "heterogeneity_intensity": row.get("heterogeneity_intensity"),
+                "partition_generator_version": row.get("partition_generator_version"),
+                "requested_partition_params": row.get("requested_partition_params"),
+                "requested_quota": row.get("requested_quota"),
+                "fedavg_source_pool_cap": row.get("fedavg_source_pool_cap"),
+                "requested_total_samples": row.get("requested_total_samples"),
+                "original_fl_run_id": row.get("original_fl_run_id"),
+            }
+        )
+    if row.get("recipe_sampler_version"):
+        payload.update({key: row.get(key) for key in ("recipe_sampler_version", "training_policy", "training_policy_hash",
+            "effective_batch_size", "partition_generator_version", "requested_quota", "max_client_quantity",
+            "unconstrained_sample_size", "quantity_capacity_policy",
+            "client_partition_index", "heterogeneity_intensity", "shard_support_quantile",
+            "calibration_band", "calibration_template_id",
+            "regression_support_policy", "min_target_bin_fraction")})
     return json.dumps({k: v for k, v in payload.items() if v is not None}, sort_keys=True)
 
 
@@ -445,548 +456,24 @@ def _split_value(dataset_spec: dict[str, Any], key: str, variant: int) -> Any:
     return value
 
 
-def _estimated_model_params_m(model: dict[str, Any]) -> float | None:
-    explicit = _as_float(model.get("estimated_params_m"))
-    if explicit is not None:
-        return explicit
-    for key in ("params_count", "model_size"):
-        value = _as_float(model.get(key))
-        if value is None:
-            continue
-        return value / 1_000_000.0 if value > 100_000 else value
-
-    model_id = str(model.get("hf_model_id") or model.get("registry_key") or "").lower()
-    exact_estimates = {
-        "sshleifer/tiny-gpt2": 0.1,
-        "roneneldan/tinystories-1m": 1.0,
-        "roneneldan/tinystories-33m": 33.0,
-        "huawei-noah/tinybert_general_4l_312d": 14.0,
-        "google/electra-small-discriminator": 14.0,
-        "google/electra-small-generator": 14.0,
-        "albert/albert-base-v2": 12.0,
-        "microsoft/minilm-l12-h384-uncased": 33.0,
-        "google/mobilebert-uncased": 25.0,
-        "squeezebert/squeezebert-uncased": 51.0,
-        "distilbert-base-uncased": 66.0,
-        "distilbert-base-cased": 66.0,
-        "distilroberta-base": 82.0,
-        "distilgpt2": 82.0,
-        "eleutherai/pythia-70m": 70.0,
-        "gpt2": 124.0,
-        "microsoft/dialogpt-small": 117.0,
-        "microsoft/dialogpt-medium": 345.0,
-        "eleutherai/gpt-neo-125m": 125.0,
-        "facebook/opt-125m": 125.0,
-        "bert-base-uncased": 110.0,
-        "bert-base-cased": 110.0,
-        "dslim/bert-base-ner": 110.0,
-        "roberta-base": 125.0,
-        "microsoft/deberta-base": 139.0,
-        "google/electra-base-discriminator": 110.0,
-        "google/electra-base-generator": 110.0,
-        "google/flan-t5-small": 80.0,
-        "t5-small": 60.0,
-        "salesforce/codet5-small": 60.0,
-        "google/flan-t5-base": 250.0,
-        "t5-base": 220.0,
-        "google/byt5-small": 300.0,
-        "google/mt5-small": 300.0,
-        "allenai/led-base-16384": 162.0,
-        "sshleifer/distilbart-cnn-12-6": 306.0,
-        "sshleifer/distilbart-xsum-12-6": 306.0,
-        "google/vit-base-patch16-224": 86.0,
-        "apple/mobilevit-small": 5.6,
-        "microsoft/resnet-50": 25.0,
-        "facebook/deit-tiny-patch16-224": 5.7,
-        "facebook/convnext-tiny-224": 28.0,
-        "microsoft/swin-tiny-patch4-window7-224": 28.0,
-        "google/efficientnet-b0": 5.3,
-        "google/mobilenet_v2_1.0_224": 3.5,
-        "facebook/regnet-y-040": 21.0,
-        "facebook/levit-128s": 7.8,
-        "facebook/detr-resnet-50": 41.0,
-        "facebook/detr-resnet-50-dc5": 41.0,
-        "hustvl/yolos-small": 31.0,
-        "hustvl/yolos-tiny": 6.0,
-        "hustvl/yolos-base": 85.0,
-        "pekingu/rtdetr_r18vd_coco_o365": 20.0,
-        "pekingu/rtdetr_v2_r18vd": 20.0,
-        "microsoft/conditional-detr-resnet-50": 44.0,
-        "sensetime/deformable-detr": 40.0,
-        "microsoft/table-transformer-detection": 28.0,
-        "nvidia/segformer-b0-finetuned-ade-512-512": 3.8,
-        "nvidia/segformer-b1-finetuned-ade-512-512": 14.0,
-        "nvidia/segformer-b2-finetuned-ade-512-512": 25.0,
-        "nvidia/segformer-b3-finetuned-ade-512-512": 45.0,
-        "nvidia/segformer-b4-finetuned-ade-512-512": 62.0,
-        "nvidia/segformer-b5-finetuned-ade-640-640": 82.0,
-        "intel/dpt-large-ade": 344.0,
-        "openmmlab/upernet-convnext-tiny": 60.0,
-        "openmmlab/upernet-swin-tiny": 60.0,
-        "mattmdjaga/segformer_b2_clothes": 25.0,
-        "salesforce/blip-image-captioning-base": 224.0,
-        "salesforce/blip-image-captioning-large": 446.0,
-        "microsoft/git-base": 177.0,
-        "microsoft/git-base-coco": 177.0,
-        "microsoft/git-base-vatex": 177.0,
-        "microsoft/git-base-textcaps": 177.0,
-        "microsoft/git-large": 430.0,
-        "microsoft/git-large-coco": 430.0,
-        "microsoft/git-large-vatex": 430.0,
-        "microsoft/git-large-textcaps": 430.0,
-        "openai/clip-vit-base-patch32": 151.0,
-        "openai/clip-vit-base-patch16": 150.0,
-        "openai/clip-vit-large-patch14": 427.0,
-        "openai/clip-vit-large-patch14-336": 427.0,
-        "patrickjohncyh/fashion-clip": 151.0,
-        "wkcn/tinyclip-vit-8m-16-text-3m-yfcc15m": 11.0,
-        "google/siglip-base-patch16-224": 203.0,
-        "google/siglip2-base-patch16-224": 203.0,
-        "google/siglip-so400m-patch14-384": 878.0,
-        "baai/altclip": 322.0,
-        "salesforce/blip-vqa-base": 224.0,
-        "salesforce/blip-vqa-capfilt-large": 446.0,
-        "salesforce/blip2-opt-2.7b": 2700.0,
-        "salesforce/blip2-opt-2.7b-coco": 2700.0,
-        "microsoft/git-base-vqav2": 177.0,
-        "microsoft/git-large-vqav2": 430.0,
-        "dandelin/vilt-b32-finetuned-vqa": 113.0,
-        "bingsu/temp_vilt_vqa": 113.0,
-        "jeney/vilt-b32-finetuned-vqa": 113.0,
-        "jmonas/vilt-33m-vqa": 33.0,
-    }
-    if model_id in exact_estimates:
-        return exact_estimates[model_id]
-
-    family = str(model.get("family") or "").lower()
-    family_estimates = {
-        "tinybert": 14.0,
-        "albert": 12.0,
-        "electra": 60.0,
-        "mobilebert": 25.0,
-        "distilbert": 66.0,
-        "distilroberta": 82.0,
-        "bert": 110.0,
-        "roberta": 125.0,
-        "deberta": 139.0,
-        "gpt2": 124.0,
-        "t5": 120.0,
-        "bart": 306.0,
-        "vit": 86.0,
-        "resnet": 25.0,
-        "segformer": 45.0,
-        "clip": 200.0,
-        "blip": 224.0,
-        "git": 177.0,
-        "vilt": 113.0,
-    }
-    return family_estimates.get(family)
-
-
-def _resource_tier_for_model(model: dict[str, Any]) -> str:
-    params_m = _estimated_model_params_m(model)
-    if params_m is None:
-        return "medium"
-    if params_m <= 85:
-        return "light"
-    if params_m <= 250:
-        return "medium"
-    if params_m <= 700:
-        return "heavy"
-    return "stress_test"
-
-
-def _dataset_cost_score(dataset_spec: dict[str, Any], task_key: str) -> float:
-    samples = float(_as_int(dataset_spec.get("max_samples")) or 0)
-    max_length = float(_as_int(dataset_spec.get("max_length")) or 128)
-    num_classes = float(_as_int(dataset_spec.get("num_classes")) or 1)
-    if task_key in {"object_detection", "image_segmentation"}:
-        return samples * 4.0
-    if task_key == "image_classification":
-        return samples * max(1.0, min(num_classes, 200.0) / 50.0)
-    if task_key in {"image_captioning", "text_image_retrieval", "visual_question_answering"}:
-        return samples * 2.0
-    return samples * max(1.0, max_length / 128.0)
-
-
-def _resource_tier_for_dataset(dataset_spec: dict[str, Any], task_key: str) -> str:
-    score = _dataset_cost_score(dataset_spec, task_key)
-    if score <= 1000:
-        return "light"
-    if score <= 3000:
-        return "medium"
-    if score <= 8000:
-        return "heavy"
-    return "stress_test"
-
-
-def _model_aware_runtime_tier(
-    *,
-    task_key: str,
-    model: dict[str, Any],
-    dataset_spec: dict[str, Any],
-    training_regime: str,
-    resource_tier: ResourceTierSpec,
-) -> ResourceTierSpec:
-    effective_rank = int(resource_tier.rank)
-    family = str(model.get("family") or "").strip().lower()
-    model_id = str(model.get("hf_model_id") or "").strip().lower()
-    params_m = _estimated_model_params_m(model) or 0.0
-
-    if training_regime == "inference_only" and task_key == "text2text_generation":
-        if family == "led" or model_id == "allenai/led-base-16384":
-            effective_rank = max(effective_rank, RESOURCE_TIERS["heavy"].rank)
-        elif family == "mt5":
-            effective_rank = max(effective_rank, RESOURCE_TIERS["heavy"].rank)
-        elif family == "t5" and (params_m >= 180.0 or model_id in {"t5-base", "google/flan-t5-base"}):
-            effective_rank = max(effective_rank, RESOURCE_TIERS["heavy"].rank)
-        elif family == "bart" and params_m >= 250.0:
-            effective_rank = max(effective_rank, RESOURCE_TIERS["heavy"].rank)
-
-    return _resource_tier_by_rank(effective_rank)
-
-
 def _target_sample_size(
     *,
     profile: ManifestProfile,
-    resource_tier: ResourceTierSpec,
-    resource_tier_explicit: bool,
     avg_sample_size: int | None,
 ) -> int:
-    if avg_sample_size is not None:
-        return max(1, int(avg_sample_size))
-    if resource_tier_explicit:
-        return int(resource_tier.default_avg_sample_size)
-    return min(int(profile.default_avg_sample_size), int(resource_tier.default_avg_sample_size))
+    average = int(profile.default_avg_sample_size if avg_sample_size is None else avg_sample_size)
+    recipes.sample_quantity_bounds(average)
+    return average
 
 
-def _max_samples(dataset_spec: dict[str, Any], target_sample_size: int, resource_tier: ResourceTierSpec, task_key: str) -> int:
-    if _is_smoketest_tier(resource_tier):
-        smoke_mins = {
-            "object_detection": 32,
-            "image_segmentation": 32,
-            "image_captioning": 16,
-            "text_image_retrieval": 16,
-            "visual_question_answering": 16,
-        }
-        dataset_cap = _as_int(dataset_spec.get("max_samples")) or target_sample_size
-        return max(1, min(int(dataset_cap), int(smoke_mins.get(task_key, 8))))
-    task_caps = {
-        "object_detection": (48, 120, 240, 480),
-        "image_segmentation": (48, 96, 192, 384),
-        "image_captioning": (128, 768, 2000, 4000),
-        "text_image_retrieval": (128, 768, 2000, 4000),
-        "visual_question_answering": (128, 768, 2000, 4000),
-        "image_classification": (256, 1000, 2200, 5000),
-    }
-    caps = task_caps.get(task_key, (128, 768, 1600, 4000))
-    tier_cap = caps[min(resource_tier.rank, len(caps) - 1)]
-    dataset_cap = _as_int(dataset_spec.get("max_samples")) or target_sample_size
-    requested = min(int(target_sample_size), int(tier_cap))
-    return max(1, min(int(dataset_cap), requested))
-
-
-def _model_aware_max_samples(
-    *,
-    dataset_spec: dict[str, Any],
-    model: dict[str, Any],
-    target_sample_size: int,
-    resource_tier: ResourceTierSpec,
-    task_key: str,
-    training_regime: str,
-) -> int:
-    base = _max_samples(dataset_spec, target_sample_size, resource_tier, task_key)
-    if training_regime != "inference_only" and task_key == "object_detection":
-        model_id = str(model.get("hf_model_id") or "").strip().lower()
-        family = str(model.get("family") or "").strip().lower()
-        if family in {"detr", "conditional-detr", "deformable-detr"} or "detr" in model_id:
-            return min(base, 96)
-    if training_regime != "inference_only" or task_key != "text2text_generation":
-        return base
-
-    family = str(model.get("family") or "").strip().lower()
-    model_id = str(model.get("hf_model_id") or "").strip().lower()
-    if model_id in {"t5-base", "google/flan-t5-base"}:
-        return min(base, 384)
-    if family in {"t5", "mt5"}:
-        return min(base, 512)
-    if family == "led" or model_id == "allenai/led-base-16384":
-        return min(base, 320)
-    if family == "bart" and (_estimated_model_params_m(model) or 0.0) >= 250.0:
-        return min(base, 512)
-    return base
-
-
-def _max_length(dataset_spec: dict[str, Any], model: dict[str, Any], resource_tier: ResourceTierSpec, task_key: str) -> int | None:
+def _max_length(dataset_spec: dict[str, Any], model: dict[str, Any], task_key: str) -> int | None:
     base = _as_int(dataset_spec.get("max_length")) or _as_int(model.get("max_length"))
     if base is None:
         return None
-    caps = {
-        "text_generation": (128, 192, 256, 512),
-        "text2text_generation": (128, 192, 256, 512),
-        "fill_mask": (96, 128, 192, 256),
-        "token_classification": (96, 128, 192, 256),
-        "image_captioning": (48, 64, 96, 128),
-        "text_image_retrieval": (48, 64, 96, 128),
-        "visual_question_answering": (32, 48, 64, 96),
-    }
-    default_caps = (96, 128, 192, 256)
-    cap = caps.get(task_key, default_caps)[min(resource_tier.rank, 3)]
+    caps = {"text_generation": 192, "text2text_generation": 192,
+            "image_captioning": 64, "text_image_retrieval": 64, "visual_question_answering": 48}
+    cap = caps.get(task_key, 128)
     return max(1, min(int(base), int(cap)))
-
-
-def _unique_ints(values: tuple[int, ...] | list[int]) -> tuple[int, ...]:
-    seen: set[int] = set()
-    result: list[int] = []
-    for value in values:
-        value = max(1, int(value))
-        if value not in seen:
-            seen.add(value)
-            result.append(value)
-    return tuple(result)
-
-
-def _batch_sizes_for(task_key: str, model: dict[str, Any], resource_tier: ResourceTierSpec) -> tuple[int, ...]:
-    rank = resource_tier.rank
-    family = str(model.get("family") or "").strip().lower()
-    if task_key == "image_captioning" or (task_key == "visual_question_answering" and family in {"blip", "blip2", "git"}):
-        return (1,)
-    if task_key in {"object_detection", "image_segmentation", "image_captioning", "visual_question_answering", "text_image_retrieval"}:
-        table = ((1, 2), (2, 4), (4, 8), (8, 16))
-    elif task_key in {"text_generation", "text2text_generation", "token_classification"}:
-        table = ((2, 4), (4, 8), (8, 16), (8, 16, 32))
-    elif task_key == "image_classification":
-        table = ((4, 8), (8, 16), (16, 32), (32, 64))
-    else:
-        table = ((4, 8), (8, 16), (16, 32), (16, 32, 64))
-
-    params_m = _estimated_model_params_m(model)
-    values = table[min(rank, len(table) - 1)]
-    model_id = str(model.get("hf_model_id") or "").strip().lower()
-    if task_key == "object_detection" and (family in {"detr", "conditional-detr", "deformable-detr"} or "detr" in model_id):
-        values = tuple(min(2, value) for value in values)
-    if params_m is not None and params_m > 700:
-        values = tuple(max(1, value // 4) for value in values)
-    elif params_m is not None and params_m > 250:
-        values = tuple(max(1, value // 2) for value in values)
-    return _unique_ints(values)
-
-
-def _learning_rates_for(task_key: str, model: dict[str, Any], resource_tier: ResourceTierSpec) -> tuple[float, ...]:
-    params_m = _estimated_model_params_m(model) or 100.0
-    tiny_model = params_m <= 35.0 or str(model.get("family") or "").lower() in {"tinybert", "tinystories", "tinyclip", "albert"}
-    if task_key in {"object_detection", "image_segmentation"}:
-        rates = (5e-6, 1e-5, 2e-5)
-    elif task_key == "text_image_retrieval":
-        rates = (1e-6, 5e-6, 1e-5)
-    elif task_key in {"text_generation", "text2text_generation", "image_captioning", "visual_question_answering"}:
-        rates = (1e-5, 2e-5, 3e-5)
-    elif task_key == "image_classification":
-        rates = (1e-5, 2e-5, 5e-5)
-    else:
-        rates = (2e-5, 3e-5, 5e-5)
-        if tiny_model:
-            rates = (3e-5, 5e-5, 1e-4)
-    if resource_tier.rank <= 0:
-        return rates[:2]
-    if resource_tier.rank >= 3 and tiny_model and rates[-1] < 1e-4:
-        return (*rates, 1e-4)
-    return rates
-
-
-def _epochs_for(task_key: str, resource_tier: ResourceTierSpec) -> tuple[int, ...]:
-    if task_key in {"object_detection", "image_segmentation", "text_generation", "text2text_generation", "image_captioning", "visual_question_answering", "text_image_retrieval"}:
-        table = ((1,), (1,), (1, 2), (2, 3))
-    else:
-        table = ((1,), (1, 2), (2, 3), (3, 4))
-    return table[min(resource_tier.rank, len(table) - 1)]
-
-
-def _weight_decays_for(task_key: str, resource_tier: ResourceTierSpec) -> tuple[float, ...]:
-    if resource_tier.rank == 0:
-        return (0.0, 0.001)
-    if task_key in {"text_generation", "text2text_generation", "image_captioning", "visual_question_answering"}:
-        return (0.0, 0.001, 0.01)
-    return (0.0, 0.001, 0.01, 0.05)
-
-
-def _optimizers_for(task_key: str, resource_tier: ResourceTierSpec) -> tuple[str, ...]:
-    if task_key in {"object_detection", "image_segmentation", "image_captioning", "visual_question_answering", "text_image_retrieval"}:
-        return ("adamw", "adam")
-    if resource_tier.rank <= 0:
-        return ("adamw", "adam")
-    return ("adamw", "adam", "sgd")
-
-
-def _warmup_ratios_for(task_key: str, resource_tier: ResourceTierSpec) -> tuple[float, ...]:
-    if task_key in {"object_detection", "image_segmentation"}:
-        return (0.0, 0.03)
-    if resource_tier.rank <= 0:
-        return (0.0, 0.05)
-    return (0.0, 0.03, 0.06, 0.1)
-
-
-def _mlm_probabilities_for(task_key: str) -> tuple[float, ...]:
-    if task_key == "fill_mask":
-        return (0.10, 0.15, 0.20, 0.30)
-    return ()
-
-
-def _gradient_accumulation_steps_for(task_key: str, model: dict[str, Any], resource_tier: ResourceTierSpec) -> tuple[int, ...]:
-    params_m = _estimated_model_params_m(model) or 0.0
-    if task_key in {"object_detection", "image_segmentation", "image_captioning", "visual_question_answering", "text_image_retrieval"}:
-        values = (1, 2, 4) if resource_tier.rank >= 1 else (1, 2)
-    elif task_key in {"text_generation", "text2text_generation", "token_classification"}:
-        values = (1, 2, 4) if resource_tier.rank >= 1 else (1, 2)
-    else:
-        values = (1, 2, 4) if resource_tier.rank >= 2 else (1, 2)
-    if params_m > 250:
-        values = tuple(value for value in values if value >= 2) or (2,)
-    return _unique_ints(values)
-
-
-def _sample_size_for_variant(max_samples: int, knob_variant: int) -> int:
-    cap = max(1, int(max_samples))
-    if cap <= 2:
-        return 1
-    if cap <= 4:
-        return cap - 1
-    fractions = (0.5, 0.65, 0.8, 0.95)
-    frac = fractions[int(knob_variant) % len(fractions)]
-    return max(1, min(cap - 1, int(round(float(cap) * frac))))
-
-
-def _sample_seed_for_variant(
-    *,
-    base_seed: int,
-    model_id: Any,
-    dataset_name: Any,
-    dataset_config: Any,
-    dataset_variant: int,
-    split_variant: int,
-    knob_variant: int,
-) -> int:
-    raw = "|".join(
-        str(value)
-        for value in (
-            base_seed,
-            model_id,
-            dataset_name,
-            dataset_config,
-            dataset_variant,
-            split_variant,
-            knob_variant,
-        )
-    )
-    return int(hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8], 16)
-
-
-def _default_skew_axis_for_task(task_key: str) -> str | None:
-    mapping = {
-        "text_classification": "class_label",
-        "token_classification": "entity_present_sentence",
-        "sentence_similarity": "score_bin",
-        "fill_mask": "masked_token_id",
-        "text_generation": "supervised_token_bucket",
-        "text2text_generation": "supervised_token_bucket",
-        "image_classification": "class_label",
-        "image_captioning": "supervised_token_bucket",
-        "text_image_retrieval": "query_length_bucket",
-        "visual_question_answering": "answer_vocab",
-    }
-    return mapping.get(task_key)
-
-
-def _skew_axis_config_for_task(task_key: str) -> dict[str, Any] | None:
-    if task_key == "sentence_similarity":
-        return {"num_bins": 5}
-    if task_key in {"text_generation", "text2text_generation"}:
-        return {"num_bins": 5}
-    return None
-
-
-def _split_knobs_for_variant(task_key: str, knob_variant: int, resource_tier: ResourceTierSpec) -> tuple[str, float | None, str | None, dict[str, Any] | None]:
-    skew_axis = _default_skew_axis_for_task(task_key)
-    skew_axis_config = _skew_axis_config_for_task(task_key)
-    if resource_tier.rank == 0 or skew_axis is None or task_key in {"object_detection", "image_segmentation"}:
-        return "iid", None, skew_axis, skew_axis_config
-    options: tuple[tuple[str, float | None], ...] = (("iid", None), ("dirichlet", 0.2))
-    split_strategy, distribution_param = options[int(knob_variant) % len(options)]
-    return split_strategy, distribution_param, skew_axis, skew_axis_config
-
-
-def _training_knobs_for_variant(
-    *,
-    task_key: str,
-    model: dict[str, Any],
-    training_regime: str,
-    knob_variant: int,
-    resource_tier: ResourceTierSpec,
-) -> dict[str, Any]:
-    batch_sizes = _batch_sizes_for(task_key, model, resource_tier)
-    split_strategy, distribution_param, skew_axis, skew_axis_config = _split_knobs_for_variant(task_key, knob_variant, resource_tier)
-    mixed_precision, precision_type = _precision_knobs_for_variant(knob_variant)
-    if training_regime == "inference_only":
-        return {
-            "training_epochs": 0,
-            "batch_size": batch_sizes[int(knob_variant) % len(batch_sizes)],
-            "learning_rate": None,
-            "optimizer": "none",
-            "weight_decay": 0.0,
-            "warmup_ratio": 0.0,
-            "mlm_probability": _mlm_probabilities_for(task_key)[int(knob_variant) % len(_mlm_probabilities_for(task_key))] if _mlm_probabilities_for(task_key) else None,
-            "gradient_accumulation_steps": 1,
-            "momentum": 0.0,
-            "split_strategy": split_strategy,
-            "skew_axis": skew_axis,
-            "skew_axis_config": skew_axis_config,
-            "distribution_type": split_strategy,
-            "distribution_param": distribution_param,
-            "mixed_precision": mixed_precision,
-            "precision_type": precision_type,
-        }
-
-    learning_rates = _learning_rates_for(task_key, model, resource_tier)
-    epochs = _epochs_for(task_key, resource_tier)
-    weight_decays = _weight_decays_for(task_key, resource_tier)
-    optimizers = _optimizers_for(task_key, resource_tier)
-    warmup_ratios = _warmup_ratios_for(task_key, resource_tier)
-    mlm_probabilities = _mlm_probabilities_for(task_key)
-    grad_accum_steps = _gradient_accumulation_steps_for(task_key, model, resource_tier)
-    batch_idx = int(knob_variant) % len(batch_sizes)
-    lr_idx = int(knob_variant) % len(learning_rates)
-    optimizer_idx = int(knob_variant) % len(optimizers)
-    epoch_idx = int(knob_variant) % len(epochs)
-    wd_idx = int(knob_variant) % len(weight_decays)
-    warmup_idx = int(knob_variant) % len(warmup_ratios)
-    mlm_idx = int(knob_variant) % len(mlm_probabilities) if mlm_probabilities else 0
-    grad_accum_idx = int(knob_variant) % len(grad_accum_steps)
-    return {
-        "training_epochs": epochs[epoch_idx],
-        "batch_size": batch_sizes[batch_idx],
-        "learning_rate": learning_rates[lr_idx],
-        "optimizer": optimizers[optimizer_idx],
-        "weight_decay": weight_decays[wd_idx],
-        "warmup_ratio": warmup_ratios[warmup_idx],
-        "mlm_probability": mlm_probabilities[mlm_idx] if mlm_probabilities else None,
-        "gradient_accumulation_steps": grad_accum_steps[grad_accum_idx],
-        "momentum": 0.0,
-        "split_strategy": split_strategy,
-        "skew_axis": skew_axis,
-        "skew_axis_config": skew_axis_config,
-        "distribution_type": split_strategy,
-        "distribution_param": distribution_param,
-        "mixed_precision": mixed_precision,
-        "precision_type": precision_type,
-    }
-
-
-def _precision_knobs_for_variant(knob_variant: int) -> tuple[bool, str]:
-    enabled = int(knob_variant) % 4 != 3
-    if not enabled:
-        return False, "fp16"
-    # ROCm runs in this project have been materially more stable with fp16 than bf16.
-    return True, "fp16"
 
 
 def _task_specific_inference_model(task_key: str, model: dict[str, Any]) -> bool:
@@ -1056,7 +543,9 @@ def _vision_dataset_meets_minimum_examples(task_key: str, dataset_spec: dict[str
     return train_examples >= min_train and benchmark_examples >= min_benchmark
 
 
-def _row_is_manifest_eligible(row: dict[str, Any]) -> bool:
+def _row_is_manifest_eligible(row: dict[str, Any], *, check_family: bool = True) -> bool:
+    if check_family and manifest_family_error(row):
+        return False
     training_regime = str(row.get("training_regime") or "").strip().lower()
     blocked_reason = known_bad_path_reason(
         task_key=row.get("task"),
@@ -1111,41 +600,16 @@ def _fit_quality_score(task_key: str, model: dict[str, Any], dataset_spec: dict[
     return max(0, score)
 
 
-def _sort_models_for_tier(
-    models: list[dict[str, Any]],
-    *,
-    task_key: str,
-    resource_tier: ResourceTierSpec,
-    selected_training_regimes: list[str],
-    rng: random.Random,
-) -> list[dict[str, Any]]:
+def _sort_models(models: list[dict[str, Any]], *, task_key: str,
+                 selected_training_regimes: list[str], rng: random.Random) -> list[dict[str, Any]]:
     eligible = []
     for model in models:
-        if not any(_quality_allows_model_regime(model, regime) for regime in selected_training_regimes):
-            continue
-        model_tier = _resource_tier_for_model(model)
-        if not _is_smoketest_tier(resource_tier) and _resource_tier_rank(model_tier) > resource_tier.rank:
-            continue
-        copied = dict(model)
-        copied["_model_resource_tier"] = model_tier
-        copied["_estimated_params_m"] = _estimated_model_params_m(model)
-        copied["_selection_jitter"] = rng.random()
-        eligible.append(copied)
-    if not eligible:
-        return []
-    target_rank = min(
-        resource_tier.rank,
-        max(_resource_tier_rank(str(item.get("_model_resource_tier"))) for item in eligible),
-    )
-    return sorted(
-        eligible,
-        key=lambda item: (
-            abs(_resource_tier_rank(str(item.get("_model_resource_tier"))) - target_rank),
-            -_model_selection_score(task_key, item, selected_training_regimes),
-            _estimated_model_params_m(item) or 1_000_000.0,
-            item["_selection_jitter"],
-        ),
-    )
+        if any(_quality_allows_model_regime(model, regime) for regime in selected_training_regimes):
+            eligible.append({**model, "_estimated_params_m": _estimated_model_params_m(model),
+                             "_selection_jitter": rng.random()})
+    # Uniform random priorities: size and quality metadata must not determine
+    # which compatible architectures reach the population limit.
+    return sorted(eligible, key=lambda item: item["_selection_jitter"])
 
 
 def _quality_allows_model_regime(model: dict[str, Any], training_regime: str) -> bool:
@@ -1167,45 +631,10 @@ def _model_selection_score(task_key: str, model: dict[str, Any], selected_traini
     return score
 
 
-def _sort_datasets_for_tier(
-    datasets: list[dict[str, Any]],
-    *,
-    task_key: str,
-    resource_tier: ResourceTierSpec,
-    rng: random.Random,
-) -> list[dict[str, Any]]:
-    if not datasets:
-        return []
-    eligible = []
-    for dataset in datasets:
-        copied = dict(dataset)
-        copied["_dataset_resource_tier"] = _resource_tier_for_dataset(dataset, task_key)
-        copied["_selection_jitter"] = rng.random()
-        eligible.append(copied)
-
-    if _is_smoketest_tier(resource_tier):
-        return sorted(
-            eligible,
-            key=lambda item: (
-                _dataset_cost_score(item, task_key),
-                item["_selection_jitter"],
-            ),
-        )
-
-    within_tier = [item for item in eligible if _resource_tier_rank(str(item.get("_dataset_resource_tier"))) <= resource_tier.rank]
-    source = within_tier or eligible
-    target_rank = min(
-        resource_tier.rank,
-        max(_resource_tier_rank(str(item.get("_dataset_resource_tier"))) for item in source),
-    )
-    return sorted(
-        source,
-        key=lambda item: (
-            abs(_resource_tier_rank(str(item.get("_dataset_resource_tier"))) - target_rank),
-            _dataset_cost_score(item, task_key),
-            item["_selection_jitter"],
-        ),
-    )
+def _sort_datasets(datasets: list[dict[str, Any]], *, task_key: str,
+                   rng: random.Random) -> list[dict[str, Any]]:
+    eligible = [{**dataset, "_selection_jitter": rng.random()} for dataset in datasets]
+    return sorted(eligible, key=lambda item: item["_selection_jitter"])
 
 
 def _row_from_registry(
@@ -1214,7 +643,7 @@ def _row_from_registry(
     task_spec: TaskSpec,
     model: dict[str, Any],
     dataset_spec: dict[str, Any],
-    resource_tier: ResourceTierSpec,
+    budgets: dict[str, int],
     target_sample_size: int,
     training_regime: str,
     dataset_variant: int,
@@ -1223,43 +652,25 @@ def _row_from_registry(
     seed: int,
 ) -> dict[str, Any]:
     defaults = _training_regime_defaults(training_regime)
-    runtime_tier = _model_aware_runtime_tier(
-        task_key=task_key,
-        model=model,
-        dataset_spec=dataset_spec,
-        training_regime=training_regime,
-        resource_tier=resource_tier,
-    )
     knobs = _training_knobs_for_variant(
         task_key=task_key,
         model=model,
         training_regime=training_regime,
         knob_variant=knob_variant,
-        resource_tier=runtime_tier,
     )
-    max_length = _max_length(dataset_spec, model, runtime_tier, task_key)
+    max_length = _max_length(dataset_spec, model, task_key)
     source_max_length = dataset_spec.get("source_max_length")
     target_max_length = dataset_spec.get("target_max_length")
     if task_key == "text2text_generation" and max_length is not None:
         source_max_length = source_max_length or max_length
-        target_max_length = target_max_length or min(max_length, 96 if runtime_tier.rank <= 1 else 128)
+        target_max_length = target_max_length or min(max_length, 96)
     fit_quality_score = _fit_quality_score(task_key, model, dataset_spec, training_regime)
-    model_resource_tier = str(model.get("_model_resource_tier") or _resource_tier_for_model(model))
-    dataset_resource_tier = str(dataset_spec.get("_dataset_resource_tier") or _resource_tier_for_dataset(dataset_spec, task_key))
     estimated_params_m = model.get("_estimated_params_m") or _estimated_model_params_m(model)
     estimated_params_count = None if estimated_params_m is None else int(float(estimated_params_m) * 1_000_000)
-    max_samples = _model_aware_max_samples(
-        dataset_spec=dataset_spec,
-        model=model,
-        target_sample_size=target_sample_size,
-        resource_tier=resource_tier,
-        task_key=task_key,
-        training_regime=training_regime,
-    )
     sample_size = (
         None
         if training_regime == "inference_only"
-        else _sample_size_for_variant(max_samples, knob_variant)
+        else target_sample_size
     )
     sample_seed = _sample_seed_for_variant(
         base_seed=seed,
@@ -1288,7 +699,6 @@ def _row_from_registry(
         "input_schema": dataset_spec.get("input_schema") or model.get("input_schema"),
         "output_schema": dataset_spec.get("label_format"),
         "training_regime": training_regime,
-        "resource_tier": resource_tier.name,
         "dataset_variant": dataset_variant,
         "split_variant": split_variant,
         "knob_variant": knob_variant,
@@ -1310,11 +720,11 @@ def _row_from_registry(
         "momentum": knobs["momentum"],
         "sample_seed": sample_seed,
         "sample_size": sample_size,
-        "max_samples": max_samples,
+        "benchmark_sample_size": target_sample_size if training_regime == "inference_only" else None,
         "max_length": max_length,
-        "timeout_s": runtime_tier.timeout_s,
-        "max_train_time_s": runtime_tier.max_train_time_s,
-        "max_eval_time_s": runtime_tier.max_eval_time_s,
+        "timeout_s": budgets["timeout_s"],
+        "max_train_time_s": budgets["max_train_time_s"],
+        "max_eval_time_s": budgets["max_eval_time_s"],
         "device": "auto",
         "mixed_precision": knobs["mixed_precision"],
         "precision_type": knobs["precision_type"],
@@ -1342,7 +752,7 @@ def _row_from_registry(
         "enable_perturbation_metrics": bool((model.get("explainability") or dataset_spec.get("explainability") or {}).get("supported", True)),
         "perturbation_stage_logging": True,
         "perturbation_progress_logging": False,
-        "perturbation_sample_count": resource_tier.perturbation_sample_count,
+        "perturbation_sample_count": 1,
         "perturbation_candidate_units": 4,
         "perturbation_target_units": 1,
         "perturbation_trust_trials": 2,
@@ -1355,11 +765,8 @@ def _row_from_registry(
         "fit_decision": "compatible",
         "fit_reason": (
             f"quality-filtered registry pair task={task_key} training_regime={training_regime} "
-            f"resource_tier={resource_tier.name}"
         ),
         "fit_quality_score": fit_quality_score,
-        "model_resource_tier": model_resource_tier,
-        "dataset_resource_tier": dataset_resource_tier,
         "realism_score": model.get("realism_score"),
         "domain_alignment": dataset_spec.get("domain_alignment"),
         "dataset_hint": dataset_spec.get("dataset_hint"),
@@ -1376,9 +783,6 @@ def _row_from_registry(
                 "dataset_registry_key": dataset_spec.get("registry_key"),
                 "model_registry_key": model.get("registry_key"),
                 "training_regime": training_regime,
-                "resource_tier": resource_tier.name,
-                "model_resource_tier": model_resource_tier,
-                "dataset_resource_tier": dataset_resource_tier,
                 "estimated_model_params_m": estimated_params_m,
                 "fit_quality_score": fit_quality_score,
                 "dataset_variant": dataset_variant,
@@ -1388,9 +792,17 @@ def _row_from_registry(
             sort_keys=True,
         ),
     }
+    from ...task_contract import resolve_sentence_pair_contract
+    resolve_sentence_pair_contract(row, dataset_spec=dataset_spec)
+    from ...precision_policy import apply_precision_policy
+    apply_precision_policy(row, model_family=model.get("family"))
+    from ...segmentation_policy import apply_segmentation_label_policy
+    apply_segmentation_label_policy(row)
+    from ...mobilebert_policy import apply_mobilebert_generation_defaults
+    apply_mobilebert_generation_defaults(row, model_family=model.get("family"))
     row["case_name"] = (
         f"{task_spec.task_label}__{model.get('hf_model_id')}__{dataset_spec.get('dataset_name')}"
-        f"__{training_regime}__{resource_tier.name}__d{dataset_variant}__s{split_variant}__k{knob_variant}"
+        f"__{training_regime}__d{dataset_variant}__s{split_variant}__k{knob_variant}"
     )
     row["notes"] = "Reviewed service row generated from model and dataset registries"
     row["service_id"] = _service_id(
@@ -1400,7 +812,7 @@ def _row_from_registry(
             "dataset": row["dataset_name"],
             "dataset_config": row["dataset_config"],
             "training_regime": training_regime,
-            "resource_tier": resource_tier.name,
+            "budgets": budgets,
             "dataset_variant": dataset_variant,
             "split_variant": split_variant,
             "knob_variant": knob_variant,
@@ -1451,114 +863,21 @@ def _selected_generic_cases(requested_task_keys: list[str]) -> list[dict[str, An
     return [case for case in GENERIC_MANIFEST_CASES if case["task_key"] in requested]
 
 
-def _generic_split_knobs_for_variant(
-    case: dict[str, Any],
-    split_variant: int,
-    resource_tier: ResourceTierSpec,
-) -> tuple[str, float | None, str | None, dict[str, Any] | None]:
-    task_key = str(case.get("task_key") or "")
-    task_type = str(case.get("task_type") or "")
-    if task_type == "regression":
-        skew_axis = "score_bin"
-        skew_axis_config = {"num_bins": 5 + (int(split_variant) % 4)}
-    elif task_type in {"classification", "clustering"}:
-        skew_axis = "class_label"
-        skew_axis_config = None
-    else:
-        skew_axis = _default_skew_axis_for_task(task_key)
-        skew_axis_config = _skew_axis_config_for_task(task_key)
-
-    if resource_tier.rank == 0:
-        return "iid", None, skew_axis, skew_axis_config
-
-    options: tuple[tuple[str, float | None], ...] = (
-        ("iid", None),
-        ("dirichlet", 0.05),
-        ("dirichlet", 0.1),
-        ("dirichlet", 0.2),
-        ("dirichlet", 0.5),
-        ("dirichlet", 1.0),
-        ("quantity_skew", 0.1),
-        ("quantity_skew", 0.3),
-    )
-    split_strategy, distribution_param = options[int(split_variant) % len(options)]
-    return split_strategy, distribution_param, skew_axis, skew_axis_config
-
-
-def _generic_training_knobs_for_variant(
-    case: dict[str, Any],
-    knob_variant: int,
-    resource_tier: ResourceTierSpec,
-) -> dict[str, Any]:
-    task_key = str(case.get("task_key") or "")
-    model_type = str(case.get("model_type") or "").lower()
-    variant = int(knob_variant)
-
-    if model_type in {"randomforest", "kmeans"}:
-        learning_rates = (None,)
-        optimizers = ("none",)
-        weight_decays = (0.0,)
-        momentum_values = (0.0,)
-    elif task_key == "keras_image_classification":
-        learning_rates = (1e-4, 3e-4, 1e-3, 3e-3, 1e-2)
-        optimizers = ("adam", "sgd", "rmsprop", "adamw")
-        weight_decays = (0.0, 1e-5, 1e-4, 1e-3)
-        momentum_values = (0.0, 0.5, 0.9)
-    elif task_key == "tabular_regression":
-        learning_rates = (1e-4, 3e-4, 1e-3, 3e-3, 1e-2)
-        optimizers = ("adam", "sgd", "rmsprop", "adamw", "adagrad")
-        weight_decays = (0.0, 1e-6, 1e-5, 1e-4, 1e-3)
-        momentum_values = (0.0, 0.5, 0.9)
-    else:
-        learning_rates = (case.get("learning_rate"),)
-        optimizers = (case.get("optimizer") or "adam",)
-        weight_decays = (0.0,)
-        momentum_values = (0.0,)
-
-    base_batch_sizes = _batch_sizes_for(task_key, case, resource_tier)
-    case_batch = case.get("batch_size")
-    if case_batch:
-        candidates = tuple(sorted({1, 2, 4, 8, 16, 32, int(case_batch)}))
-        batch_sizes = _unique_ints(
-            tuple(value for value in candidates if value <= max(int(case_batch), max(base_batch_sizes)))
-        )
-    else:
-        batch_sizes = base_batch_sizes
-
-    if model_type == "kmeans":
-        epochs = (1,)
-    else:
-        epochs = (1, 2, 3) if resource_tier.rank >= 1 else (1, 2)
-
-    return {
-        "training_epochs": epochs[variant % len(epochs)],
-        "batch_size": batch_sizes[variant % len(batch_sizes)],
-        "learning_rate": learning_rates[(variant * 2 + variant // 3) % len(learning_rates)],
-        "optimizer": optimizers[(variant * 3 + variant // 2) % len(optimizers)],
-        "weight_decay": weight_decays[(variant * 5 + variant // 4) % len(weight_decays)],
-        "momentum": momentum_values[(variant * 7 + variant // 5) % len(momentum_values)],
-        "clustering_k": (2, 3, 4, 5, 6)[variant % 5] if model_type == "kmeans" else case.get("clustering_k"),
-        "clustering_n_init": (5, 10, 20)[variant % 3] if model_type == "kmeans" else None,
-        "clustering_max_iter": (100, 200, 300, 500)[variant % 4] if model_type == "kmeans" else None,
-        "clustering_tol": (1e-3, 1e-4, 1e-5)[variant % 3] if model_type == "kmeans" else None,
-    }
-
-
-def _generic_max_samples_for_variant(case: dict[str, Any], target_sample_size: int, dataset_variant: int, resource_tier: ResourceTierSpec) -> int:
-    del target_sample_size
-    case_max = int(case.get("max_samples", 5000))
-    tier_caps = (128, 5000, 5000, 5000)
-    cap = min(case_max, tier_caps[min(resource_tier.rank, len(tier_caps) - 1)])
-    fractions = (0.25, 0.4, 0.6, 0.75, 1.0, 0.5, 0.9)
-    value = int(round(cap * fractions[int(dataset_variant) % len(fractions)]))
-    return max(16, min(cap, value))
+def _sample_cnn_hidden_layers(case: dict[str, Any], *, seed: int) -> list[int]:
+    # A separate family RNG keeps the draw independent of client count, task
+    # ordering and the draws used for training recipes.
+    contract = {key: case.get(key) for key in (
+        "task_key", "model_type", "dataset", "dataset_name", "dataset_config",
+    )}
+    rng = random.Random(f"cnn_hidden_layers_v1:{seed}:{sha256_json(contract)}")
+    return list(rng.choice(CNN_HIDDEN_LAYER_POOL))
 
 
 def _row_from_generic_case(
     *,
     case: dict[str, Any],
     profile: ManifestProfile,
-    resource_tier: ResourceTierSpec,
+    budgets: dict[str, int],
     target_sample_size: int,
     dataset_variant: int,
     split_variant: int,
@@ -1566,16 +885,14 @@ def _row_from_generic_case(
     seed: int,
 ) -> dict[str, Any]:
     del profile
-    split_strategy, distribution_param, skew_axis, skew_axis_config = _generic_split_knobs_for_variant(case, split_variant, resource_tier)
-    training_knobs = _generic_training_knobs_for_variant(case, knob_variant, resource_tier)
-    max_samples = _generic_max_samples_for_variant(case, target_sample_size, dataset_variant, resource_tier)
+    split_strategy, distribution_param, skew_axis, skew_axis_config = _generic_split_knobs_for_variant(case, split_variant)
+    training_knobs = _generic_training_knobs_for_variant(case, knob_variant)
     row = {
         **case,
         "enabled": True,
-        "case_name": f"{case['task_label']}__{case['dataset_name']}__generic__{resource_tier.name}__d{dataset_variant}__s{split_variant}__k{knob_variant}",
+        "case_name": f"{case['task_label']}__{case['dataset_name']}__generic__d{dataset_variant}__s{split_variant}__k{knob_variant}",
         "notes": "Reviewed generic service row",
         "training_regime": "generic",
-        "resource_tier": resource_tier.name,
         "dataset_variant": dataset_variant,
         "split_variant": split_variant,
         "knob_variant": knob_variant,
@@ -1591,26 +908,23 @@ def _row_from_generic_case(
         "optimizer": training_knobs["optimizer"],
         "weight_decay": training_knobs["weight_decay"],
         "momentum": training_knobs["momentum"],
-        "sample_size": None,
-        "max_samples": max_samples,
-        "timeout_s": resource_tier.timeout_s,
-        "max_train_time_s": resource_tier.max_train_time_s,
-        "max_eval_time_s": resource_tier.max_eval_time_s,
+        "sample_size": target_sample_size,
+        "timeout_s": budgets["timeout_s"],
+        "max_train_time_s": budgets["max_train_time_s"],
+        "max_eval_time_s": budgets["max_eval_time_s"],
         "mixed_precision": False,
         "precision_type": "fp16",
         "num_workers": 0,
         "service_source": "generic_registry",
         "model_role": "service",
         "fit_decision": "compatible",
-        "fit_reason": f"generic manifest-compatible task runner resource_tier={resource_tier.name}",
+        "fit_reason": "generic manifest-compatible task runner",
         "fit_quality_score": 70,
-        "model_resource_tier": "light" if case.get("model_type") in {"randomforest", "kmeans"} else resource_tier.name,
-        "dataset_resource_tier": resource_tier.name,
         "explainability_enabled": True,
         "enable_perturbation_metrics": True,
         "perturbation_stage_logging": True,
         "perturbation_progress_logging": False,
-        "perturbation_sample_count": resource_tier.perturbation_sample_count,
+        "perturbation_sample_count": 1,
         "perturbation_candidate_units": 4,
         "perturbation_target_units": 1,
         "perturbation_trust_trials": 2,
@@ -1628,7 +942,7 @@ def _row_from_generic_case(
             "model": row["model_type"],
             "dataset": row["dataset_name"],
             "training_regime": "generic",
-            "resource_tier": resource_tier.name,
+            "budgets": budgets,
             "dataset_variant": dataset_variant,
             "split_variant": split_variant,
             "knob_variant": knob_variant,
@@ -1639,56 +953,317 @@ def _row_from_generic_case(
     return row
 
 
+def _default_fedavg_runs(profile: ManifestProfile) -> int:
+    return {"test": 2, "balanced": 50, "benchmark": 200}.get(profile.name, 50)
+
+
+def _fedavg_client_knobs_for_row(*, base_row: dict[str, Any], client_index: int, task_key: str) -> dict[str, Any]:
+    model = {"hf_model_id": base_row.get("hf_model_id")}
+    return fedavg_client_knobs(
+        base_row=base_row,
+        client_index=client_index,
+        task_key=task_key,
+        profile_batch_sizes=_batch_sizes_for(task_key, model),
+        profile_learning_rates=_learning_rates_for(task_key, model),
+        profile_epochs=_epochs_for(task_key),
+        profile_optimizers=_optimizers_for(task_key),
+    )
+
+
+def _collect_fedavg_run_seed_rows(
+    *,
+    requested_task_keys: list[str],
+    selected_training_regimes: list[str],
+    models_per_task: int,
+    datasets_per_model: int,
+    dataset_variants_per_pair: int,
+    split_variants_per_pair: int,
+    budgets: dict[str, int],
+    target_sample_size: int,
+    seed: int,
+    max_models_per_family: int | None,
+    strict_inference_dataset_match: bool,
+    rng: random.Random,
+) -> list[dict[str, Any]]:
+    run_seeds: list[dict[str, Any]] = []
+    for task_key in requested_task_keys:
+        task_spec = TASK_SPECS.get(task_key)
+        if task_spec is not None:
+            models = _model_candidates(task_key)
+            models = _sort_models(
+                models,
+                task_key=task_key,
+                selected_training_regimes=selected_training_regimes,
+                rng=rng,
+            )
+            if max_models_per_family:
+                models = _cap_models_per_family(models, int(max_models_per_family))
+            model_limit = _normalise_positive_int(models_per_task)
+            for model in models[:model_limit]:
+                for training_regime in selected_training_regimes:
+                    if training_regime == "inference_only":
+                        continue
+                    if not _quality_allows_model_regime(model, training_regime):
+                        continue
+                    datasets = _dataset_candidates(task_key, model, training_regime=training_regime)
+                    datasets = [
+                        dataset
+                        for dataset in datasets
+                        if _quality_allows_combo(
+                            task_key=task_key,
+                            model=model,
+                            dataset_spec=dataset,
+                            training_regime=training_regime,
+                            strict_inference_dataset_match=strict_inference_dataset_match,
+                        )
+                    ]
+                    datasets = _sort_datasets(
+                        datasets,
+                        task_key=task_key,
+                        rng=rng,
+                    )
+                    dataset_limit = _normalise_positive_int(datasets_per_model)
+                    for dataset in datasets[:dataset_limit]:
+                        for dataset_variant in range(_normalise_positive_int(dataset_variants_per_pair)):
+                            for split_variant in range(_normalise_positive_int(split_variants_per_pair)):
+                                row = _row_from_registry(
+                                    task_key=task_key,
+                                    task_spec=task_spec,
+                                    model=model,
+                                    dataset_spec=dataset,
+                                    budgets=budgets,
+                                    target_sample_size=target_sample_size,
+                                    training_regime=training_regime,
+                                    dataset_variant=dataset_variant,
+                                    split_variant=split_variant,
+                                    knob_variant=0,
+                                    seed=seed,
+                                )
+                                if _row_is_manifest_eligible(row, check_family=False) and is_fedavg_eligible_row(row):
+                                    run_seeds.append(row)
+            continue
+
+        for case in _selected_generic_cases([task_key]):
+            for dataset_variant in range(_normalise_positive_int(dataset_variants_per_pair)):
+                for split_variant in range(_normalise_positive_int(split_variants_per_pair)):
+                    row = _row_from_generic_case(
+                        case=case,
+                        profile=_resolve_manifest_profile("balanced"),
+                        budgets=budgets,
+                        target_sample_size=target_sample_size,
+                        dataset_variant=dataset_variant,
+                        split_variant=split_variant,
+                        knob_variant=0,
+                        seed=seed,
+                    )
+                    if is_fedavg_eligible_row(row):
+                        run_seeds.append(row)
+    return run_seeds
+
+
+def _independent_clients(base: dict, *, count: int, seed: int, model: dict | None = None,
+                         heterogeneity_intensity: float = 0.5, average_samples: int,
+                         regression_support_policy: str = "general", min_target_bin_fraction: float = 0.6) -> list[dict]:
+    """Attach shared recipes to a selected registry contract, without loading it."""
+    from ...tasks.contracts import uses_task_protocol, VERSION as TASK_CONTRACT_VERSION
+    if uses_task_protocol(base):
+        base = {**base, "task_contract_version": TASK_CONTRACT_VERSION}
+    context = {**(model or {}), **base}
+    policy = training.build_training_policy({"config": context}, task=base["task"])
+    namespace = sha256_json({"base": base["service_id"], "seed": seed, "count": count,
+                             "intensity": heterogeneity_intensity, "policy": sha256_json(policy)})
+    sampled = recipes.sample_client_recipes(policy, count=count, seed=namespace,
+        average_samples=average_samples, quantity_seed=str(seed),
+        regression_support_policy=regression_support_policy, min_target_bin_fraction=min_target_bin_fraction,
+        heterogeneity_intensity=heterogeneity_intensity)
+    rows = []
+    for client in sampled:
+        client = {key: value for key, value in client.items() if key != "client_id"}
+        row = {**base, **client, "knob_variant": client["client_partition_index"],
+               "distribution_type": client["split_strategy"], "distribution_param": None}
+        training.validate_training_recipe(row)
+        if not _row_is_manifest_eligible(row):
+            raise ValueError(f"shared client policy produced an unsupported recipe for {base['case_name']}")
+        row["service_id"] = _service_id("svc", {key: value for key, value in row.items() if key != "service_config"})
+        row["service_config"] = _service_config(row)
+        rows.append(row)
+    return rows
+
+
 def build_hf_manifest(
     json_path: str | None = None,
     task_keys: list[str] | None = None,
     models_per_task: int = 10,
     datasets_per_model: int = 1,
     training_regimes: list[str] | None = None,
-    dataset_variants_per_pair: int = 1,
-    split_variants_per_pair: int = 1,
-    knob_variants_per_pair: int = 1,
+    dataset_variants_per_pair: int | None = None,
+    split_variants_per_pair: int | None = None,
+    knob_variants_per_pair: int | None = None,
     total_services: int | None = None,
     seed: int | None = None,
     manifest_profile: str = "balanced",
-    resource_tier: str | None = None,
+    timeout_s: int = 1800,
+    max_train_time_s: int = 120,
+    max_eval_time_s: int = 120,
     avg_sample_size: int | None = None,
     max_models_per_family: int | None = None,
     strict_inference_dataset_match: bool = True,
+    generation_mode: str = "independent",
+    fedavg_runs: int | None = None,
+    fedavg_clients_per_run: int = 10,
+    fedavg_rounds: int = 3,
+    fedavg_client_participation_rate: float = 1.0,
+    fedavg_heterogeneity_intensity: float | None = None,
+    fedavg_source_pool_cap: int | None = None,
+    clients_per_family: int | None = None,
+    initialization_seed: int | None = None,
+    evaluation_seed: int | None = None,
+    heterogeneity_intensity: float = 0.5,
+    average_samples: int | None = None,
+    regression_support_policy: str = "general",
+    min_target_bin_fraction: float = 0.6,
 ) -> pd.DataFrame:
     del json_path
+    if not 0 <= heterogeneity_intensity <= 1:
+        raise ValueError("heterogeneity intensity must be in [0,1]")
+    variants_explicit = any(v is not None for v in (dataset_variants_per_pair, split_variants_per_pair, knob_variants_per_pair))
+    if clients_per_family is not None and variants_explicit:
+        raise ValueError("--clients-per-family cannot be combined with explicit variant counts")
+    if clients_per_family is not None and clients_per_family < 1:
+        raise ValueError("--clients-per-family must be positive")
+    dataset_variants_per_pair = dataset_variants_per_pair or 1
+    split_variants_per_pair = split_variants_per_pair or 1
+    knob_variants_per_pair = (knob_variants_per_pair or 1) if variants_explicit or generation_mode == "fedavg" else (clients_per_family or 100)
     seed = _resolve_manifest_seed(seed)
+    initialization_seed = seed if initialization_seed is None else int(initialization_seed)
+    evaluation_seed = seed if evaluation_seed is None else int(evaluation_seed)
     rng = random.Random(seed)
     profile = _resolve_manifest_profile(manifest_profile)
-    resolved_resource_tier, resource_tier_explicit = _resolve_resource_tier(resource_tier, profile)
-    smoketest = _is_smoketest_tier(resolved_resource_tier)
+    budgets = {"timeout_s": timeout_s, "max_train_time_s": max_train_time_s, "max_eval_time_s": max_eval_time_s}
+    for key, value in budgets.items():
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"{key} must be a positive integer")
+    if average_samples is not None:
+        if avg_sample_size is not None and avg_sample_size != average_samples:
+            raise ValueError("average_samples and avg_sample_size must agree")
+        avg_sample_size = average_samples
     target_sample_size = _target_sample_size(
         profile=profile,
-        resource_tier=resolved_resource_tier,
-        resource_tier_explicit=resource_tier_explicit,
         avg_sample_size=avg_sample_size,
     )
-    requested_task_keys = task_keys or (list(TASK_SPECS) if smoketest else list(TASK_SPECS) + sorted(GENERIC_MANIFEST_TASK_KEYS))
+    requested_task_keys = task_keys or (list(TASK_SPECS) + sorted(GENERIC_MANIFEST_TASK_KEYS))
     selected_training_regimes = training_regimes or ["finetune_transfer"]
     selected_training_regimes = [str(item).strip().lower() for item in selected_training_regimes if str(item).strip()]
+    mode = str(generation_mode or "independent").strip().lower()
+
+    if mode == "fedavg":
+        if total_services is not None:
+            raise ValueError("--total-services is independent-mode only; use --fedavg-runs")
+        if int(fedavg_clients_per_run) < 4:
+            raise ValueError("fedavg_clients_per_run must be at least 4")
+        if fedavg_source_pool_cap is not None and int(fedavg_source_pool_cap) < 1:
+            raise ValueError("fedavg_source_pool_cap must be positive or omitted")
+        if int(fedavg_rounds) < 2:
+            raise ValueError("fedavg_rounds must be at least 2")
+        if not 0.0 < float(fedavg_client_participation_rate) <= 1.0:
+            raise ValueError("fedavg_client_participation_rate must be in (0, 1]")
+        run_seeds = _collect_fedavg_run_seed_rows(
+            requested_task_keys=requested_task_keys,
+            selected_training_regimes=selected_training_regimes,
+            models_per_task=models_per_task,
+            datasets_per_model=datasets_per_model,
+            dataset_variants_per_pair=dataset_variants_per_pair,
+            split_variants_per_pair=split_variants_per_pair,
+            budgets=budgets,
+            target_sample_size=target_sample_size,
+            seed=seed,
+            max_models_per_family=max_models_per_family,
+            strict_inference_dataset_match=strict_inference_dataset_match,
+            rng=rng,
+        )
+        run_limit = fedavg_runs
+        if run_limit is None:
+            run_limit = _default_fedavg_runs(profile)
+        run_seeds = run_seeds[: max(0, int(run_limit))]
+        if fedavg_heterogeneity_intensity is None:
+            intensities = stratified_heterogeneity_intensities(len(run_seeds), seed=seed)
+        else:
+            intensity = float(fedavg_heterogeneity_intensity)
+            if not 0.0 <= intensity <= 1.0:
+                raise ValueError("fedavg_heterogeneity_intensity must be in [0, 1]")
+            intensities = [intensity] * len(run_seeds)
+        rows: list[dict[str, Any]] = []
+        for run_index, (base_row, intensity) in enumerate(zip(run_seeds, intensities)):
+            base_row = dict(base_row)
+            base_row["fedavg_source_pool_cap"] = fedavg_source_pool_cap
+            rows.extend(
+                expand_fedavg_run(
+                    base_row,
+                    run_index=run_index,
+                    clients_per_run=int(fedavg_clients_per_run),
+                    rounds=int(fedavg_rounds),
+                    participation_rate=float(fedavg_client_participation_rate),
+                    seed=seed,
+                    heterogeneity_intensity=intensity,
+                    average_samples=target_sample_size,
+                    service_id_fn=_service_id,
+                    service_config_fn=_service_config,
+                    client_knobs_fn=_fedavg_client_knobs_for_row,
+                )
+            )
+        df = pd.DataFrame(rows)
+        return df.reindex(columns=MANIFEST_COLUMNS)
 
     rows: list[dict[str, Any]] = []
+    exclusions: dict[tuple, dict[str, Any]] = {}
+
+    def family_datasets(datasets, model, training_regime):
+        if training_regime == "inference_only":
+            return datasets
+        accepted = []
+        for dataset in datasets:
+            valid_variant = False
+            for variant in range(_normalise_positive_int(split_variants_per_pair)):
+                selected = {**dataset, "train_split": _split_value(dataset, "train_split", variant),
+                            "test_split": _split_value(dataset, "test_split", variant)}
+                error = hf_dataset_error(selected, dataset_spec=dataset)
+                if error is None:
+                    valid_variant = True
+                    continue
+                key = (task_key, dataset.get("registry_key"), selected["train_split"], selected["test_split"], error)
+                record = exclusions.setdefault(key, {
+                    "task": task_key, "dataset_name": dataset.get("dataset_name"),
+                    "dataset_config": dataset.get("dataset_config"),
+                    "train_split": selected["train_split"], "test_split": selected["test_split"],
+                    "reason": error, "model_ids": [],
+                })
+                if model.get("hf_model_id") not in record["model_ids"]:
+                    record["model_ids"].append(model.get("hf_model_id"))
+            if valid_variant:
+                accepted.append(dataset)
+        return accepted
+
     for task_key in requested_task_keys:
         task_spec = TASK_SPECS.get(task_key)
         if task_spec is None:
             continue
         models = _model_candidates(task_key)
-        models = _sort_models_for_tier(
+        models = _sort_models(
             models,
             task_key=task_key,
-            resource_tier=resolved_resource_tier,
             selected_training_regimes=selected_training_regimes,
             rng=rng,
         )
-        if max_models_per_family:
-            models = _cap_models_per_family(models, int(max_models_per_family))
-        model_limit = len(models) if smoketest else _normalise_positive_int(models_per_task)
-        for model in models[:model_limit]:
+        model_limit = _normalise_positive_int(models_per_task)
+        emitted_models = 0
+        emitted_families: dict[str, int] = {}
+        for model in models:
+            if emitted_models >= model_limit:
+                break
+            architecture = str(model.get("family") or model.get("registry_key") or "unknown")
+            if max_models_per_family and emitted_families.get(architecture, 0) >= int(max_models_per_family):
+                continue
+            rows_before_model = len(rows)
             for training_regime in selected_training_regimes:
                 if not _quality_allows_model_regime(model, training_regime):
                     continue
@@ -1704,27 +1279,34 @@ def build_hf_manifest(
                         strict_inference_dataset_match=strict_inference_dataset_match,
                     )
                 ]
-                datasets = _sort_datasets_for_tier(
+                datasets = family_datasets(datasets, model, training_regime)
+                datasets = _sort_datasets(
                     datasets,
                     task_key=task_key,
-                    resource_tier=resolved_resource_tier,
                     rng=rng,
                 )
-                dataset_limit = len(datasets) if smoketest else _normalise_positive_int(datasets_per_model)
+                dataset_limit = _normalise_positive_int(datasets_per_model)
                 for dataset in datasets[:dataset_limit]:
                     for dataset_variant in range(_normalise_positive_int(dataset_variants_per_pair)):
                         for split_variant in range(_normalise_positive_int(split_variants_per_pair)):
+                            if training_regime != "inference_only" and hf_dataset_error({
+                                **dataset, "train_split": _split_value(dataset, "train_split", split_variant),
+                                "test_split": _split_value(dataset, "test_split", split_variant),
+                            }, dataset_spec=dataset):
+                                continue
                             effective_knob_variants = (
                                 1 if training_regime == "inference_only"
                                 else _normalise_positive_int(knob_variants_per_pair)
                             )
-                            for knob_variant in range(effective_knob_variants):
+                            emitted = 0
+                            candidate_count = effective_knob_variants if variants_explicit else 8
+                            for knob_variant in range(candidate_count):
                                 row = _row_from_registry(
                                     task_key=task_key,
                                     task_spec=task_spec,
                                     model=model,
                                     dataset_spec=dataset,
-                                    resource_tier=resolved_resource_tier,
+                                    budgets=budgets,
                                     target_sample_size=target_sample_size,
                                     training_regime=training_regime,
                                     dataset_variant=dataset_variant,
@@ -1732,30 +1314,145 @@ def build_hf_manifest(
                                     knob_variant=knob_variant,
                                     seed=seed,
                                 )
+                                if not variants_explicit and _mlm_probabilities_for(task_key):
+                                    # Masking is prepared data: freeze it within the
+                                    # family rather than changing the shared source.
+                                    row["mlm_probability"] = _mlm_probabilities_for(task_key)[0]
+                                    row["service_config"] = _service_config(row)
                                 if _row_is_manifest_eligible(row):
+                                    if not variants_explicit and training_regime != "inference_only":
+                                        rows.extend(_independent_clients(row, count=effective_knob_variants, seed=seed,
+                                            model=model, heterogeneity_intensity=heterogeneity_intensity, average_samples=target_sample_size,
+                                            regression_support_policy=regression_support_policy, min_target_bin_fraction=min_target_bin_fraction))
+                                        break
                                     rows.append(row)
+                                    emitted += 1
+                                    if emitted == effective_knob_variants:
+                                        break
+            if len(rows) > rows_before_model:
+                emitted_models += 1
+                emitted_families[architecture] = emitted_families.get(architecture, 0) + 1
 
     for case in _selected_generic_cases(requested_task_keys):
+        if case.get("model_type") == "cnn":
+            case = {**case, "hidden_layers": _sample_cnn_hidden_layers(case, seed=seed)}
         for dataset_variant in range(_normalise_positive_int(dataset_variants_per_pair)):
             for split_variant in range(_normalise_positive_int(split_variants_per_pair)):
-                for knob_variant in range(_normalise_positive_int(knob_variants_per_pair)):
-                    rows.append(
-                        _row_from_generic_case(
-                            case=case,
-                            profile=profile,
-                            resource_tier=resolved_resource_tier,
-                            target_sample_size=target_sample_size,
-                            dataset_variant=dataset_variant,
-                            split_variant=split_variant,
-                            knob_variant=knob_variant,
-                            seed=seed,
-                        )
-                    )
+                for knob_variant in range(knob_variants_per_pair if variants_explicit else 1):
+                    row = _row_from_generic_case(case=case, profile=profile,
+                        budgets=budgets, target_sample_size=target_sample_size,
+                        dataset_variant=dataset_variant, split_variant=split_variant,
+                        knob_variant=knob_variant, seed=seed)
+                    if variants_explicit:
+                        rows.append(row)
+                    else:
+                        rows.extend(_independent_clients(row, count=knob_variants_per_pair, seed=seed,
+                            heterogeneity_intensity=heterogeneity_intensity, average_samples=target_sample_size,
+                            regression_support_policy=regression_support_policy, min_target_bin_fraction=min_target_bin_fraction))
 
+    if total_services is not None and total_services >= 0:
+        rows = _balanced_family_limit(rows, int(total_services), seed=seed)
+    if variants_explicit or total_services is not None:
+        groups = {}
+        for row in rows:
+            if row["training_regime"] == "inference_only":
+                continue
+            key = tuple(row.get(k) for k in ("task", "hf_model_id", "model_type", "dataset_name", "dataset_config", "training_regime"))
+            groups.setdefault(key, []).append(row)
+        for group in groups.values():
+            quantities = recipes.stratified_sample_quantities(target_sample_size, count=len(group), seed=str(seed))
+            if (all(row.get("recipe_sampler_version") == training.SAMPLER_VERSION for row in group)
+                    and len({row["training_policy_hash"] for row in group}) == 1):
+                # Truncation must not accidentally remove the intentional band
+                # allocation. Resample knobs for the final roster, not outcomes.
+                knobs = training.sample_training_knobs(group[0]["training_policy"],
+                    [row["split_strategy"] for row in group], seed=f"{seed}:final_roster")
+                for index, row in enumerate(group):
+                    row.pop("calibration_band", None)
+                    row.pop("calibration_template_id", None)
+                    row.update(knobs[index])
+            recipes.assign_shard_support_quantiles(group, seed=str(seed))
+            for row, quantity in zip(group, quantities):
+                quantity *= row.get("training_policy", {}).get("sample_quantity_multiplier", 1)
+                from ...clients.capacity import known_training_capacity, scale_quantity, CAPACITY_POLICY
+                maximum = recipes.sample_quantity_bounds(target_sample_size)[1] * row.get("training_policy", {}).get("sample_quantity_multiplier", 1)
+                row["unconstrained_sample_size"] = quantity
+                quantity, row["max_client_quantity"] = scale_quantity(quantity, maximum, known_training_capacity(row))
+                row["quantity_capacity_policy"] = CAPACITY_POLICY
+                row["sample_size"] = quantity
+                if row.get("recipe_sampler_version"):
+                    row["requested_quota"] = quantity
+                    training.constrain_training_opportunity(row, seed=f"{seed}:{row['service_id']}")
+                    training.validate_training_recipe(row)
+                row["service_id"] = _service_id("svc", {k: v for k, v in row.items() if k != "service_config"})
+                row["service_config"] = _service_config(row)
     df = pd.DataFrame(rows)
+    if not df.empty:
+        df["seed"] = seed
+        df["initialization_seed"] = int(initialization_seed)
+        df["evaluation_seed"] = int(evaluation_seed)
+        if "sample_seed" not in df:
+            df["sample_seed"] = None
+        missing_seed = df["sample_seed"].isna()
+        if missing_seed.any():
+            df.loc[missing_seed, "sample_seed"] = df.loc[missing_seed, "service_id"].map(lambda sid: int(hashlib.sha256(f"{seed}:{sid}".encode()).hexdigest()[:8], 16))
+        if "training_seed" not in df:
+            df["training_seed"] = df["sample_seed"]
+        else:
+            df["training_seed"] = df["training_seed"].fillna(df["sample_seed"])
+        df["service_id"] = df["service_id"].map(lambda sid: _service_id("svc", {"recipe": sid, "initialization_seed": initialization_seed, "evaluation_seed": evaluation_seed}))
+        df["service_config"] = df.apply(lambda row: json.dumps({
+            **json.loads(row["service_config"]),
+            **{key: int(row[key]) for key in ("seed", "sample_seed", "initialization_seed", "evaluation_seed", "training_seed")},
+        }, sort_keys=True), axis=1)
     if total_services is not None and total_services >= 0:
         df = df.head(int(total_services))
-    return df.reindex(columns=MANIFEST_COLUMNS)
+    from ...config import CONFIG
+    checkpoint_defaults = {key: CONFIG[key] for key in (
+        "checkpoint_patch_operation_policy", "checkpoint_measure_full", "checkpoint_weight_format",
+        "checkpoint_reduced_compression", "checkpoint_reduced_compression_level",
+        "checkpoint_validation_samples", "checkpoint_quality_tolerance",
+        "checkpoint_patch_compression", "checkpoint_patch_compression_level")}
+    for key, value in checkpoint_defaults.items():
+        df[key] = value
+    if not df.empty:
+        df["service_config"] = df["service_config"].map(lambda value: json.dumps({**json.loads(value), **checkpoint_defaults}, sort_keys=True))
+    df = df.reindex(columns=MANIFEST_COLUMNS)
+    df.attrs["family_preflight_exclusions"] = list(exclusions.values())
+    return df
+
+
+def _balanced_family_limit(rows: list[dict[str, Any]], limit: int, *, seed: int) -> list[dict[str, Any]]:
+    """Select families in random task-balanced rounds, retaining client groups.
+
+    Only the last selected family may be partial. Exhausted tasks leave the
+    rotation; a task with more registered families cannot dominate early slots.
+    """
+    if limit >= len(rows):
+        return rows
+    tasks: dict[str, dict[tuple, list[dict[str, Any]]]] = {}
+    for row in rows:
+        task = str(row.get("task_key") or row.get("task"))
+        family = tuple(row.get(k) for k in (
+            "task", "hf_model_id", "model_type", "dataset_name", "dataset_config",
+            "training_regime", "dataset_variant", "split_variant"))
+        tasks.setdefault(task, {}).setdefault(family, []).append(row)
+    rng = random.Random(f"uniform_family_selection_v1:{seed}")
+    queues = {task: list(families.values()) for task, families in sorted(tasks.items())}
+    for families in queues.values():
+        rng.shuffle(families)
+    selected = []
+    while queues and len(selected) < limit:
+        order = list(queues)
+        rng.shuffle(order)
+        for task in order:
+            family = queues[task].pop()
+            selected.extend(family[:limit - len(selected)])
+            if not queues[task]:
+                del queues[task]
+            if len(selected) == limit:
+                break
+    return selected
 
 
 def _cap_models_per_family(models: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
@@ -1770,8 +1467,38 @@ def _cap_models_per_family(models: list[dict[str, Any]], limit: int) -> list[dic
     return selected
 
 
-def save_manifest(df: pd.DataFrame, output_path: Path, sheet_name: str = "services") -> None:
+def save_manifest(df: pd.DataFrame, output_path: Path, sheet_name: str = "services", *,
+                  manifest_format: str = "review") -> None:
+    if manifest_format not in {"review", "expanded"}:
+        raise ValueError("manifest_format must be review or expanded")
+    if output_path.suffix.lower() not in {".csv", ".xlsx", ".xls"}:
+        raise ValueError("Output path must end with .csv or .xlsx")
+    exclusions = df.attrs.get("family_preflight_exclusions", [])
+    if "family_preflight_exclusions" in df.attrs:
+        from ...task_capabilities import resolve_capabilities
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        recipe_groups = {}
+        fields = ("task", "hf_model_id", "model_type", "dataset_name", "dataset_config", "max_length")
+        for row in df.to_dict("records"):
+            context = {k: None if pd.isna(row.get(k)) else row.get(k) for k in fields}
+            entry = recipe_groups.setdefault(sha256_json(context), {"context": context, "rows": []})
+            entry["rows"].append(row)
+        output_path.with_suffix(".preflight.json").write_text(json.dumps({
+            "version": "independent_family_preflight_v1",
+            "scope": "offline registry checks; loaded data is checked again during preparation",
+            "excluded_dataset_contracts": exclusions,
+            "task_capabilities": [{**g["context"], "capabilities": resolve_capabilities(g["rows"][0])}
+                for g in recipe_groups.values()],
+            "recipe_diversity": [{**g["context"], **recipes.recipe_summary(g["rows"])} for g in recipe_groups.values()],
+        }, indent=2), encoding="utf-8")
+    # Historical federated/parent documents retain their embedded recipe format.
+    historical = "generation_mode" in df and df["generation_mode"].isin(["fedavg", "shared_parent"]).any()
+    if manifest_format == "review" and not historical:
+        from .review import save_review_manifest
+        save_review_manifest(df, output_path, sheet_name=sheet_name)
+        return
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    df = df.map(lambda value: canonical_json(value) if isinstance(value, (dict, list)) else value)
     if output_path.suffix.lower() == ".csv":
         df.to_csv(output_path, index=False)
         return
@@ -1788,19 +1515,29 @@ def main() -> None:
     parser.add_argument("--input-json")
     parser.add_argument("--output", default=str(DEFAULT_MANIFEST_PATH))
     parser.add_argument("--sheet", default="services")
+    parser.add_argument("--manifest-format", choices=("review", "expanded"), default="review",
+                        help="Compact review table with shared definitions (default), or legacy expanded rows")
     parser.add_argument("--task-keys")
     parser.add_argument("--models-per-task", type=int, default=10)
     parser.add_argument("--max-models-per-family", type=int)
     parser.add_argument("--datasets-per-model", type=int, default=1)
     parser.add_argument("--training-regimes")
-    parser.add_argument("--dataset-variants-per-pair", type=int, default=1)
-    parser.add_argument("--split-variants-per-pair", type=int, default=1)
-    parser.add_argument("--knob-variants-per-pair", type=int, default=1)
+    parser.add_argument("--dataset-variants-per-pair", type=int)
+    parser.add_argument("--split-variants-per-pair", type=int)
+    parser.add_argument("--knob-variants-per-pair", type=int)
+    parser.add_argument("--clients-per-family", type=int)
+    parser.add_argument("--initialization-seed", type=int, help="Optional initialization override; defaults to --seed.")
+    parser.add_argument("--evaluation-seed", type=int, help="Optional evaluation override; defaults to --seed.")
+    parser.add_argument("--heterogeneity-intensity", type=float, default=0.5)
+    parser.add_argument("--regression-support-policy", choices=("general", "specialist"), default="general")
+    parser.add_argument("--min-target-bin-fraction", type=float, default=0.6)
     parser.add_argument("--total-services", type=int)
+    parser.add_argument("--timeout-s", type=int, default=1800)
+    parser.add_argument("--max-train-time-s", type=int, default=120)
+    parser.add_argument("--max-eval-time-s", type=int, default=120)
     parser.add_argument("--manifest-profile", choices=sorted(MANIFEST_PROFILES), default="balanced")
-    parser.add_argument("--resource-tier", choices=sorted(RESOURCE_TIERS), help="Workload budget: smoketest, light, medium, heavy, or stress_test. Defaults from --manifest-profile.")
-    parser.add_argument("--avg-sample-size", type=int)
-    parser.add_argument("--seed", type=int, help="Optional seed. Omit for a fresh randomized manifest on each run.")
+    parser.add_argument("--average-samples", "--avg-sample-size", dest="avg_sample_size", type=int)
+    parser.add_argument("--seed", type=int, help="Global seed for recipes, initialization, evaluation, and derived client seeds. Omit to generate and record a fresh seed.")
     args = parser.parse_args()
 
     df = build_hf_manifest(
@@ -1814,12 +1551,18 @@ def main() -> None:
         knob_variants_per_pair=args.knob_variants_per_pair,
         total_services=args.total_services,
         seed=args.seed,
+        clients_per_family=args.clients_per_family,
+        initialization_seed=args.initialization_seed,
+        evaluation_seed=args.evaluation_seed,
+        heterogeneity_intensity=args.heterogeneity_intensity,
+        regression_support_policy=args.regression_support_policy,
+        min_target_bin_fraction=args.min_target_bin_fraction,
         manifest_profile=args.manifest_profile,
-        resource_tier=args.resource_tier,
+        timeout_s=args.timeout_s, max_train_time_s=args.max_train_time_s, max_eval_time_s=args.max_eval_time_s,
         avg_sample_size=args.avg_sample_size,
         max_models_per_family=args.max_models_per_family,
     )
-    save_manifest(df, Path(args.output), sheet_name=args.sheet)
+    save_manifest(df, Path(args.output), sheet_name=args.sheet, manifest_format=args.manifest_format)
     print(f"Wrote {len(df)} service rows to {args.output}")
 
 

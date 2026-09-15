@@ -12,7 +12,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "label_column": "label",
         "input_schema": "single_text",
         "loader_template": "hf_text_classification",
-        "max_samples": 600,
         "max_length": 128,
         "explainability": {
             "supported": True,
@@ -38,7 +37,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "label_column": "label",
         "input_schema": "single_text",
         "loader_template": "hf_text_classification",
-        "max_samples": 800,
         "max_length": 128,
         "explainability": {
             "supported": True,
@@ -64,7 +62,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "label_column": "label",
         "input_schema": "single_text",
         "loader_template": "hf_text_classification",
-        "max_samples": 1200,
         "max_length": 256,
         "explainability": {
             "supported": True,
@@ -90,7 +87,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "label_column": "label",
         "input_schema": "single_text",
         "loader_template": "hf_text_classification",
-        "max_samples": 900,
         "max_length": 128,
         "explainability": {
             "supported": True,
@@ -116,7 +112,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "label_column": "label",
         "input_schema": "single_text",
         "loader_template": "hf_text_classification",
-        "max_samples": 1200,
         "max_length": 128,
         "explainability": {
             "supported": True,
@@ -142,7 +137,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "label_column": "label",
         "input_schema": "single_text",
         "loader_template": "hf_text_classification",
-        "max_samples": 1600,
         "max_length": 128,
         "explainability": {
             "supported": True,
@@ -168,7 +162,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "label_column": "label",
         "input_schema": "text_pair",
         "loader_template": "hf_text_classification",
-        "max_samples": 2200,
         "max_length": 192,
         "explainability": {
             "supported": True,
@@ -194,7 +187,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "label_column": "label",
         "input_schema": "text_pair",
         "loader_template": "hf_text_classification",
-        "max_samples": 2200,
         "max_length": 192,
         "explainability": {
             "supported": True,
@@ -220,7 +212,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "label_column": "label",
         "input_schema": "text_pair",
         "loader_template": "hf_text_classification",
-        "max_samples": 1600,
         "max_length": 192,
         "explainability": {
             "supported": True,
@@ -246,7 +237,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "label_column": "label",
         "input_schema": "text_pair",
         "loader_template": "hf_text_classification",
-        "max_samples": 2400,
         "max_length": 192,
         "explainability": {
             "supported": True,
@@ -272,7 +262,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "label_column": "ner_tags",
         "input_schema": "token_sequence",
         "loader_template": "hf_token_classification",
-        "max_samples": 800,
         "max_length": 128,
         "explainability": {
             "supported": True,
@@ -298,7 +287,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "label_column": "ner_tags",
         "input_schema": "token_sequence",
         "loader_template": "hf_token_classification",
-        "max_samples": 600,
         "max_length": 128,
         "explainability": {
             "supported": True,
@@ -324,7 +312,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "label_column": "ner_tags",
         "input_schema": "token_sequence",
         "loader_template": "hf_token_classification",
-        "max_samples": 900,
         "max_length": 128,
         "explainability": {
             "supported": True,
@@ -350,7 +337,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "label_column": "ner_tags",
         "input_schema": "token_sequence",
         "loader_template": "hf_token_classification",
-        "max_samples": 900,
         "max_length": 128,
         "explainability": {
             "supported": True,
@@ -376,7 +362,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "label_column": "ner_tags",
         "input_schema": "token_sequence",
         "loader_template": "hf_token_classification",
-        "max_samples": 900,
         "max_length": 128,
         "explainability": {
             "supported": True,
@@ -402,7 +387,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "label_column": "ner_tags",
         "input_schema": "token_sequence",
         "loader_template": "hf_token_classification",
-        "max_samples": 900,
         "max_length": 128,
         "explainability": {
             "supported": True,
@@ -428,7 +412,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "label_column": "ner_tags",
         "input_schema": "token_sequence",
         "loader_template": "hf_token_classification",
-        "max_samples": 700,
         "max_length": 128,
         "explainability": {
             "supported": True,
@@ -454,7 +437,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "label_column": "ner_tags",
         "input_schema": "token_sequence",
         "loader_template": "hf_token_classification",
-        "max_samples": 900,
         "max_length": 128,
         "explainability": {
             "supported": True,
@@ -480,7 +462,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "label_column": "ner_tags",
         "input_schema": "token_sequence",
         "loader_template": "hf_token_classification",
-        "max_samples": 900,
         "max_length": 128,
         "explainability": {
             "supported": True,
@@ -506,7 +487,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "label_column": "ner_tags",
         "input_schema": "token_sequence",
         "loader_template": "hf_token_classification",
-        "max_samples": 900,
         "max_length": 128,
         "explainability": {
             "supported": True,
@@ -533,7 +513,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "input_schema": "text_pair",
         "loader_template": "hf_sentence_pair_classification",
         "task_type": "regression",
-        "max_samples": 800,
         "max_length": 128,
         "explainability": {
             "supported": True,
@@ -559,7 +538,9 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "label_column": "label",
         "input_schema": "text_pair",
         "loader_template": "hf_sentence_pair_classification",
-        "max_samples": 800,
+        "task_type": "classification",
+        "num_classes": 2,
+        "label_format": "single_index",
         "max_length": 128,
         "explainability": {
             "supported": True,
@@ -585,7 +566,7 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "label_column": "label",
         "input_schema": "text_pair",
         "loader_template": "hf_sentence_pair_classification",
-        "max_samples": 2400,
+        "task_type": "classification",
         "max_length": 192,
         "explainability": {
             "supported": True,
@@ -611,7 +592,7 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "label_column": "label",
         "input_schema": "text_pair",
         "loader_template": "hf_sentence_pair_classification",
-        "max_samples": 2400,
+        "task_type": "classification",
         "max_length": 192,
         "explainability": {
             "supported": True,
@@ -637,7 +618,7 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "label_column": "label",
         "input_schema": "text_pair",
         "loader_template": "hf_sentence_pair_classification",
-        "max_samples": 2400,
+        "task_type": "classification",
         "max_length": 192,
         "explainability": {
             "supported": True,
@@ -663,7 +644,7 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "label_column": "label",
         "input_schema": "text_pair",
         "loader_template": "hf_sentence_pair_classification",
-        "max_samples": 2400,
+        "task_type": "classification",
         "max_length": 192,
         "explainability": {
             "supported": True,
@@ -683,13 +664,19 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "pipeline_tag": "sentence-similarity",
         "dataset_name": "glue",
         "dataset_config": "wnli",
+        # Source cardinalities, not per-client sampling budgets. Small labeled
+        # evaluation splits use their available rows for catalogue/audit data.
+        "split_sizes": {"train": 635, "validation": 71, "test": 146},
+        "unlabeled_splits": ["test"],
         "train_split": "train",
         "test_split": "validation",
         "text_column": ["sentence1", "sentence2"],
         "label_column": "label",
         "input_schema": "text_pair",
         "loader_template": "hf_sentence_pair_classification",
-        "max_samples": 1600,
+        "task_type": "classification",
+        "num_classes": 2,
+        "label_format": "single_index",
         "max_length": 192,
         "explainability": {
             "supported": True,
@@ -715,7 +702,7 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "label_column": "label",
         "input_schema": "text_pair",
         "loader_template": "hf_sentence_pair_classification",
-        "max_samples": 2400,
+        "task_type": "classification",
         "max_length": 192,
         "explainability": {
             "supported": True,
@@ -741,7 +728,7 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "label_column": "label",
         "input_schema": "text_pair",
         "loader_template": "hf_sentence_pair_classification",
-        "max_samples": 2400,
+        "task_type": "classification",
         "max_length": 192,
         "explainability": {
             "supported": True,
@@ -768,7 +755,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "input_schema": "text_pair",
         "loader_template": "hf_sentence_pair_classification",
         "task_type": "regression",
-        "max_samples": 2400,
         "max_length": 192,
         "explainability": {
             "supported": True,
@@ -794,7 +780,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "label_column": "text",
         "input_schema": "single_text",
         "loader_template": "hf_masked_lm",
-        "max_samples": 1200,
         "max_length": 128,
         "explainability": {
             "supported": True,
@@ -820,7 +805,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "label_column": "text",
         "input_schema": "single_text",
         "loader_template": "hf_masked_lm",
-        "max_samples": 1000,
         "max_length": 128,
         "explainability": {
             "supported": True,
@@ -846,7 +830,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "label_column": "text",
         "input_schema": "single_text",
         "loader_template": "hf_masked_lm",
-        "max_samples": 1000,
         "max_length": 128,
         "explainability": {
             "supported": True,
@@ -872,7 +855,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "label_column": "text",
         "input_schema": "single_text",
         "loader_template": "hf_masked_lm",
-        "max_samples": 900,
         "max_length": 128,
         "explainability": {
             "supported": True,
@@ -898,7 +880,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "label_column": "text",
         "input_schema": "single_text",
         "loader_template": "hf_masked_lm",
-        "max_samples": 1000,
         "max_length": 128,
         "explainability": {
             "supported": True,
@@ -924,7 +905,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "label_column": "article",
         "input_schema": "single_text",
         "loader_template": "hf_masked_lm",
-        "max_samples": 1000,
         "max_length": 192,
         "explainability": {
             "supported": True,
@@ -950,7 +930,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "label_column": "document",
         "input_schema": "single_text",
         "loader_template": "hf_masked_lm",
-        "max_samples": 1000,
         "max_length": 192,
         "explainability": {
             "supported": True,
@@ -976,7 +955,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "label_column": "text",
         "input_schema": "single_text",
         "loader_template": "hf_masked_lm",
-        "max_samples": 1000,
         "max_length": 192,
         "explainability": {
             "supported": True,
@@ -1002,7 +980,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "label_column": "text",
         "input_schema": "single_text",
         "loader_template": "hf_masked_lm",
-        "max_samples": 1000,
         "max_length": 192,
         "explainability": {
             "supported": True,
@@ -1028,7 +1005,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "label_column": "dialogue",
         "input_schema": "single_text",
         "loader_template": "hf_masked_lm",
-        "max_samples": 1000,
         "max_length": 192,
         "explainability": {
             "supported": True,
@@ -1055,7 +1031,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "input_schema": "single_text",
         "loader_template": "hf_causal_lm",
         "task_tag": "language-modeling",
-        "max_samples": 1000,
         "max_length": 256,
         "explainability": {
             "supported": True,
@@ -1082,7 +1057,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "input_schema": "single_text",
         "loader_template": "hf_causal_lm",
         "task_tag": "language-modeling",
-        "max_samples": 1000,
         "max_length": 256,
         "explainability": {
             "supported": True,
@@ -1109,7 +1083,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "input_schema": "single_text",
         "loader_template": "hf_causal_lm",
         "task_tag": "language-modeling",
-        "max_samples": 1000,
         "max_length": 256,
         "explainability": {
             "supported": True,
@@ -1136,7 +1109,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "input_schema": "single_text",
         "loader_template": "hf_causal_lm",
         "task_tag": "language-modeling",
-        "max_samples": 900,
         "max_length": 192,
         "explainability": {
             "supported": True,
@@ -1163,7 +1135,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "input_schema": "single_text",
         "loader_template": "hf_causal_lm",
         "task_tag": "language-modeling",
-        "max_samples": 1000,
         "max_length": 192,
         "explainability": {
             "supported": True,
@@ -1190,7 +1161,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "input_schema": "single_text",
         "loader_template": "hf_causal_lm",
         "task_tag": "language-modeling",
-        "max_samples": 1000,
         "max_length": 256,
         "explainability": {
             "supported": True,
@@ -1217,7 +1187,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "input_schema": "single_text",
         "loader_template": "hf_causal_lm",
         "task_tag": "language-modeling",
-        "max_samples": 1000,
         "max_length": 256,
         "explainability": {
             "supported": True,
@@ -1244,7 +1213,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "input_schema": "single_text",
         "loader_template": "hf_causal_lm",
         "task_tag": "language-modeling",
-        "max_samples": 1000,
         "max_length": 256,
         "explainability": {
             "supported": True,
@@ -1271,7 +1239,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "input_schema": "single_text",
         "loader_template": "hf_causal_lm",
         "task_tag": "language-modeling",
-        "max_samples": 1000,
         "max_length": 256,
         "explainability": {
             "supported": True,
@@ -1298,7 +1265,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "input_schema": "single_text",
         "loader_template": "hf_causal_lm",
         "task_tag": "language-modeling",
-        "max_samples": 800,
         "max_length": 256,
         "explainability": {
             "supported": True,
@@ -1325,7 +1291,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "input_schema": "single_text",
         "loader_template": "hf_seq2seq",
         "task_tag": "summarization",
-        "max_samples": 1000,
         "max_length": 256,
         "explainability": {
             "supported": True,
@@ -1352,7 +1317,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "input_schema": "source_target_text",
         "loader_template": "hf_seq2seq",
         "task_tag": "summarization",
-        "max_samples": 1000,
         "max_length": 256,
         "explainability": {
             "supported": True,
@@ -1379,7 +1343,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "input_schema": "source_target_text",
         "loader_template": "hf_seq2seq",
         "task_tag": "summarization",
-        "max_samples": 1000,
         "max_length": 256,
         "explainability": {
             "supported": True,
@@ -1406,7 +1369,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "input_schema": "dialogue_summary",
         "loader_template": "hf_seq2seq",
         "task_tag": "summarization",
-        "max_samples": 1000,
         "max_length": 256,
         "explainability": {
             "supported": True,
@@ -1433,7 +1395,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "input_schema": "source_target_text",
         "loader_template": "hf_seq2seq",
         "task_tag": "summarization",
-        "max_samples": 800,
         "max_length": 256,
         "explainability": {
             "supported": True,
@@ -1460,7 +1421,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "input_schema": "source_target_text",
         "loader_template": "hf_seq2seq",
         "task_tag": "summarization",
-        "max_samples": 800,
         "max_length": 256,
         "explainability": {
             "supported": True,
@@ -1487,7 +1447,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "input_schema": "source_target_text",
         "loader_template": "hf_seq2seq",
         "task_tag": "summarization",
-        "max_samples": 800,
         "max_length": 256,
         "explainability": {
             "supported": True,
@@ -1514,7 +1473,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "input_schema": "source_target_text",
         "loader_template": "hf_seq2seq",
         "task_tag": "summarization",
-        "max_samples": 700,
         "max_length": 256,
         "explainability": {
             "supported": True,
@@ -1541,7 +1499,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "input_schema": "source_target_text",
         "loader_template": "hf_seq2seq",
         "task_tag": "summarization",
-        "max_samples": 700,
         "max_length": 256,
         "explainability": {
             "supported": True,
@@ -1568,7 +1525,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "input_schema": "instruction_response",
         "loader_template": "hf_seq2seq",
         "task_tag": "instruction-following",
-        "max_samples": 800,
         "max_length": 256,
         "explainability": {
             "supported": True,
@@ -1595,7 +1551,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "input_schema": "single_image",
         "loader_template": "hf_image_classification",
         "num_classes": 3,
-        "max_samples": 800,
         "max_length": None,
         "explainability": {
             "supports_feature_attribution": True,
@@ -1615,7 +1570,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "input_schema": "single_image",
         "loader_template": "hf_image_classification",
         "num_classes": 10,
-        "max_samples": 2000,
         "max_length": None,
         "explainability": {
             "supports_feature_attribution": True,
@@ -1635,7 +1589,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "input_schema": "single_image",
         "loader_template": "hf_image_classification",
         "num_classes": 101,
-        "max_samples": 2200,
         "max_length": None,
         "explainability": {
             "supports_feature_attribution": True,
@@ -1655,7 +1608,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "input_schema": "single_image",
         "loader_template": "hf_image_classification",
         "num_classes": 10,
-        "max_samples": 2000,
         "max_length": None,
         "explainability": {
             "supports_feature_attribution": True,
@@ -1675,7 +1627,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "input_schema": "single_image",
         "loader_template": "hf_image_classification",
         "num_classes": 10,
-        "max_samples": 2000,
         "max_length": None,
         "explainability": {
             "supports_feature_attribution": True,
@@ -1695,7 +1646,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "input_schema": "single_image",
         "loader_template": "hf_image_classification",
         "num_classes": 100,
-        "max_samples": 2000,
         "max_length": None,
         "explainability": {
             "supports_feature_attribution": True,
@@ -1715,7 +1665,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "input_schema": "single_image",
         "loader_template": "hf_image_classification",
         "num_classes": 10,
-        "max_samples": 2000,
         "max_length": None,
         "explainability": {
             "supports_feature_attribution": True,
@@ -1735,7 +1684,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "input_schema": "single_image",
         "loader_template": "hf_image_classification",
         "num_classes": 2,
-        "max_samples": 1200,
         "max_length": None,
         "explainability": {
             "supports_feature_attribution": True,
@@ -1755,7 +1703,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "input_schema": "single_image",
         "loader_template": "hf_image_classification",
         "num_classes": 37,
-        "max_samples": 1600,
         "max_length": None,
         "explainability": {
             "supports_feature_attribution": True,
@@ -1775,7 +1722,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "input_schema": "single_image",
         "loader_template": "hf_image_classification",
         "num_classes": 200,
-        "max_samples": 2000,
         "max_length": None,
         "explainability": {
             "supports_feature_attribution": True,
@@ -1795,7 +1741,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "label_column": "objects",
         "input_schema": "image_with_boxes",
         "loader_template": "hf_object_detection",
-        "max_samples": 240,
         "max_length": None,
         "explainability": {
             "supports_feature_attribution": True,
@@ -1814,7 +1759,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "label_column": "objects",
         "input_schema": "image_with_boxes",
         "loader_template": "hf_object_detection",
-        "max_samples": 240,
         "max_length": None,
         "explainability": {
             "supports_feature_attribution": True,
@@ -1833,7 +1777,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "label_column": "objects",
         "input_schema": "image_with_boxes",
         "loader_template": "hf_object_detection",
-        "max_samples": 180,
         "max_length": None,
         "explainability": {
             "supports_feature_attribution": True,
@@ -1854,7 +1797,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "loader_template": "hf_object_detection",
         "train_examples": 3,
         "benchmark_examples": 3,
-        "max_samples": 120,
         "max_length": None,
         "explainability": {
             "supports_feature_attribution": True,
@@ -1875,7 +1817,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "loader_template": "hf_object_detection",
         "train_examples": 3,
         "benchmark_examples": 3,
-        "max_samples": 120,
         "max_length": None,
         "explainability": {
             "supports_feature_attribution": True,
@@ -1896,7 +1837,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "loader_template": "hf_object_detection",
         "train_examples": 3,
         "benchmark_examples": 3,
-        "max_samples": 96,
         "max_length": None,
         "explainability": {
             "supports_feature_attribution": True,
@@ -1917,7 +1857,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "loader_template": "hf_object_detection",
         "train_examples": 3,
         "benchmark_examples": 3,
-        "max_samples": 96,
         "max_length": None,
         "explainability": {
             "supports_feature_attribution": True,
@@ -1938,7 +1877,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "loader_template": "hf_object_detection",
         "train_examples": 3,
         "benchmark_examples": 3,
-        "max_samples": 96,
         "max_length": None,
         "explainability": {
             "supports_feature_attribution": True,
@@ -1959,7 +1897,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "loader_template": "hf_object_detection",
         "train_examples": 3,
         "benchmark_examples": 3,
-        "max_samples": 96,
         "max_length": None,
         "explainability": {
             "supports_feature_attribution": True,
@@ -1980,7 +1917,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "loader_template": "hf_object_detection",
         "train_examples": 3,
         "benchmark_examples": 3,
-        "max_samples": 96,
         "max_length": None,
         "explainability": {
             "supports_feature_attribution": True,
@@ -2001,7 +1937,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "mask_column": "annotation",
         "input_schema": "image_mask_pair",
         "loader_template": "hf_image_segmentation",
-        "max_samples": 96,
         "max_length": None,
         "explainability": {
             "supports_feature_attribution": True,
@@ -2021,7 +1956,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "mask_column": "annotation",
         "input_schema": "image_mask_pair",
         "loader_template": "hf_image_segmentation",
-        "max_samples": 96,
         "max_length": None,
         "explainability": {
             "supports_feature_attribution": True,
@@ -2043,7 +1977,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "loader_template": "hf_image_segmentation",
         "train_examples": 3,
         "benchmark_examples": 3,
-        "max_samples": 64,
         "max_length": None,
         "explainability": {
             "supports_feature_attribution": True,
@@ -2063,7 +1996,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "mask_column": "mask",
         "input_schema": "image_mask_pair",
         "loader_template": "hf_image_segmentation",
-        "max_samples": 96,
         "max_length": None,
         "explainability": {
             "supports_feature_attribution": True,
@@ -2083,7 +2015,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "mask_column": "label",
         "input_schema": "image_mask_pair",
         "loader_template": "hf_image_segmentation",
-        "max_samples": 96,
         "max_length": None,
         "explainability": {
             "supports_feature_attribution": True,
@@ -2103,7 +2034,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "mask_column": "mask",
         "input_schema": "image_mask_pair",
         "loader_template": "hf_image_segmentation",
-        "max_samples": 96,
         "max_length": None,
         "explainability": {
             "supports_feature_attribution": True,
@@ -2123,7 +2053,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "mask_column": "mask",
         "input_schema": "image_mask_pair",
         "loader_template": "hf_image_segmentation",
-        "max_samples": 96,
         "max_length": None,
         "explainability": {
             "supports_feature_attribution": True,
@@ -2143,7 +2072,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "mask_column": "mask",
         "input_schema": "image_mask_pair",
         "loader_template": "hf_image_segmentation",
-        "max_samples": 96,
         "max_length": None,
         "explainability": {
             "supports_feature_attribution": True,
@@ -2163,7 +2091,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "mask_column": "label",
         "input_schema": "image_mask_pair",
         "loader_template": "hf_image_segmentation",
-        "max_samples": 96,
         "max_length": None,
         "explainability": {
             "supports_feature_attribution": True,
@@ -2183,7 +2110,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "mask_column": "mask",
         "input_schema": "image_mask_pair",
         "loader_template": "hf_image_segmentation",
-        "max_samples": 96,
         "max_length": None,
         "explainability": {
             "supports_feature_attribution": True,
@@ -2206,7 +2132,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "loader_template": "hf_image_captioning",
         "task_tag": "captioning",
         "manifest_validated": True,
-        "max_samples": 4000,
         "max_length": 64,
         "explainability": {
             "supports_feature_attribution": True,
@@ -2229,7 +2154,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "loader_template": "hf_image_text_retrieval",
         "task_tag": "retrieval",
         "manifest_validated": True,
-        "max_samples": 4000,
         "max_length": 64,
         "explainability": {
             "supports_feature_attribution": True,
@@ -2254,7 +2178,6 @@ DATASET_REGISTRY: dict[str, dict[str, object]] = {
         "manifest_validated": True,
         "vqa_label_mode": "auto",
         "vqa_unseen_answer_policy": "ignore",
-        "max_samples": 3000,
         "max_length": 48,
         "explainability": {
             "supports_feature_attribution": True,

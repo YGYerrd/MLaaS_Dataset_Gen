@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from mlaas_data_generator.terminal import debug_print
+
 import contextlib
 import hashlib
 import math
@@ -302,7 +304,11 @@ def run_perturbation_stage(
                 semantic_selectivity_score = np.nan
                 semantic_alignment_score = np.nan
                 semantic_behavior_score = np.nan
-                budget_score = self_faithfulness_score
+                # A ranking-derived score alone does not establish semantic
+                # faithfulness.  Keep it as a diagnostic, but do not promote it
+                # to the headline attribute without an independently formed
+                # semantic target.
+                budget_score = np.nan
 
                 if semantic_supported:
                     semantic_unit_count = _budget_unit_count(
@@ -507,7 +513,7 @@ def run_perturbation_stage(
                     "targeted_quality": _finite_or_none(final_targeted_record["targeted_quality"]),
                     "targeted_quality_degradation": float(final_targeted_record["targeted_degradation"]),
                     "random_quality_degradation": float(final_targeted_record["random_degradation"]),
-                    "explainability_self_faithfulness_score": float(_mean_or_nan(self_faithfulness_scores)),
+                    "perturbation_ranking_selectivity_score": float(_mean_or_nan(self_faithfulness_scores)),
                     "explainability_semantic_supported": semantic_scored,
                     "explainability_semantic_target_source": semantic_source,
                     "explainability_semantic_behavior_score": _mean_or_nan(semantic_behavior_scores),
@@ -518,8 +524,8 @@ def run_perturbation_stage(
                     "semantic_random_quality_degradation": _finite_or_none(
                         final_targeted_record["semantic_random_degradation"]
                     ),
-                    "explainability_budget_scores": [float(v) for v in budget_scores],
-                    "explainability_self_faithfulness_budget_scores": [
+                    "explainability_budget_scores": [float(v) for v in _finite_values(budget_scores)],
+                    "perturbation_ranking_selectivity_budget_scores": [
                         float(v) for v in self_faithfulness_scores
                     ],
                     "explainability_semantic_behavior_budget_scores": [
@@ -534,7 +540,7 @@ def run_perturbation_stage(
                     "explainability_semantic_alignment_budget_scores": [
                         float(v) for v in _finite_values(semantic_alignment_scores)
                     ],
-                    "explainability_score": float(_mean_or_nan(budget_scores)),
+                    "explainability_score": _finite_or_none(_mean_or_nan(budget_scores)),
                     "explainability_quality_metric": quality_metric,
                     "trust_confidence_abs_delta_mean": _mean_or_nan(trust_changes),
                     "trust_prediction_same_rate": _mean_or_nan(trust_same),
@@ -586,7 +592,7 @@ def run_perturbation_stage(
     output_deltas = _values(per_sample, "targeted_output_relative_delta")
     targeted_quality_degradations = _values(per_sample, "targeted_quality_degradation")
     random_quality_degradations = _values(per_sample, "random_quality_degradation")
-    self_faithfulness_scores = _values(per_sample, "explainability_self_faithfulness_score")
+    self_faithfulness_scores = _values(per_sample, "perturbation_ranking_selectivity_score")
     semantic_behavior_scores = _values(per_sample, "explainability_semantic_behavior_score")
     semantic_sensitivity_scores = _values(per_sample, "explainability_semantic_sensitivity_score")
     semantic_selectivity_scores = _values(per_sample, "explainability_semantic_selectivity_score")
@@ -603,9 +609,16 @@ def run_perturbation_stage(
     per_sample_trust_scores = [_sample_trust_score(item) for item in per_sample]
 
     explainability_score = _mean_or_nan(per_sample_explainability_scores)
-    if math.isnan(explainability_score):
-        explainability_score = 0.0
-    explainability_score = float(np.clip(explainability_score, 0.0, 1.0))
+    explainability_score = _finite_or_none(explainability_score)
+    if explainability_score is not None:
+        explainability_score = float(np.clip(explainability_score, 0.0, 1.0))
+    faithfulness_alignment_supported = explainability_score is not None
+    if not faithfulness_alignment_supported:
+        explainability_support_status = "unsupported_no_semantic_target"
+    elif semantic_supported_rate < 1.0:
+        explainability_support_status = "partial_semantic_coverage"
+    else:
+        explainability_support_status = "supported"
     quality_metrics = [
         str(item.get("explainability_quality_metric"))
         for item in per_sample
@@ -630,7 +643,9 @@ def run_perturbation_stage(
     result = {
         "perturbation_enabled_flag": True,
         "perturbation_supported_flag": True,
-        "explainability_supported_flag": True,
+        "explainability_supported_flag": faithfulness_alignment_supported,
+        "faithfulness_alignment_supported_flag": faithfulness_alignment_supported,
+        "explainability_support_status": explainability_support_status,
         "explainability_task_family": str(task_family or "unknown"),
         "explainability_method": "semantic_sensitivity_faithfulness_v1",
         "explainability_quality_metric": quality_metric,
@@ -649,8 +664,8 @@ def run_perturbation_stage(
         "explainability_unit_fraction_p95": _percentile_or_nan(unit_fractions, 95),
         "explainability_targeted_degradation_mean": _mean_or_nan(targeted_quality_degradations),
         "explainability_random_degradation_mean": _mean_or_nan(random_quality_degradations),
-        "explainability_self_faithfulness_score": _mean_or_nan(self_faithfulness_scores),
-        "explainability_self_faithfulness_score_p10": _percentile_or_nan(self_faithfulness_scores, 10),
+        "perturbation_ranking_selectivity_score": _mean_or_nan(self_faithfulness_scores),
+        "perturbation_ranking_selectivity_score_p10": _percentile_or_nan(self_faithfulness_scores, 10),
         "explainability_semantic_supported_flag": bool(semantic_supported_rate > 0.0)
         if not math.isnan(semantic_supported_rate)
         else False,
@@ -679,6 +694,8 @@ def run_perturbation_stage(
         "trust_prediction_stability_min": _min_or_nan(trust_same),
         "trust_confidence_stability": confidence_stability,
         "trust_score": trust_score,
+        "trust_score_name": "perturbation_response_stability",
+        "trust_score_definition": "stability of confidence and prediction under benign input perturbations",
         "trust_score_p05": _percentile_or_nan(per_sample_trust_scores, 5),
         "trust_score_min": _min_or_nan(per_sample_trust_scores),
         "perturbation_duration_s": float(time.time() - start),
@@ -700,10 +717,9 @@ def run_perturbation_stage(
 
 
 def _enabled(config):
-    value = config.get("enable_perturbation_metrics", config.get("perturbation_enabled", True))
-    if isinstance(value, str):
-        return value.strip().lower() not in {"0", "false", "no", "off"}
-    return bool(value)
+    return _config_bool(config, "enable_perturbation_metrics", False) or _config_bool(
+        config, "explainability_enabled", False
+    ) or _config_bool(config, "perturbation_enabled", False)
 
 
 def _config_bool(config, key, default=False):
@@ -734,7 +750,7 @@ def _progress_enabled(config):
 
 def _progress_log(config, message):
     if _progress_enabled(config):
-        print(f"[Perturbation] {message}", flush=True)
+        debug_print(f"[Perturbation] {message}", flush=True)
 
 
 def _progress_sample_interval(config):
@@ -912,9 +928,9 @@ def _semantic_behavior_score(sensitivity_score, selectivity_score, selectivity_f
 def _headline_explainability_score(semantic_behavior_score, semantic_alignment_score, self_faithfulness_score):
     semantic_behavior = _finite_or_none(semantic_behavior_score)
     semantic_alignment = _finite_or_none(semantic_alignment_score)
-    self_faithfulness = float(np.clip(_finite_or_none(self_faithfulness_score) or 0.0, 0.0, 1.0))
     if semantic_behavior is None or semantic_alignment is None:
-        return self_faithfulness
+        return None
+    self_faithfulness = float(np.clip(_finite_or_none(self_faithfulness_score) or 0.0, 0.0, 1.0))
     return float(
         np.clip(
             (0.65 * float(semantic_behavior)) + (0.25 * float(semantic_alignment)) + (0.10 * self_faithfulness),
@@ -1020,11 +1036,12 @@ def _sample_count(x, y=None):
 
 
 def _get_sample(x, idx):
+    from ..data.image_store import DiskArrayStore
     if x is None:
         return None
     if isinstance(x, dict):
         return {k: _get_sample(v, idx) for k, v in x.items()}
-    if isinstance(x, np.ndarray):
+    if isinstance(x, (np.ndarray, DiskArrayStore)):
         return x[int(idx)]
     if isinstance(x, (list, tuple)):
         return x[int(idx)]
@@ -1317,15 +1334,9 @@ def _expected_units(
             mask_context = _mask_context_units(x_sample, positions, model=model, limit=limit)
             if mask_context:
                 return mask_context, "mask_context"
-        content_tokens = _token_content_units(x_sample, positions, model=model, limit=limit)
-        if content_tokens:
-            return content_tokens, "token_content_heuristic"
         return [], None
 
     if modality == "text":
-        content_words = _content_word_units(x_sample, limit=limit)
-        if content_words:
-            return content_words, "content_word_heuristic"
         return [], None
 
     if modality == "image" and family in {"detection", "segmentation"}:
@@ -1755,34 +1766,51 @@ def _mask_token(sample, pos, *, model=None):
     if 0 <= int(pos) < flat.size:
         token_id = _mask_token_id(model)
         if token_id is None:
+            tokenizer = getattr(getattr(model, "core", None), "tokenizer", None)
+            token_id = _valid_replacement_token_id(model, getattr(tokenizer, "unk_token_id", None))
+        if token_id is None:
             token_id = _pad_token_id(model)
         flat[int(pos)] = int(token_id if token_id is not None else 0)
         out["input_ids"] = flat.reshape(ids.shape)
     return out
 
 
+def _valid_replacement_token_id(model, value):
+    """Tokenizer special tokens can exceed a distilled model's embeddings."""
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return None
+    core_model = getattr(getattr(model, "core", None), "model", None)
+    get_embeddings = getattr(core_model, "get_input_embeddings", None)
+    embeddings = get_embeddings() if callable(get_embeddings) else None
+    size = getattr(embeddings, "num_embeddings", None)
+    if size is None:
+        size = getattr(getattr(core_model, "config", None), "vocab_size", None)
+    if value < 0 or (size is not None and value >= int(size)):
+        return None
+    return value
+
+
 def _mask_token_id(model):
     tokenizer = getattr(getattr(model, "core", None), "tokenizer", None)
     value = getattr(tokenizer, "mask_token_id", None)
-    try:
-        return None if value is None else int(value)
-    except Exception:
-        return None
+    return _valid_replacement_token_id(model, value)
 
 
 def _pad_token_id(model):
     tokenizer = getattr(getattr(model, "core", None), "tokenizer", None)
     value = getattr(tokenizer, "pad_token_id", None)
-    try:
-        return None if value is None else int(value)
-    except Exception:
-        return None
+    return _valid_replacement_token_id(model, value)
 
 
 def _mask_token_text(model):
     tokenizer = getattr(getattr(model, "core", None), "tokenizer", None)
-    value = getattr(tokenizer, "mask_token", None)
-    return str(value) if value else None
+    for name in ("mask", "unk", "pad"):
+        value = getattr(tokenizer, f"{name}_token", None)
+        if value and _valid_replacement_token_id(model, getattr(tokenizer, f"{name}_token_id", None)) is not None:
+            return str(value)
+    return None
 
 
 def _image_array_view(sample):
@@ -1942,14 +1970,7 @@ def _sample_explainability_score(record):
     score = _finite_or_none(record.get("explainability_score"))
     if score is not None:
         return float(np.clip(score, 0.0, 1.0))
-    signal = _finite_or_none(record.get("targeted_relative_drop"))
-    if signal is None or signal == 0.0:
-        signal = _finite_or_none(record.get("targeted_output_relative_delta"))
-    if signal is None:
-        signal = 0.0
-    unit_fraction = _finite_or_none(record.get("targeted_unit_fraction"))
-    compactness = 1.0 - min(1.0, unit_fraction if unit_fraction is not None else 1.0)
-    return float(np.clip(max(0.0, signal) * max(0.0, compactness), 0.0, 1.0))
+    return None
 
 
 def _sample_trust_score(record):

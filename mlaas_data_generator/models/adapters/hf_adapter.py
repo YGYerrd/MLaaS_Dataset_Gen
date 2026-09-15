@@ -67,6 +67,10 @@ class TransformersTextFineTuneAdapter:
         label_format="single_index",
         generation_config=None,
         task_tag=None,
+        model_revision=None,
+        mobilebert_head_normalization=None,
+        max_grad_norm=None,
+        dataset_id=None,
     ):
         resolved_task, spec = build_task_spec(
             hf_task,
@@ -89,6 +93,10 @@ class TransformersTextFineTuneAdapter:
             label_pad_value=int(label_pad_value),
             generation_config=generation_config,
             task_tag=task_tag,
+            model_revision=model_revision,
+            mobilebert_head_normalization=mobilebert_head_normalization,
+            max_grad_norm=max_grad_norm,
+            dataset_id=dataset_id,
         )
         self.model_id = model_id
         self.max_length = int(max_length)
@@ -155,6 +163,8 @@ class TransformersTextClassifierAdapter:
         generation_config=None,
         task_tag=None,
         label_format="single_index",
+        model_revision=None,
+        dataset_id=None,
     ):
         task, spec = build_task_spec(
             hf_task,
@@ -173,7 +183,12 @@ class TransformersTextClassifierAdapter:
             task_spec=spec,
             generation_config=generation_config,
             task_tag=task_tag,
+            model_revision=model_revision,
+            dataset_id=dataset_id,
         )
+
+        original_model_id = model_id
+        model_id = core.model_source
 
         transformers = core.transformers
         if core.model is None:
@@ -219,13 +234,17 @@ class TransformersTextClassifierAdapter:
                 loader_fn=_load_model,
             )
 
+        saved_normalization = getattr(getattr(core.model, "config", None), "mobilebert_head_normalization", None)
+        if saved_normalization is not None:
+            from .mobilebert_stability import apply_mobilebert_head_normalization
+            apply_mobilebert_head_normalization(core.model, saved_normalization)
         core.model.to(core.device)
         core._configure_memory_optimizations()
         core.model.eval()
         core.sync_effective_max_length()
 
         self.core = core
-        self.model_id = model_id
+        self.model_id = original_model_id
         self.max_length = int(max_length)
         self.batch_size = int(batch_size)
         self.device = self.core.device

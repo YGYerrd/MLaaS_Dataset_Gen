@@ -1,0 +1,13 @@
+{
+  "schema_version": "5.0.0",
+  "library_id": "request_profiles.v5",
+  "profiles": {
+    "measured_tasks_v5": {
+      "description": "Frozen task semantics and evaluation protocols for measured parameter compositions; experimental implementations retain scoped evidence.",
+      "composition_size": {"minimum": 2, "maximum": 4},
+      "preference_weight_dirichlet_alpha": 1.0,
+      "constraint_penalty_dirichlet_alpha": 1.0,
+      "request_schema_version": "5.0.0"
+    }
+  }
+}

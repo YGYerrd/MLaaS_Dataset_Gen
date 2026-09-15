@@ -5,6 +5,9 @@ from .skew_axes import axis_supports_strategy, bucket_distribution, resolve_skew
 
 
 def _take(x, idx):
+    from .image_store import DiskArrayStore
+    if isinstance(x, DiskArrayStore):
+        return x.take(idx)
     if x is None:
         return None
     if isinstance(x, dict):
@@ -26,6 +29,9 @@ def _num_samples(x):
 
 
 def _is_scalar_label_vector(y):
+    from .image_store import DiskArrayStore
+    if isinstance(y, DiskArrayStore):
+        return False
     arr = np.asarray(y, dtype=object)
     if arr.ndim != 1:
         return False

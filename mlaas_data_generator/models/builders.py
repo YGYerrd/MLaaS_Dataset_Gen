@@ -18,20 +18,65 @@ def _import_keras_stack():
     return layers, models, optimizers, regularizers, MobileNetV2, preprocess_input, tf
 
 
-def _make_optimizer(name: str, lr: float):
+def _make_optimizer(name: str, lr: float, weight_decay: float = 0.0):
     _, _, optimizers, _, _, _, _ = _import_keras_stack()
     if name is None or name.lower() == "none" or lr is None:
         return None
     name = name.lower()
+    extra = {"weight_decay": float(weight_decay)} if float(weight_decay or 0.0) > 0 else {}
     if name == "sgd":
-        return optimizers.SGD(learning_rate=lr, momentum=0.0)
+        return optimizers.SGD(learning_rate=lr, momentum=0.0, **extra)
     if name == "rmsprop":
-        return optimizers.RMSprop(learning_rate=lr)
+        return optimizers.RMSprop(learning_rate=lr, **extra)
     if name == "adagrad":
-        return optimizers.Adagrad(learning_rate=lr)
+        return optimizers.Adagrad(learning_rate=lr, **extra)
     if name == "adamw":
-        return optimizers.AdamW(learning_rate=lr)
-    return optimizers.Adam(learning_rate=lr)
+        return optimizers.AdamW(
+            learning_rate=lr,
+            weight_decay=float(weight_decay or 0.0),
+        )
+    return optimizers.Adam(learning_rate=lr, **extra)
+
+
+def prepare_keras_local_update(
+    model, *, optimizer: str, learning_rate: float, weight_decay: float = 0.0
+) -> bool:
+    """Recompile a Keras model with fresh training-only state.
+
+    Returns ``False`` for non-Keras estimators.  Model variables are not
+    changed; callers verify that invariant using the canonical state hash.
+    """
+    compile_fn = getattr(model, "compile", None)
+    get_weights = getattr(model, "get_weights", None)
+    if not callable(compile_fn) or not callable(get_weights):
+        return False
+    module_name = str(getattr(model.__class__, "__module__", "")).lower()
+    if "keras" not in module_name and "tensorflow" not in module_name:
+        return False
+    fresh_optimizer = _make_optimizer(
+        str(optimizer or "adam"), float(learning_rate), float(weight_decay or 0.0)
+    )
+    if fresh_optimizer is None:
+        raise ValueError("FedAvg Keras local updates require an optimizer")
+
+    get_compile_config = getattr(model, "get_compile_config", None)
+    compile_from_config = getattr(model, "compile_from_config", None)
+    if callable(get_compile_config) and callable(compile_from_config):
+        config = dict(get_compile_config() or {})
+        _, _, optimizers, _, _, _, _ = _import_keras_stack()
+        config["optimizer"] = optimizers.serialize(fresh_optimizer)
+        compile_from_config(config)
+        return True
+
+    loss = getattr(model, "loss", None)
+    if loss is None:
+        raise ValueError("FedAvg Keras model has no reusable compile loss")
+    metric_names = [
+        name for name in list(getattr(model, "metrics_names", ()) or ())
+        if str(name).lower() not in {"loss", "compile_metrics"}
+    ]
+    compile_fn(optimizer=fresh_optimizer, loss=loss, metrics=metric_names)
+    return True
 
 from .adapters.hf_adapter import resolve_hf_task
 
@@ -60,6 +105,8 @@ def create_model(
     # ----------------------------
     if model_choice in ("hf_finetune", "hf_train", "transformers_finetune"):
         from .adapters.hf_adapter import TransformersTextFineTuneAdapter
+        from ..segmentation_policy import validate_ade20k_mini_metadata
+        validate_ade20k_mini_metadata(meta or {}, kwargs)
 
         model_id = None
         if isinstance(meta, dict):
@@ -126,6 +173,10 @@ def create_model(
             label_format=label_format,
             generation_config=generation_config,
             task_tag=kwargs.get("task_tag", (meta or {}).get("task_tag") if isinstance(meta, dict) else None),
+            model_revision=kwargs.get("hf_model_revision") or kwargs.get("model_revision"),
+            mobilebert_head_normalization=kwargs.get("mobilebert_head_normalization"),
+            max_grad_norm=kwargs.get("max_grad_norm"),
+            dataset_id=(meta or {}).get("hf_id") or kwargs.get("dataset_name"),
         )
 
     if model_choice in ("hf", "hf_text", "transformers"):
@@ -183,6 +234,8 @@ def create_model(
             generation_config=generation_config,
             task_tag=kwargs.get("task_tag", (meta or {}).get("task_tag") if isinstance(meta, dict) else None),
             label_format=label_format,
+            model_revision=kwargs.get("hf_model_revision") or kwargs.get("model_revision"),
+            dataset_id=(meta or {}).get("hf_id") or kwargs.get("dataset_name"),
         )
 
     # ----------------------------
@@ -227,7 +280,7 @@ def create_model(
         out_units = 1
         out_activation = "linear"
         loss = "mse"
-        metrics = ["mse"]
+        metrics = None  # Named Keras metrics are constructed after backend selection.
     elif label_format in {"multilabel", "multihot"}:
         out_units = int(resolved_num_labels)
         out_activation = "sigmoid"
@@ -253,6 +306,10 @@ def create_model(
         return make_random_forest(task_type="regression" if is_regression else "classification", **rf_kwargs)
 
     layers, models, _, regularizers, MobileNetV2, preprocess_input, tf = _import_keras_stack()
+    if is_regression:
+        from keras.metrics import MeanSquaredError, RootMeanSquaredError, MeanAbsoluteError
+        metrics = [MeanSquaredError(name="mse"), RootMeanSquaredError(name="rmse"),
+                   MeanAbsoluteError(name="mae")]
     l2 = regularizers.l2(weight_decay) if weight_decay and weight_decay > 0 else None
 
     if rank == 3:

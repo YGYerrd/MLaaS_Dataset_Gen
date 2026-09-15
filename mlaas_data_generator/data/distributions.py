@@ -482,6 +482,16 @@ def get_data_distribution(
     if y is None:
         return distribution
 
+    from .image_store import DiskArraySequence
+    if isinstance(y, DiskArraySequence):
+        # Preserve pixel-class counts without materializing all stored masks.
+        for sample in y:
+            counts = get_data_distribution(sample, num_classes=num_classes,
+                                           label_pad_value=label_pad_value)
+            for label, count in counts.items():
+                distribution[label] += count
+        return distribution
+
     try:
         y_arr = np.asarray(y)
     except Exception:

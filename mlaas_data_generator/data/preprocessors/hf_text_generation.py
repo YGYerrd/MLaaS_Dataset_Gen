@@ -1,8 +1,60 @@
 import json
+import time
 
 from ..accounting import append_accounting_stage, finalize_accounting
 
 import numpy as np
+
+
+_GENERATION_BATCH_ROWS = 32
+
+
+def _encode_generation_split(ds, encode_batch, *, widths, pad_id, ignore_index, dynamic_padding, split, accepted_positions=None):
+    """Read/tokenize bounded raw batches and avoid corpus-sized Python token lists."""
+    count = len(ds)
+    ids = np.empty((count, widths[0]), dtype="int32")
+    masks = np.empty_like(ids)
+    labels = np.empty((count, widths[1]), dtype="int32")
+    written = source_width = target_width = 0
+    started = last = time.monotonic()
+    print(f"Preparing generation {split}: 0/{count:,} rows", flush=True)
+    for start in range(0, count, _GENERATION_BATCH_ROWS):
+        stop = min(start + _GENERATION_BATCH_ROWS, count)
+        if hasattr(ds, "select"):
+            # Select before reading columns: long documents stay in Arrow until needed.
+            batch = ds.select(range(start, stop))
+        else:
+            batch = {column: ds[column][start:stop] for column in ds.column_names}
+        try:
+            encoded = encode_batch(batch)
+        except ValueError as exc:
+            if not str(exc).startswith("insufficient_supervision:"):
+                raise
+            encoded = None
+        if encoded is not None:
+            features, targets = encoded[:2]
+            if accepted_positions is not None:
+                positions = encoded[-1]
+                accepted_positions.extend(start + int(i) for i in positions)
+            size = len(targets)
+            sw, tw = features["input_ids"].shape[1], targets.shape[1]
+            end = written + size
+            ids[written:end].fill(pad_id)
+            masks[written:end].fill(0)
+            labels[written:end].fill(ignore_index)
+            ids[written:end, :sw] = features["input_ids"]
+            masks[written:end, :sw] = features["attention_mask"]
+            labels[written:end, :tw] = targets
+            written = end
+            source_width, target_width = max(source_width, sw), max(target_width, tw)
+        now = time.monotonic()
+        if start == 0 or stop == count or now - last >= 10:
+            print(f"Preparing generation {split}: {stop:,}/{count:,} rows | elapsed={now-started:.1f}s", flush=True)
+            last = now
+    if not written:
+        raise ValueError(f"insufficient_supervision: generation {split} split has no targets")
+    sw, tw = (source_width, target_width) if dynamic_padding else widths
+    return {"input_ids": ids[:written, :sw], "attention_mask": masks[:written, :sw]}, labels[:written, :tw], sw, tw
 
 
 # Seq2seq auto-mapping priority is ordered from the most explicit generic schema
@@ -137,19 +189,18 @@ def _strip_trailing_eos(token_ids, tokenizer):
 def _pad_encodings(enc, pad_to):
     input_ids = enc["input_ids"]
     attention_mask = enc["attention_mask"]
-    padded_ids = []
-    padded_mask = []
-    for ids, mask in zip(input_ids, attention_mask):
-        ids = list(ids)[:pad_to]
-        mask = list(mask)[:pad_to]
-        pad_len = max(0, pad_to - len(ids))
-        padded_ids.append(ids + [0] * pad_len)
-        padded_mask.append(mask + [0] * pad_len)
-    return np.asarray(padded_ids, dtype="int32"), np.asarray(padded_mask, dtype="int32")
+    padded_ids = np.zeros((len(input_ids), pad_to), dtype="int32")
+    padded_mask = np.zeros_like(padded_ids)
+    for i, (ids, mask) in enumerate(zip(input_ids, attention_mask)):
+        width = min(len(ids), pad_to)
+        padded_ids[i, :width] = ids[:width]
+        padded_mask[i, :width] = mask[:width]
+    return padded_ids, padded_mask
 
 
 def _supervised_token_count(labels, ignore_index):
-    return int(np.count_nonzero(np.asarray(labels) != int(ignore_index)))
+    return sum(int(np.count_nonzero(labels[start:start + 1024] != int(ignore_index)))
+               for start in range(0, len(labels), 1024))
 
 
 def _dataset_size(ds, fallback_column):
@@ -160,6 +211,12 @@ def _dataset_size(ds, fallback_column):
 
 
 def _load_auto_tokenizer(hf_model_id):
+    from ..runtime_cache import cached_preparation
+    return cached_preparation("tokenizer", hf_model_id,
+                              lambda: _load_auto_tokenizer_uncached(hf_model_id))[0]
+
+
+def _load_auto_tokenizer_uncached(hf_model_id):
     import transformers
 
     fast_error = None
@@ -270,16 +327,18 @@ def preprocess_hf_text_causal_lm_generation(
     src_max = int(source_max_length or max_len)
     tgt_max = int(target_max_length or max_len)
 
-    def _encode_split(ds):
+    def _encode_batch(ds):
         pad_id = int(tokenizer.pad_token_id)
         eos_id = int(tokenizer.eos_token_id if tokenizer.eos_token_id is not None else pad_id)
 
-        ids_list, mask_list, label_list = [], [], []
+        ids_list, mask_list, label_list, row_positions = [], [], [], []
         if generation_mode == "single_text":
             texts = _to_text_list(ds[prompt_col])
             tok = tokenizer(texts, truncation=True, padding=False, max_length=max_len, add_special_tokens=True)
 
-            for ids in tok["input_ids"]:
+            for position, (text, ids) in enumerate(zip(texts, tok["input_ids"])):
+                if not text.strip():
+                    continue
                 full_ids = _strip_trailing_eos(ids, tokenizer)[:max_len]
                 if not full_ids:
                     full_ids = [eos_id]
@@ -292,6 +351,7 @@ def preprocess_hf_text_causal_lm_generation(
                 ids_list.append(full_ids)
                 mask_list.append([1] * len(full_ids))
                 label_list.append(labels)
+                row_positions.append(position)
         else:
             prompts = _to_text_list(ds[prompt_col])
             targets = _to_text_list(ds[target_col])
@@ -299,7 +359,7 @@ def preprocess_hf_text_causal_lm_generation(
             p_tok = tokenizer(prompts, truncation=True, padding=False, max_length=src_max, add_special_tokens=True)
             t_tok = tokenizer(targets, truncation=True, padding=False, max_length=tgt_max, add_special_tokens=False)
 
-            for p_ids, t_ids in zip(p_tok["input_ids"], t_tok["input_ids"]):
+            for position, (p_ids, t_ids) in enumerate(zip(p_tok["input_ids"], t_tok["input_ids"])):
                 prompt_ids = _strip_trailing_eos(p_ids, tokenizer)
                 full_ids = (prompt_ids + list(t_ids) + [eos_id])[:max_len]
                 labels = full_ids.copy()
@@ -310,7 +370,18 @@ def preprocess_hf_text_causal_lm_generation(
                 ids_list.append(full_ids)
                 mask_list.append([1] * len(full_ids))
                 label_list.append(labels)
+                row_positions.append(position)
 
+        # Causal models shift labels by one position. An EOS-only blank row or
+        # a prompt that fills the entire context has no next-token supervision.
+        supervised_rows = [
+            (ids, mask, labels, position)
+            for ids, mask, labels, position in zip(ids_list, mask_list, label_list, row_positions)
+            if any(label != int(ignore_index) for label in labels[1:])
+        ]
+        if not supervised_rows:
+            raise ValueError("insufficient_supervision: causal LM split has no next-token targets")
+        ids_list, mask_list, label_list, row_positions = map(list, zip(*supervised_rows))
         pad_to = max(len(x) for x in ids_list) if dynamic_padding else max_len
         padded_ids, padded_mask, padded_labels = [], [], []
         for ids, mask, labels in zip(ids_list, mask_list, label_list):
@@ -327,10 +398,25 @@ def preprocess_hf_text_causal_lm_generation(
             "attention_mask": np.asarray(padded_mask, dtype="int32"),
         }
         y = np.asarray(padded_labels, dtype="int32")
-        return X, y, pad_to
+        return X, y, pad_to, row_positions
 
-    X_train, y_train, train_len = _encode_split(ds_train)
-    X_test, y_test, test_len = _encode_split(ds_test)
+    accepted = {"train": [], "evaluation": []}
+    cache = meta.get("_preparation_cache", {})
+    def _encode_split(ds, split):
+        if split == "evaluation" and "causal_evaluation" in cache:
+            result, positions = cache["causal_evaluation"]
+            accepted[split].extend(positions)
+            return dict(result[0]), result[1], result[2]
+        x, y, width, _ = _encode_generation_split(ds, _encode_batch,
+            widths=(max_len, max_len), pad_id=int(tokenizer.pad_token_id), ignore_index=ignore_index,
+            dynamic_padding=dynamic_padding, split=split, accepted_positions=accepted[split])
+        result = x, y, width
+        if split == "evaluation":
+            cache["causal_evaluation"] = ((dict(x), y, width), list(accepted[split]))
+        return result
+
+    X_train, y_train, train_len = _encode_split(ds_train, "train")
+    X_test, y_test, test_len = _encode_split(ds_test, "evaluation")
 
     pad_len = max(train_len, test_len) if dynamic_padding else max_len
     if dynamic_padding and train_len != test_len:
@@ -341,6 +427,10 @@ def preprocess_hf_text_causal_lm_generation(
         y_test = np.pad(y_test, ((0, 0), (0, pad_len - y_test.shape[1])), constant_values=int(ignore_index))
 
     meta2 = dict(meta)
+    meta2["accepted_train_positions"] = accepted["train"]
+    from ..tokenization_selection import select_metadata
+    for split, key in (("train", "train"), ("evaluation", "test")):
+        meta2 = select_metadata(meta2, accepted[split], len(ds_train if key == "train" else ds_test), split=key)
     meta2.update({
         "hf_task": "causal_lm_generation",
         "hf_model_id": hf_model_id,
@@ -373,7 +463,7 @@ def preprocess_hf_text_causal_lm_generation(
         stage="hf_text_generation",
         split="train",
         input_record_count=train_input_count,
-        post_filter_record_count=train_input_count,
+        post_filter_record_count=train_sequences,
         tokenized_record_count=train_sequences,
         emitted_record_count=train_sequences,
         sequence_count=train_sequences,
@@ -385,7 +475,7 @@ def preprocess_hf_text_causal_lm_generation(
         stage="hf_text_generation",
         split="test",
         input_record_count=test_input_count,
-        post_filter_record_count=test_input_count,
+        post_filter_record_count=test_sequences,
         tokenized_record_count=test_sequences,
         emitted_record_count=test_sequences,
         sequence_count=test_sequences,
@@ -432,7 +522,7 @@ def preprocess_hf_text_seq2seq_generation(
     src_max = int(source_max_length or max_len)
     tgt_max = int(target_max_length or max_len)
 
-    def _encode_split(ds):
+    def _encode_batch(ds):
         src = _to_text_list(ds[source_col])
         tgt = _to_text_list(ds[target_col])
 
@@ -462,10 +552,15 @@ def preprocess_hf_text_seq2seq_generation(
             "attention_mask": np.asarray(X_mask, dtype="int32"),
         }
         labels = np.asarray(y, dtype="int32")
-        return X, labels, src_pad_to, tgt_pad_to
+        return X, labels, src_pad_to, tgt_pad_to, list(range(len(src)))
 
-    X_train, y_train, train_src_len, train_tgt_len = _encode_split(ds_train)
-    X_test, y_test, test_src_len, test_tgt_len = _encode_split(ds_test)
+    def _encode_split(ds, split):
+        return _encode_generation_split(ds, _encode_batch,
+            widths=(src_max, tgt_max), pad_id=int(tokenizer.pad_token_id), ignore_index=ignore_index,
+            dynamic_padding=dynamic_padding, split=split)
+
+    X_train, y_train, train_src_len, train_tgt_len = _encode_split(ds_train, "train")
+    X_test, y_test, test_src_len, test_tgt_len = _encode_split(ds_test, "evaluation")
 
     src_pad_to = max(train_src_len, test_src_len) if dynamic_padding else src_max
     tgt_pad_to = max(train_tgt_len, test_tgt_len) if dynamic_padding else tgt_max
