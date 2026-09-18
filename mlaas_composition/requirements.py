@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from .catalogue import normalise_service_rows
+from .evidence import EVALUATION_DIMENSIONS, DEFAULT_EVALUATION_VERSION, PRODUCTION_EVALUATION_VERSION, production_evidence_mask
 from .protocol import (
     DEFAULT_PRINCIPLE_ID,
     DEFAULT_PROFILE_ID,
@@ -50,15 +51,17 @@ def generate_service_requests(
     profile = load_request_profile(profile_id)
     principle = load_request_principle(principle_id)
     services = normalise_service_rows(services)
+    if profile.get("request_schema_version") == "6.0.0":
+        services["latency"] = pd.to_numeric(services["composition_latency_s_per_example"], errors="coerce")
     compatibility_mode = str(compatibility_mode).lower()
     if compatibility_mode not in {"functional", "strict"}:
         raise ValueError("compatibility_mode must be 'functional' or 'strict'")
-    if profile.get("request_schema_version") == "5.0.0" and compatibility_mode != "strict":
+    if profile.get("request_schema_version") in {"5.0.0", "6.0.0"} and compatibility_mode != "strict":
         raise ValueError("measured task requests require strict compatibility")
     rng = np.random.default_rng(seed)
     strict_groups = _strict_snapshot_groups(services, profile) if compatibility_mode == "strict" else []
     schema_version = profile.get("request_schema_version", REQUEST_SCHEMA_VERSION)
-    if compatibility_mode == "strict" and strict_groups and schema_version != "5.0.0":
+    if compatibility_mode == "strict" and strict_groups and schema_version not in {"5.0.0", "6.0.0"}:
         schema_version = "4.0.0" if "family_id" in strict_groups[0][0] else "3.0.0" if "cohort_id" in strict_groups[0][0] else "2.0.0"
     if compatibility_mode == "strict" and not strict_groups:
         raise ValueError("No viable compatible family, shared-parent cohort, or legacy FedAvg snapshot is available")
@@ -89,10 +92,21 @@ def generate_service_requests(
         composition_size = min(proposed_size, len(compatible_pool))
         reference = compatible_pool.sample(n=composition_size, random_state=int(rng.integers(2**32 - 1)))
 
-        hard_constraints = _hard_constraints(reference, rng, principle)
-        qos_requirements = _qos_requirements(reference, rng, principle)
-        preference_weights = _preference_weights(rng, profile)
-        constraint_penalties = _constraint_penalties(rng, profile)
+        # Synthetic experiments only request evaluation dimensions backed by
+        # complete production evidence throughout the compatible pool.
+        protocol_version = (PRODUCTION_EVALUATION_VERSION
+            if compatible_pool["evaluation_protocol_version"].eq(PRODUCTION_EVALUATION_VERSION).all()
+            else DEFAULT_EVALUATION_VERSION)
+        evaluation_dimensions = tuple(d for d in EVALUATION_DIMENSIONS if production_evidence_mask(compatible_pool, d, protocol_version).all())
+        hard_constraints = _hard_constraints(reference, rng, principle, evaluation_dimensions)
+        qos_requirements = _qos_requirements(reference, rng, principle, evaluation_dimensions)
+        if schema_version == "6.0.0":
+            # One aggregate model executes: latency is seconds per example.
+            qos_requirements["max_latency"] /= len(reference)
+            quality = float(np.average(reference.metric_score, weights=reference.realised_sample_count))
+            qos_requirements["min_accuracy"] = quality * float(rng.uniform(*principle["minimum_target_multiplier"]))
+        preference_weights = _preference_weights(rng, profile, evaluation_dimensions)
+        constraint_penalties = _constraint_penalties(rng, profile, evaluation_dimensions)
         request = {
             "request_id": f"req_{idx:06d}",
             "request_schema_version": schema_version,
@@ -109,6 +123,8 @@ def generate_service_requests(
             "composition_size": composition_size,
             "preference_weights": _json(preference_weights),
             "constraint_penalties": _json(constraint_penalties),
+            "evaluation_requirements": _json({"protocol_version": protocol_version,
+                                               **{d: d in evaluation_dimensions for d in EVALUATION_DIMENSIONS}}),
         }
         if schema_version == "5.0.0":
             request["required_capabilities"] = _json({"parameter_aggregation": True, "measured_composition_validation": True})
@@ -146,6 +162,18 @@ def _functional_task_pools(services: pd.DataFrame) -> dict[str, pd.DataFrame]:
 def _strict_snapshot_groups(
     services: pd.DataFrame, profile: dict
 ) -> list[tuple[dict[str, str | int], pd.DataFrame]]:
+    if profile.get("request_schema_version") == "6.0.0":
+        from .raw_family import RAW_FAMILY_VERSIONS
+        from .validation import supported_composition_reason
+        keys = ["family_id", "initial_state_hash", "compatibility_contract_hash"]
+        candidates = services[services.composition_compatible.eq(1)
+                              & services.family_contract_version.isin(RAW_FAMILY_VERSIONS)]
+        groups = []
+        for values, frame in candidates.dropna(subset=keys).groupby(keys, sort=True):
+            if (len(frame) >= int(profile["composition_size"]["minimum"])
+                    and frame.primary_metric_name.nunique() == 1 and supported_composition_reason(frame) is None):
+                groups.append((dict(zip(keys, values)), frame.sort_values("service_id").reset_index(drop=True)))
+        return groups
     if profile.get("request_schema_version") == "5.0.0":
         from .validation import supported_composition_reason
         groups = []
@@ -255,7 +283,7 @@ def _filter_functional_requirements(pool: pd.DataFrame, requirements: dict[str, 
     return eligible
 
 
-def _hard_constraints(reference: pd.DataFrame, rng: np.random.Generator, principle: dict) -> dict[str, float]:
+def _hard_constraints(reference: pd.DataFrame, rng: np.random.Generator, principle: dict, evaluation_dimensions: tuple[str, ...] = ()) -> dict[str, float]:
     """Set feasible per-service bounds from a sampled reference composition."""
     low_min, low_max = principle["minimum_target_multiplier"]
     high_min, high_max = principle["maximum_target_multiplier"]
@@ -264,12 +292,12 @@ def _hard_constraints(reference: pd.DataFrame, rng: np.random.Generator, princip
         "max_latency": float(reference["latency"].max() * rng.uniform(high_min, high_max)),
         "min_resource_cost_score": float(np.clip(reference["resource_cost_score"].min() * rng.uniform(low_min, low_max), 0.0, 1.0)),
         "min_reliability_score": float(np.clip(reference["reliability_score"].min() * rng.uniform(low_min, low_max), 0.0, 1.0)),
-        "min_explainability_score": float(np.clip(reference["explainability_score"].min() * rng.uniform(low_min, low_max), 0.0, 1.0)),
+        **{f"min_{d}_score": float(np.clip(reference[f"{d}_score"].min() * rng.uniform(low_min, low_max), 0.0, 1.0)) for d in evaluation_dimensions},
         "max_compute_time": float(reference["compute_time_s"].max() * rng.uniform(high_min, high_max)),
     }
 
 
-def _qos_requirements(reference: pd.DataFrame, rng: np.random.Generator, principle: dict) -> dict[str, float]:
+def _qos_requirements(reference: pd.DataFrame, rng: np.random.Generator, principle: dict, evaluation_dimensions: tuple[str, ...] = ()) -> dict[str, float]:
     """Create feasible composition-level targets used by the penalty objective."""
     low_min, low_max = principle["minimum_target_multiplier"]
     high_min, high_max = principle["maximum_target_multiplier"]
@@ -278,31 +306,31 @@ def _qos_requirements(reference: pd.DataFrame, rng: np.random.Generator, princip
         "max_latency": float(reference["latency"].sum() * rng.uniform(high_min, high_max)),
         "max_compute_time": float(reference["compute_time_s"].mean() * rng.uniform(high_min, high_max)),
         "min_reliability": float(np.clip(reference["reliability_score"].mean() * rng.uniform(low_min, low_max), 0.0, 1.0)),
-        "min_explainability": float(np.clip(reference["explainability_score"].mean() * rng.uniform(low_min, low_max), 0.0, 1.0)),
+        **{f"min_{d}": float(np.clip(reference[f"{d}_score"].mean() * rng.uniform(low_min, low_max), 0.0, 1.0)) for d in evaluation_dimensions},
         "min_resource_cost_score": float(np.clip(reference["resource_cost_score"].mean() * rng.uniform(low_min, low_max), 0.0, 1.0)),
     }
 
 
-def _preference_weights(rng: np.random.Generator, profile: dict) -> dict[str, float]:
+def _preference_weights(rng: np.random.Generator, profile: dict, evaluation_dimensions: tuple[str, ...] = ()) -> dict[str, float]:
     names = (
         "data_parameters", "model_parameters", "compute_time", "latency",
-        "accuracy", "reliability", "explainability", "resource_cost",
+        "accuracy", "reliability", *evaluation_dimensions, "resource_cost",
     )
     values = rng.dirichlet(np.full(len(names), float(profile["preference_weight_dirichlet_alpha"])))
     return {name: float(value) for name, value in zip(names, values)}
 
 
-def _constraint_penalties(rng: np.random.Generator, profile: dict) -> dict[str, float]:
+def _constraint_penalties(rng: np.random.Generator, profile: dict, evaluation_dimensions: tuple[str, ...] = ()) -> dict[str, float]:
     names = (
         "min_accuracy", "max_latency", "max_compute_time", "min_reliability",
-        "min_explainability", "min_resource_cost_score",
+        *(f"min_{d}" for d in evaluation_dimensions), "min_resource_cost_score",
     )
     values = rng.dirichlet(np.full(len(names), float(profile["constraint_penalty_dirichlet_alpha"])))
     return {name: float(value) for name, value in zip(names, values)}
 
 
 def _json(value: dict[str, str] | dict[str, float]) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
 def _apply_v2_constraints(pool: pd.DataFrame, constraints: dict[str, float]) -> pd.DataFrame:
@@ -311,11 +339,13 @@ def _apply_v2_constraints(pool: pd.DataFrame, constraints: dict[str, float]) -> 
         "min_metric_score": "metric_score",
         "min_resource_cost_score": "resource_cost_score",
         "min_reliability_score": "reliability_score",
+        "min_trust_score": "trust_score",
         "min_explainability_score": "explainability_score",
     }
     upper = {"max_latency": "latency", "max_compute_time": "compute_time_s"}
     for name, field in lower.items():
-        eligible = eligible[eligible[field].astype(float) >= float(constraints[name])]
+        if name in constraints:
+            eligible = eligible[eligible[field].astype(float) >= float(constraints[name])]
     for name, field in upper.items():
         eligible = eligible[eligible[field].astype(float) <= float(constraints[name])]
     return eligible.sort_values("service_id", kind="stable").reset_index(drop=True)

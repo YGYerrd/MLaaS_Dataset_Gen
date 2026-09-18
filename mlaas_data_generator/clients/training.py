@@ -10,6 +10,7 @@ import numpy as np
 
 from .resources import task_key
 from ..provenance import sha256_json
+from .profiles import PROFILES, current_profiles
 
 LEGACY_SAMPLER_VERSION = "conditional_balancing_v1"
 PREVIOUS_SAMPLER_VERSION = "conditional_balancing_v2"
@@ -64,18 +65,21 @@ def build_training_policy(parent: Mapping[str, Any], *, task: str | None = None)
               "sample_quantity_multiplier": RANDOM_INITIALIZATION_SAMPLE_MULTIPLIER if small_random else 1,
               "quality_gate": "none"}
     from .capacity import CAPACITY_POLICY, REALIZED_TRAINING_POLICY, known_training_capacity
+    policy["partition_profiles"] = list(PROFILES)
     if base.get("task_contract"):
-        policy["partition_profiles"] = list(base["task_contract"]["sampling"]["profiles"])
+        policy["partition_profiles"] = list(current_profiles(base["task_contract"]["sampling"]["profiles"]))
     elif task in {"image_segmentation", "text2text_generation", "seq2seq_generation"}:
-        policy["partition_profiles"] = ["iid", "quantity_skew"]
+        policy["partition_profiles"] = ["iid"]
     axis = base.get("skew_axis")
+    if not axis and task == "fill_mask":
+        axis = "raw_text_length_bucket"
     if not axis and task in {"text_classification", "image_classification", "keras_image_classification", "tabular_classification"}:
         axis = "class_label"
     if not axis and task in {"regression", "tabular_regression", "sentence_similarity"}:
         axis = "score_bin"
     policy["skew_axis"] = axis
     if not axis:
-        policy["partition_profiles"] = ["iid", "quantity_skew"]
+        policy["partition_profiles"] = ["iid"]
     policy.update(quantity_capacity_policy=CAPACITY_POLICY,
                   known_training_capacity=known_training_capacity(base),
                   realized_training_policy=REALIZED_TRAINING_POLICY,
@@ -373,9 +377,10 @@ def training_coverage(rows: list[dict], policy: dict) -> dict:
     result["calibration_band_counts"] = dict(Counter(row.get("calibration_band", "uncalibrated") for row in rows))
     limits = policy["limits"]
     group = rows
+    profiles = list(dict.fromkeys([*PROFILES, *(row["split_strategy"] for row in group)]))
     result["coverage"] = {
         "client_count": len(group),
-        "profile_counts": counts(group, "split_strategy", ["iid", "dirichlet", "shard", "quantity_skew"]),
+        "profile_counts": counts(group, "split_strategy", profiles),
         "knob_counts": {key: counts(group, key, policy["optimizers"] if key == "optimizer" else limits[key])
                         for key in ("optimizer", "batch_size", "training_epochs", "weight_decay", "warmup_ratio")},
         "learning_rate_counts_by_optimizer": {optimizer: counts([row for row in group if row["optimizer"] == optimizer],

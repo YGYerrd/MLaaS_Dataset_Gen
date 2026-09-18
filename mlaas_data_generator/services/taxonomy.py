@@ -15,6 +15,9 @@ def canonical_task_family(task_type: str | None, hf_task: str | None = None) -> 
     base = (task_type or "").strip().lower().replace("-", "_")
     hf = normalize_hf_task(hf_task)
 
+    if base in {"token_classification", "fill_mask"}:
+        return base
+
     if base in {"image_classification", "text_classification", "sequence_classification", "single_label_classification"}:
         return "classification"
     if base in {"object_detection", "image_detection", "detection"}:

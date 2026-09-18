@@ -136,7 +136,7 @@ def register_manifest_roster(configs, *, run_id, manifest_path, rerun_existing=F
         snapshot = {key: config.get(key) for key in (
             "service_id", "case_name", "dataset", "dataset_name", "dataset_config", "model_type",
             "hf_model_id", "hf_task", "task_type", "training_regime", "manifest_group_id", "row_index")}
-        snapshot.update(db_path=db, manifest_path=str(manifest_path), started_at=now(), rerun_existing=rerun_existing)
+        snapshot.update(db_path=db, started_at=now(), rerun_existing=rerun_existing)
         grouped.setdefault(db, []).append(snapshot)
     for db, rows in grouped.items():
         directory = Path(str(db) + ".manifest-roster")

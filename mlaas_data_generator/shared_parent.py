@@ -22,6 +22,7 @@ from .checkpoint_store import (capture_model_tensor_state,
 from .config import CONFIG
 from .reduced_checkpoint import source_state_hash
 from .family_preflight import MIN_EVALUATION_EXAMPLES, evaluation_size_error
+from .evaluation_sampling import evaluation_settings
 from .clients.partitioning import client_partition, materialize_partition
 from .data.fedavg_partition import _take_rows
 from .data.image_store import DiskImageArray, DiskArraySequence, close_image_stores
@@ -130,8 +131,9 @@ def parent_config(recipe: Mapping[str, Any], db: str) -> dict:
         config.pop(key, None)
     config.update(db_path=str(Path(db).resolve()), generation_mode="shared_parent",
                   sample_size=None, max_train_time_s=None, max_eval_time_s=None,
-                  timeout_s=None, benchmark_sample_size=None, split_strategy="iid",
+                  timeout_s=None, split_strategy="iid",
                   sample_seed=int(config.get("seed", 42)), training_seed=int(config.get("seed", 42)))
+    config.update(evaluation_settings(recipe["config"]))
     from .tasks.contracts import uses_task_protocol, VERSION
     if uses_task_protocol(config):
         config["task_contract_version"] = VERSION
@@ -143,7 +145,7 @@ def _dataset_args(config: Mapping[str, Any]) -> dict:
     from .cli.run_manifest import _build_dataset_args
     args = _build_dataset_args(dict(config))
     args.pop("max_samples", None)
-    args.update(benchmark_sample_size=None, seed=int(config.get("seed", 42)))
+    args.update(_defer_evaluation_sampling=True, seed=int(config.get("seed", 42)))
     args.pop("train_examples", None)
     args.pop("benchmark_examples", None)
     return args
@@ -163,7 +165,8 @@ def _source_ids(meta: Mapping[str, Any], count: int, split: str, name: str) -> l
 
 
 def reserve_evaluation(train_ids: list[str], test_ids: list[str], labels: Any, *,
-                       task_family: str, seed: int, contract: Mapping[str, Any], source_groups=None) -> dict:
+                       task_family: str, seed: int, contract: Mapping[str, Any], source_groups=None,
+                       benchmark_sample_size=None) -> dict:
     if set(train_ids) & set(test_ids):
         raise ValueError("training and evaluation source IDs overlap")
     error = evaluation_size_error(len(test_ids))
@@ -188,6 +191,10 @@ def reserve_evaluation(train_ids: list[str], test_ids: list[str], labels: Any, *
         audit = grouped_audit_positions(train_ids, test_ids, source_groups, count=count, seed=seed)
         audit_set = set(audit)
     metric = [i for i in range(len(test_ids)) if i not in audit_set]
+    from .evaluation_sampling import evaluation_indices
+    positions, sampling = evaluation_indices(len(metric), {
+        "benchmark_sample_size": benchmark_sample_size, "evaluation_seed": seed})
+    metric = [metric[i] for i in positions]
     if contract.get("task_semantics_hash"):
         from .tasks.contracts import target_fingerprints
         target_labels = target_fingerprints(labels)
@@ -198,6 +205,7 @@ def reserve_evaluation(train_ids: list[str], test_ids: list[str], labels: Any, *
               "catalogue_metric_ids": [test_ids[i] for i in metric],
               "audit_ids": [test_ids[i] for i in audit],
               "catalogue_positions": metric, "audit_positions": audit,
+              "evaluation_sampling": sampling,
               "seed": seed, "task_family": task_family, "contract": dict(contract),
               "historical_evaluation_exposure": "unknown"}
     if contract.get("task_semantics_hash"):
@@ -339,8 +347,10 @@ def train_parents(file: str | Path, *, db: str = DEFAULT_COHORT_DB, output: str 
             contracts = _contracts(model, config, meta, task_family)
             compatibility = _compatibility(contracts)
             root = service_runner._provenance_artifact_root(config)
+            evaluation = evaluation_settings(config)
             reservation = reserve_evaluation(train_ids, test_ids, test[1], task_family=task_family,
-                                             seed=int(config["seed"]), contract=compatibility,
+                                             seed=evaluation["evaluation_seed"], contract=compatibility,
+                                             benchmark_sample_size=evaluation["benchmark_sample_size"],
                                              source_groups=config.get("task_source_groups"))
             reservation_artifact = write_json_artifact(root, requested_id, "cohort_reservation", reservation)
             support = save_reconstruction_support_artifacts(root, requested_id, model)
@@ -551,11 +561,12 @@ def execute_cohort(entries: list[Any], *, load_dataset=None, build_model=None, e
                 restore_model_tensor_state(model, state, verify=True)
                 reset_s = reset_timer.elapsed_s()
                 row.update(db_path=db, lineage_id=document["lineage_id"], max_eval_time_s=None,
-                    benchmark_sample_size=None, provenance_artifact_dir=document["store_root"],
+                    **evaluation_settings(config), provenance_artifact_dir=document["store_root"],
                     dataset_args=config["dataset_args"], _prepared_model=model,
                     _prepared_dataset=(train, benchmark, meta),
                     _prepared_train_partition=materialize_partition(*train, partition),
-                    _prepared_benchmark_sample_info={"source_ids": reservation["catalogue_metric_ids"], "frozen": True},
+                    _prepared_benchmark_sample_info={**reservation.get("evaluation_sampling", {}),
+                        "source_ids": reservation["catalogue_metric_ids"], "frozen": True},
                     _parent_state=state, _parent_ref=base.base, _parent_lineage_base=base,
                     _restored_parent=state, _model_reset_s=reset_s,
                     _expected_compatibility=document["compatibility"], _retain_client_checkpoint=True,

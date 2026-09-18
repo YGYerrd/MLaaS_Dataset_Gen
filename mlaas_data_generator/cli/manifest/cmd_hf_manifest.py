@@ -69,6 +69,7 @@ def register_hf_manifest(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument("--clients-per-family", type=int, help="Training recipes per model/dataset/task contract (default: 100; mutually exclusive with variant counts)")
     p.add_argument("--initialization-seed", type=int, help="Optional initialization override; defaults to --seed.")
     p.add_argument("--evaluation-seed", type=int, help="Optional evaluation override; defaults to --seed.")
+    p.add_argument("--metric-evaluation-profile", choices=("benchmark", "diagnostic", "pilot", "production"), default="benchmark")
     p.add_argument("--heterogeneity-intensity", type=float, default=0.5,
                    help="Shared client distribution skew intensity in [0,1] (default: 0.5)")
     p.add_argument("--total-services", type=int, help="Total service rows to emit")
@@ -110,6 +111,7 @@ def register_hf_manifest(subparsers: argparse._SubParsersAction) -> None:
             clients_per_family=args.clients_per_family,
             initialization_seed=args.initialization_seed,
             evaluation_seed=args.evaluation_seed,
+            metric_evaluation_profile=args.metric_evaluation_profile,
             heterogeneity_intensity=args.heterogeneity_intensity,
             regression_support_policy=args.regression_support_policy,
             min_target_bin_fraction=args.min_target_bin_fraction,

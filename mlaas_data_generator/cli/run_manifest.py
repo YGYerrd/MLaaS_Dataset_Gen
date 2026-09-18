@@ -58,6 +58,7 @@ BASE_DEFAULTS: dict[str, Any] = {
 }
 
 BOOL_COLUMNS = {
+    "retain_validation_checkpoint",
     "checkpoint_measure_full",
     "enabled",
     "measure_system_metrics",
@@ -75,6 +76,10 @@ BOOL_COLUMNS = {
     "scheduled_to_participate",
 }
 INT_COLUMNS = {
+    "trust_sample_count", "trust_trials", "explainability_sample_count", "explainability_candidate_units",
+    "metric_evaluation_random_trials", "metric_evaluation_min_independent_inputs",
+    "trust_min_independent_inputs", "explainability_min_independent_inputs",
+    "metric_evaluation_bootstrap_resamples", "metric_evaluation_batch_size",
     "checkpoint_reduced_compression_level", "checkpoint_validation_samples",
     "initialization_seed",
     "evaluation_seed",
@@ -127,6 +132,8 @@ INT_COLUMNS = {
     "requested_quota",
 }
 FLOAT_COLUMNS = {
+    "trust_max_duration_s", "explainability_max_duration_s", "metric_evaluation_max_ci_width",
+    "metric_evaluation_min_coverage",
     "max_grad_norm",
     "checkpoint_quality_tolerance",
     "learning_rate",
@@ -145,6 +152,7 @@ FLOAT_COLUMNS = {
 }
 ENUM_COLUMNS = {"training_regime", "resource_tier", "optimizer", "device", "model_type", "hf_task", "task_type", "modality", "split_strategy", "distribution_type", "skew_axis", "precision_type"}
 JSON_COLUMNS = {
+    "metric_evaluation_budget_fractions", "explanation_replacement_methods",
     "preprocessing_identity",
     "processor_size",
     "task_contract", "task_source_groups", "generation_config",
@@ -167,6 +175,9 @@ MISSING_MULTIMODAL_MANIFEST_PATH = MANIFEST_RESULTS_PATH.parent / "service_manif
 FEDAVG_RUN_RESULTS_PATH = MANIFEST_RESULTS_PATH.parent / "fedavg_run_results.csv"
 
 DATASET_ARG_COLUMNS = {
+    "evaluation_seed",
+    "csv_path", "target", "test_size", "scaler", "y_standardize", "preprocessors",
+    "training_augmentations", "eval_augmentations", "label_pad_value", "prompt_loss_only",
     "source_group_column",
     "processor_size",
     "dataset_name",
@@ -599,13 +610,23 @@ def _database_candidates(db_path: Any) -> list[Path]:
     return list(dict.fromkeys(candidates))
 
 
+_FAMILY_UNSPECIFIED = object()
+
+
 def _find_existing_service_database(
     db_path: Any,
     service_id: Any,
-    cache: dict[str, set[str]],
+    cache: dict[str, set[tuple[str | None, str]]],
+    family_id: Any = _FAMILY_UNSPECIFIED,
 ) -> str | None:
-    """Find a service by primary ID without creating or migrating a database."""
+    """Find a completed family/service pair without mutating a database.
+
+    Older manifests do not carry the computed family ID.  For those rows only,
+    the globally unique service ID remains a compatibility lookup.  A supplied
+    family ID always requires an exact pair match.
+    """
     wanted = str(service_id)
+    wanted_family = None if family_id is None else str(family_id)
     for candidate in _database_candidates(db_path):
         if not candidate.is_file():
             continue
@@ -616,12 +637,42 @@ def _find_existing_service_database(
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name='services'"
                 ).fetchone()
                 columns = {row[1] for row in conn.execute("PRAGMA table_info(services)")}
-                cache[cache_key] = (
-                    {str(row[0]) for row in conn.execute("SELECT service_id FROM services WHERE status='completed'")}
-                    if table_exists and "status" in columns
-                    else set()
-                )
-        if wanted in cache[cache_key]:
+                if not table_exists or "status" not in columns:
+                    cache[cache_key] = set()
+                elif "family_id" in columns:
+                    cache[cache_key] = {
+                        (None if row[0] is None else str(row[0]), str(row[1]))
+                        for row in conn.execute(
+                            "SELECT family_id,service_id FROM services WHERE status='completed'"
+                        )
+                    }
+                elif conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' "
+                    "AND name='service_generation_provenance'"
+                ).fetchone() and "family_id" in {
+                    row[1] for row in conn.execute("PRAGMA table_info(service_generation_provenance)")
+                }:
+                    cache[cache_key] = {
+                        (None if row[0] is None else str(row[0]), str(row[1]))
+                        for row in conn.execute(
+                            "SELECT p.family_id,s.service_id FROM services s "
+                            "LEFT JOIN service_generation_provenance p USING(service_id) "
+                            "WHERE s.status='completed'"
+                        )
+                    }
+                else:
+                    cache[cache_key] = {
+                        (None, str(row[0])) for row in conn.execute(
+                            "SELECT service_id FROM services WHERE status='completed'"
+                        )
+                    }
+        pairs = cache[cache_key]
+        matched = (
+            any(sid == wanted for _, sid in pairs)
+            if family_id is _FAMILY_UNSPECIFIED
+            else (wanted_family, wanted) in pairs
+        )
+        if matched:
             return str(candidate)
     return None
 
@@ -681,13 +732,29 @@ def _resolve_row(row: pd.Series, manifest_defaults: dict[str, Any]) -> dict[str,
     resolved["dataset_args"] = _build_dataset_args(resolved)
     from ..debug_mode import apply_debug_mode
     apply_debug_mode(resolved)
+    from ..client_reconstruction import apply_retention_defaults
+    apply_retention_defaults(resolved)
     return resolved
 
 
-def _resolve_execution_row(row: pd.Series, manifest_defaults: dict[str, Any]) -> dict[str, Any]:
+def _resolve_execution_row(
+    row: pd.Series, manifest_defaults: dict[str, Any], metric_evaluation_profile=None,
+    *, no_trust_explainability: bool = False,
+) -> dict[str, Any]:
     """Retain a row identity so malformed settings can be recorded as failed."""
     try:
-        return _resolve_row(row, manifest_defaults)
+        resolved = _resolve_row(row, manifest_defaults)
+        if metric_evaluation_profile is not None:
+            from ..evaluation_protocol import PLAN_CONFIG_KEYS, apply_evaluation_profile
+            original_metric_settings = {key: resolved[key] for key in (*PLAN_CONFIG_KEYS, "enable_perturbation_metrics")
+                                        if key in resolved}
+            resolved = apply_evaluation_profile(resolved, metric_evaluation_profile)
+            resolved["_manifest_metric_settings"] = original_metric_settings
+            from ..debug_mode import apply_debug_mode
+            apply_debug_mode(resolved)
+        if no_trust_explainability:
+            resolved.update(enable_perturbation_metrics=False, explainability_enabled=False)
+        return resolved
     except (ValueError, TypeError, KeyError, OverflowError) as exc:
         config = {**CONFIG, **BASE_DEFAULTS, **manifest_defaults}
         config.update({key: value for key, value in row.items() if not _is_blank(value)})
@@ -771,6 +838,9 @@ def _resolve_manifest_hf_revisions(
 
 
 def _validate_row(resolved: dict[str, Any]) -> RowValidation:
+    from ..client_reconstruction import retention_error
+    if error := retention_error(resolved):
+        return RowValidation(False, error)
     from ..debug_mode import debug_mode_error
     if error := debug_mode_error(resolved):
         return RowValidation(False, error)
@@ -792,6 +862,11 @@ def _validate_row(resolved: dict[str, Any]) -> RowValidation:
         return RowValidation(False, "FedAvg generation is retired; use select-parent-configs -> train-parents -> cohort-manifest")
     if generation_mode not in {"independent", "shared_parent"}:
         return RowValidation(False, "generation_mode must be independent or shared_parent")
+    from ..data.tokenization_selection import selection_blocker
+    try:
+        selection_blocker(resolved)
+    except ValueError as exc:
+        return RowValidation(False, str(exc))
     if generation_mode == "shared_parent":
         from ..cohort_manifest import validate_client_recipe
         try:
@@ -1411,13 +1486,30 @@ def run_manifest(
     rerun_existing: bool = False,
     log_mode: str | None = None,
     no_save_weights: bool = False,
+    weight_retention: str | None = None,
+    retain_validation_checkpoint: bool | None = None,
     smoke_test: bool = False,
+    metric_evaluation_profile: str | None = None,
+    no_trust_explainability: bool = False,
 ) -> Path:
     global _ACTIVE_MANIFEST_PROGRESS
     manifest_path = Path(file)
     load_hf_token_from_file()
     print(f"Loading manifest file: {manifest_path}")
     rows_df, manifest_defaults = load_manifest(manifest_path, sheet=sheet)
+    if metric_evaluation_profile is not None:
+        from ..evaluation_protocol import manifest_evaluation_defaults
+        manifest_evaluation_defaults(metric_evaluation_profile)  # Validate before execution.
+        print(f"Evaluation preset override: {metric_evaluation_profile}; completed services remain skipped.")
+    if no_trust_explainability:
+        # Keep the override in failed-row exports as well as worker configs.
+        rows_df = rows_df.copy()
+        rows_df["enable_perturbation_metrics"] = False
+        rows_df["explainability_enabled"] = False
+        print("Trust and explainability scoring disabled.")
+    for key, value in (("weight_retention", weight_retention), ("retain_validation_checkpoint", retain_validation_checkpoint)):
+        if value is not None:
+            rows_df[key] = value
     if smoke_test:
         rows_df = rows_df.copy()
         rows_df["smoke_test"] = True
@@ -1457,7 +1549,8 @@ def run_manifest(
         if not dry_run:
             roster = []
             for idx, row in enabled_df.iterrows():
-                config = _resolve_execution_row(row, manifest_defaults)
+                config = _resolve_execution_row(row, manifest_defaults, metric_evaluation_profile,
+                                                no_trust_explainability=no_trust_explainability)
                 config.update(db_path=db_path or config.get("db_path"), manifest_group_id=manifest_group_id,
                               _execution_run_id=manifest_group_id, row_index=int(idx))
                 roster.append(config)
@@ -1468,7 +1561,8 @@ def run_manifest(
             except ManifestPreflightError as exc:
                 preflight_cache = {}
                 for index, (idx, row) in enumerate(enabled_df.iterrows()):
-                    resolved = _resolve_execution_row(row, manifest_defaults)
+                    resolved = _resolve_execution_row(row, manifest_defaults, metric_evaluation_profile,
+                                                      no_trust_explainability=no_trust_explainability)
                     resolved.update(db_path=db_path or resolved.get("db_path"), manifest_group_id=manifest_group_id,
                                     _execution_run_id=manifest_group_id, row_index=int(idx))
                     existing = None if rerun_existing else _find_existing_service_database(resolved["db_path"], resolved["service_id"], preflight_cache)
@@ -1503,10 +1597,12 @@ def run_manifest(
             if time.monotonic() - preparation_update >= 10:
                 print(f"Preparing manifest: {i - 1}/{len(enabled_df)} rows checked", flush=True)
                 preparation_update = time.monotonic()
-            resolved = _resolve_execution_row(row, manifest_defaults)
+            resolved = _resolve_execution_row(row, manifest_defaults, metric_evaluation_profile,
+                                              no_trust_explainability=no_trust_explainability)
             if log_mode is not None:
                 resolved["log_mode"] = log_mode
             resolved["_execution_run_id"] = manifest_group_id
+            resolved["_rerun_existing"] = bool(rerun_existing)
             resolved["row_index"] = int(idx)
             resolved["_manifest_total"] = len(enabled_df)
             resolved["_manifest_ordinal"] = i
@@ -1518,7 +1614,8 @@ def run_manifest(
                 resolved["lineage_id"] = f"lineage__{resolved['fl_run_id']}"
             if not dry_run and not rerun_existing:
                 existing_db = _find_existing_service_database(
-                    resolved.get("db_path"), resolved.get("service_id"), existing_service_cache
+                    resolved.get("db_path"), resolved.get("service_id"), existing_service_cache,
+                    resolved["family_id"] if "family_id" in resolved else _FAMILY_UNSPECIFIED,
                 )
                 if existing_db is not None:
                     resolved["_existing_service_db_path"] = existing_db
@@ -2680,8 +2777,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--db", "--db-path", dest="db_path", default=None, help="SQLite database path for service records")
     parser.add_argument("--log-mode", choices=("concise", "debug"), default=None, help="Terminal output detail (default: concise)")
     parser.add_argument("--workers", type=int, default=1, help="Number of row-level worker processes to run")
-    parser.add_argument("--rerun-existing", action="store_true", help="Execute rows even when their service_id already exists in SQLite")
+    parser.add_argument("--rerun-existing", action="store_true",
+                        help="Execute rows even when their family_id/service_id is already completed in SQLite")
+    parser.add_argument("--metric-evaluation-profile", choices=("benchmark", "diagnostic", "pilot", "production"), default=None,
+                        help="Replace frozen metric budgets for unfinished rows; preserve training settings and service IDs")
+    parser.add_argument("--no-trust-explainability", action="store_true",
+                        help="Disable trust and explainability scoring, overriding manifest settings and evaluation presets")
     parser.add_argument("--no-save-weights", action="store_true", help="Independent debugging: train/evaluate without saving weight checkpoints")
+    parser.add_argument("--weight-retention", choices=("checkpoint", "recipe_only"), default=None,
+                        help="Override retention (default: recipe_only for supported independent services; checkpoint otherwise)")
+    parser.add_argument("--retain-validation-checkpoint", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--smoke-test", action="store_true", help="Skip perturbation and update signatures; use separate smoke-test service IDs")
     parser.add_argument("--no-grouped-hf", dest="grouped_hf", action="store_false", help="Disable grouped Hugging Face execution")
     parser.set_defaults(grouped_hf=True)
@@ -2701,7 +2806,11 @@ def main() -> None:
         rerun_existing=args.rerun_existing,
         log_mode=args.log_mode,
         no_save_weights=args.no_save_weights,
+        weight_retention=args.weight_retention,
+        retain_validation_checkpoint=args.retain_validation_checkpoint,
         smoke_test=args.smoke_test,
+        metric_evaluation_profile=args.metric_evaluation_profile,
+        no_trust_explainability=args.no_trust_explainability,
     )
 
 

@@ -373,8 +373,14 @@ def preprocessing_metadata(meta: Mapping[str, Any]) -> dict[str, Any]:
         "model_text_max_length", "max_length_adjusted", "dynamic_padding", "padding_mode", "channel_order",
         "training_augmentations", "eval_augmentations", "segmentation_reduce_labels", "ignore_index", "label_pad_value",
         "text_column", "tokens_column", "image_column", "label_column", "mask_column", "column_mapping",
+        "mlm_probability", "masking_policy", "masking_seed",
     )
     result = {key: meta.get(key) for key in keys if meta.get(key) is not None}
+    if meta.get("dynamic_padding"):
+        # A selected union's padded width is an execution detail, not a family.
+        result.pop("input_shape", None)
+    if meta.get("shared_fitted_state") is not None:
+        result["shared_fitted_state_hash"] = sha256_json(meta["shared_fitted_state"])
     result["preprocessing_contract_hash"] = sha256_json(result)
     return result
 

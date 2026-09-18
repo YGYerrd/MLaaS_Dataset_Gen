@@ -60,7 +60,7 @@ Use `hf-manifest --manifest-format expanded ...` to export the previous full-row
 
 
 
-Both `hf-manifest` and `cohort-manifest` use the shared client library in `mlaas_data_generator/clients/`. It owns profile balancing, client quantities, sampling/training seeds, optimizer-specific learning rates, resource limits, and partitioning. New clients use IID, Dirichlet, shard, and quantity-skew profiles; `--heterogeneity-intensity` controls distribution skew (default `0.5`, range `0–1`). Both generators use explicit task/model training limits without resource tiers. All profiles receive stratified sample quantities independently of training limits and heterogeneity intensity; Dirichlet and shards change bucket distributions. Sampling never duplicates a row within a client, allows overlap between clients, and records capacity shortfalls.
+Both `hf-manifest` and `cohort-manifest` use the shared client library in `mlaas_data_generator/clients/`. It owns profile balancing, client quantities, sampling/training seeds, optimizer-specific learning rates, resource limits, and partitioning. New clients use IID, Dirichlet, and shard profiles; `--heterogeneity-intensity` controls distribution skew (default `0.5`, range `0–1`). Both generators use explicit task/model training limits without resource tiers. All profiles receive stratified sample quantities independently of training limits and heterogeneity intensity; Dirichlet and shards change bucket distributions. Sampling never duplicates a row within a client, allows overlap between clients, and records capacity shortfalls.
 
 
 
@@ -72,7 +72,7 @@ Use `--average-samples 1000` (`--avg-sample-size` is also accepted by `hf-manife
 
 
 
-Shared logic lives in `clients/recipes.py`, `quantities.py`, `training.py`, `resources.py`, and `partitioning.py`. Generator modules supply contracts and lineage, and the runner supplies the prepared source pool. Saved recipes retain their versioned interpretation. Explicit variants retain their legacy training and partition semantics, including the historical quantity-skew alias, while newly generated quantities use the fixed spread. Existing saved manifests keep their frozen quotas; newly generated parent cohorts receive new recipe hashes and resume identities.
+Shared logic lives in `clients/recipes.py`, `quantities.py`, `training.py`, `resources.py`, and `partitioning.py`. Generator modules supply contracts and lineage, and the runner supplies the prepared source pool. Saved recipes retain their versioned interpretation. New explicit variants use the current distribution profiles and the same independent quantity spread. Historical profile names and allocation semantics remain readable for frozen manifests; they are never generated as new profiles. Existing saved manifests keep their frozen quotas; newly generated parent cohorts receive new recipe hashes and resume identities.
 
 
 
@@ -80,7 +80,23 @@ The client library defines recipes, not another training engine. Independent ser
 
 
 
-Execution saves preparation bindings in `<manifest stem>.resolved/`. Keep that directory and the checkpoint artifacts when resuming. Failed-row retry CSVs also retain their preparation references. Repeating the manifest verifies and skips completed services; failed services restart from the frozen base. Edited prepared recipes require new service IDs and a new manifest. Family preparation uses the available evaluation split, with at least two examples for separate catalogue and audit partitions, and never substitutes a sliced training pool.
+The manifest is disposable execution input. It selects services and supplies their
+configuration, but execution does not create or consult a manifest-specific
+`.resolved/` binding directory. Completed services persist their resolved requested
+and effective configuration, family identity, provenance and artifact references in
+SQLite. Reordering rows, renaming the manifest, deleting unrelated rows, or changing
+the manifest size therefore has no effect on resume. A completed `(family_id,
+service_id)` is skipped; unfinished or absent services run. Family preparation uses
+the available evaluation split, with at least two examples for separate catalogue
+and audit partitions, and never substitutes a sliced training pool.
+
+New services default to `benchmark_evaluation_v1`: trust uses up to 32 independent
+inputs with 4 trials each; explanation uses up to 16 with 4 random controls per
+masking amount and replacement. Evidence floors are 16 and 8 respectively.
+To adopt these metric settings for unfinished rows of an existing manifest,
+resume with `--metric-evaluation-profile benchmark`; a new manifest is not
+required for this metric-only override. Completed services stay skipped. See the
+[evaluation protocol and resume instructions](metric-evaluation-protocol.md).
 
 
 
@@ -104,7 +120,8 @@ Existing trained parents can be passed directly to `cohort-manifest --parents <p
 
 
 
-New manifests default to [INT8 Safetensors checkpoints](checkpoint_formats.md), with unchanged training/evaluation precision and source model identities. Reload performance is checked on a catalogue sample, with exact-storage fallback if quality drops. FP16 remains selectable; existing manifests retain their saved checkpoint settings.
+Supported independent services default to [recipe-only retention](client-reconstruction.md).
+When client checkpoints are retained, new manifests default to [INT8 Safetensors](checkpoint_formats.md), with unchanged training/evaluation precision and source model identities. Reload performance is checked on a catalogue sample, with exact-storage fallback if quality drops. FP16 remains selectable; existing manifests retain their saved checkpoint settings.
 
 HF adapters keep floating model weights in FP32; mixed precision controls forward computation through autocast. This prevents FP16-loaded checkpoints from supplying FP16 gradients to GradScaler. A nonfinite mixed-precision training loss receives one FP32 forward retry of the same batch, preserving the scaler and accumulated gradients. `train_fp32_loss_retry_count` records these retries; a loss that remains nonfinite still fails before that batch's optimizer update. FP32 weights can require more memory than a model previously loaded entirely in FP16. Restart an existing worker process to pick up changes to this training path.
 
@@ -732,7 +749,8 @@ Important columns:
 | `training_epochs`, `batch_size`, `learning_rate`, `optimizer` | Training and runtime knobs. |
 
 | `sample_size` | Training examples requested for this client; uses the available source if smaller. |
-| `benchmark_sample_size` | Evaluation examples, independent of the client's training quantity. |
+| `benchmark_sample_size` | Global maximum evaluation dataset examples, independent of training quantity. Seq2seq generation, image captioning, and VQA are capped at 25% of this value at runtime, including existing manifests (for example, **2,048** becomes **512**). Smaller explicit service caps are respected. New independent families select a bounded raw evaluation pool before preprocessing, with room for a separate audit holdout of up to 512 rows. |
+| `evaluation_seed` | Fixed evaluation sampling seed (default **42**), independent of client/training seeds. Families freeze both this seed and the cap. |
 | `max_length`, `timeout_s`, `max_train_time_s`, `max_eval_time_s`, `device` | Sequence length and runtime controls. |
 
 | `input_schema`, `output_schema` | Compatibility metadata for later composition work. |
@@ -760,6 +778,34 @@ it, a durable `<database>.terminal-status` journal records the status for replay
 a failure of both stores is surfaced. Existing oversized failure records are not
 rewritten or compacted by these changes.
 
+### Production recipe-only services
+
+Supported independent services default to `weight_retention=recipe_only`: they
+retain their family, reconstruction recipe and observations, with no client
+weights. Use `--weight-retention checkpoint` (or the same manifest setting) to
+retain checkpoints. Add `--retain-validation-checkpoint` when a recipe-only run
+needs retained reference weights for comparison. Other modes keep their
+checkpoint policy. The fidelity gate checks functional results; it does not
+require bitwise-equal reconstructed weights.
+See [client reconstruction](client-reconstruction.md) for supported replay
+trajectories, materialisation commands and the Stage F fidelity gate.
+
+### Run without trust and explainability scoring
+
+Add `--no-trust-explainability` to skip both scoring stages:
+
+```powershell
+python -m mlaas_data_generator.cli.main run-manifest --file outputs/clients.csv --db outputs/services.db --no-trust-explainability
+```
+
+The flag is also supported by `python -m mlaas_data_generator.cli.run_manifest`
+and the Python API (`run_manifest(..., no_trust_explainability=True)`). It overrides
+manifest settings and `--metric-evaluation-profile`. Training, quality evaluation,
+weight retention, update signatures and service IDs keep their normal settings.
+Stored results mark metric evaluation as disabled and leave both scores null.
+Completed services still skip by default; use `--rerun-existing` to rerun them.
+Failed-row retry manifests retain the disabled scoring settings.
+
 ### Debug training without weight files
 
 Use `--no-save-weights` to train and evaluate independent clients while skipping
@@ -772,8 +818,8 @@ verification:
 
 The same flag is supported by `python -m mlaas_data_generator.cli.run_manifest`.
 For individual manifest rows or Python configurations, set `no_save_weights=true`.
-Normal checkpoint behavior remains the default; the older `save_weights` field
-does not control the generator's provenance checkpoint storage.
+The older `save_weights` field does not control production weight retention;
+use `weight_retention` for that policy.
 
 Debug service IDs receive an idempotent `__debug_no_weights` suffix, preserving
 normal providers and allowing the same manifest to run normally later. Add
@@ -811,13 +857,16 @@ cached objects are copied before use. The caches expire with the run, do not sto
 model weights, and do not eliminate first-time downloads or tokenization for a
 different model.
 
-Non-durable text-classification and sentence-pair runs now select client rows
-from the complete label pool before tokenizing their text. Grouped execution
-tokenizes the union of the clients' selections once. Token-dependent sampling,
-custom preprocessing, and durable/frozen families retain full preparation and
-print the reason. Dynamic padding may use a smaller width. See
+Independent runs select raw client candidates before preparation, including runs
+that retain checkpoints. Grouped execution tokenizes the union of the clients'
+selections. Fill-mask Dirichlet and shard profiles default to
+`raw_text_length_bucket`, using fixed character-length ranges from the configured
+raw text column. Existing explicit `masked_token_id` requests are rejected before
+preparation; change those rows to `raw_text_length_bucket`. Other explicit
+prepared-feature axes retain their existing preparation path. Dynamic padding
+may use a smaller width. See
 [selection before tokenization](tokenization-selection.md) for supported paths,
-the generation/IID limitation, and compatibility details.
+replacement after filtering, and compatibility details.
 
 T5-family models now use FP32 for training and evaluation, including manifests
 that previously requested FP16. The policy and effective precision are recorded.

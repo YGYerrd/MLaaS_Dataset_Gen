@@ -26,10 +26,11 @@ python -m mlaas_composition generate-requests --db outputs/services.db --output 
 python -m mlaas_composition evaluate --db outputs/services.db --requests-file outputs/requests.json --output-dir outputs/composition_run --search-budget 100 --seed 42
 ```
 
-Review the manifest before execution. Keep `clients.csv`, its `clients.families.json`
-companion, the generated `clients.resolved/` directory, and checkpoint artifacts
-together for reproducible execution and resume. Use a new manifest and service IDs
-when changing prepared recipes.
+Review the manifest before execution. A compact manifest needs its
+`clients.families.json` companion only while it is being expanded for execution.
+Completed services persist their resolved configuration, provenance and artifact
+references in SQLite, so the original manifest is not required for interpretation,
+reproduction or resume.
 
 ## Key files
 

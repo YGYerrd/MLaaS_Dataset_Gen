@@ -56,6 +56,53 @@ def _build_mlm_labels(encodings, tokenizer, mlm_probability, label_pad_value, rn
     return features, labels
 
 
+def _source_mlm_labels(encodings, tokenizer, probability, ignore, *, seed, source_ids):
+    """Keep masking independent of client union, row order and padding width."""
+    from ...provenance import sha256_json
+    features = {key: np.asarray(value, dtype="int32").copy() for key, value in encodings.items()
+                if key in {"input_ids", "attention_mask", "token_type_ids"}}
+    targets = np.full_like(features["input_ids"], ignore)
+    for index, source_id in enumerate(source_ids):
+        mask = np.asarray(encodings["attention_mask"][index]).astype(bool)
+        row = {key: np.asarray(value[index])[mask][None, :] for key, value in encodings.items()}
+        row_seed = int(sha256_json(["source_row_mask_v1", seed, source_id])[:16], 16)
+        prepared, labels = _build_mlm_labels(row, tokenizer, probability, ignore, np.random.default_rng(row_seed))
+        for key in features:
+            features[key][index, mask] = prepared[key][0]
+        targets[index, mask] = labels[0]
+    return features, targets
+
+
+def _prepare_split(ds, tokenizer, text_column, max_length, probability, ignore, *,
+                   seed, source_rows, split, batch_size=256):
+    """Bound tokenizer/native encoding memory to one batch of source rows."""
+    features = None
+    targets = np.empty((len(ds), max_length), dtype="int32")
+    longest = 0
+    for start in range(0, len(ds), batch_size):
+        end = min(start + batch_size, len(ds))
+        # Slice the dataset before accessing the column: ds[text_column] can
+        # materialize the entire corpus as Python strings.
+        enc = _tokenize_texts(tokenizer, ds[start:end][text_column], max_length,
+                              dynamic_padding=True)
+        longest = max(longest, max((len(row) for row in enc["input_ids"]), default=0))
+        enc = tokenizer.pad(enc, padding="max_length", max_length=max_length, return_tensors="np")
+        batch_x, batch_y = _source_mlm_labels(
+            enc, tokenizer, probability, ignore, seed=seed,
+            source_ids=[f"{split}:{source_rows[i]}" for i in range(start, end)])
+        if features is None:
+            features = {key: np.empty((len(ds), max_length), dtype="int32") for key in batch_x}
+        for key, value in batch_x.items():
+            features[key][start:end] = value
+        targets[start:end] = batch_y
+        if len(ds) > batch_size and (start == 0 or end == len(ds) or (start // batch_size) % 100 == 0):
+            print(f"Preparation: fill_mask {split} {end:,}/{len(ds):,} rows", flush=True)
+    if features is None:
+        features = {key: np.empty((0, max_length), dtype="int32")
+                    for key in ("input_ids", "attention_mask")}
+    return features, targets, longest
+
+
 def preprocess_hf_text_fill_mask(
     train,
     test,
@@ -90,6 +137,10 @@ def preprocess_hf_text_fill_mask(
     if mlm_probability <= 0.0 or mlm_probability >= 1.0:
         raise ValueError("mlm_probability must be in the open interval (0, 1)")
 
+    from ..raw_text_axis import with_raw_text_lengths
+    for split, dataset in (("train", ds_train), ("test", ds_test)):
+        meta = with_raw_text_lengths(dataset, meta, split=split, column=text_column)
+
     tokenizer, _, _ = get_cached_tokenizer(
         hf_model_id=hf_model_id,
         task="fill_mask",
@@ -98,25 +149,22 @@ def preprocess_hf_text_fill_mask(
     )
 
     seed = int(meta.get("seed", 42))
-    train_rng = np.random.default_rng(seed)
-    test_rng = np.random.default_rng(seed + 1)
 
-    enc_train = _tokenize_texts(tokenizer, ds_train[text_column], max_length=max_length, dynamic_padding=dynamic_padding)
-    enc_test = _tokenize_texts(tokenizer, ds_test[text_column], max_length=max_length, dynamic_padding=dynamic_padding)
-
-    if dynamic_padding:
-        train_max_len = max((len(ids) for ids in enc_train["input_ids"]), default=0)
-        test_max_len = max((len(ids) for ids in enc_test["input_ids"]), default=0)
-        pad_to = max(train_max_len, test_max_len)
-        enc_train = tokenizer.pad(enc_train, padding="max_length", max_length=pad_to, return_tensors="np")
-        enc_test = tokenizer.pad(enc_test, padding="max_length", max_length=pad_to, return_tensors="np")
-    else:
-        pad_to = max_length
-        enc_train = tokenizer.pad(enc_train, padding="max_length", max_length=pad_to, return_tensors="np")
-        enc_test = tokenizer.pad(enc_test, padding="max_length", max_length=pad_to, return_tensors="np")
-
-    X_train, y_train = _build_mlm_labels(enc_train, tokenizer, mlm_probability, label_pad_value, train_rng)
-    X_test, y_test = _build_mlm_labels(enc_test, tokenizer, mlm_probability, label_pad_value, test_rng)
+    X_train, y_train, train_max_len = _prepare_split(
+        ds_train, tokenizer, text_column, max_length, mlm_probability, label_pad_value,
+        seed=seed, source_rows=meta.get("selected_train_rows", range(len(ds_train))),
+        split=meta.get("train_split") or "train")
+    X_test, y_test, test_max_len = _prepare_split(
+        ds_test, tokenizer, text_column, max_length, mlm_probability, label_pad_value,
+        seed=seed, source_rows=meta.get("selected_test_rows", range(len(ds_test))),
+        split=meta.get("test_split") or "test")
+    pad_to = max(train_max_len, test_max_len) if dynamic_padding else max_length
+    if pad_to < max_length:
+        # Preserve both left- and right-padding semantics without retokenizing.
+        columns = slice(max_length - pad_to, None) if getattr(tokenizer, "padding_side", "right") == "left" else slice(0, pad_to)
+        X_train = {key: value[:, columns] for key, value in X_train.items()}
+        X_test = {key: value[:, columns] for key, value in X_test.items()}
+        y_train, y_test = y_train[:, columns], y_test[:, columns]
 
     meta2 = dict(meta)
     meta2.update({
@@ -131,6 +179,8 @@ def preprocess_hf_text_fill_mask(
         "modality": "text",
         "label_pad_value": label_pad_value,
         "mlm_probability": mlm_probability,
+        "masking_policy": "source_row_mask_v1",
+        "masking_seed": seed,
         "hf_tokenizer_required": "AutoTokenizer",
         "hf_model_required": "AutoModelForMaskedLM",
         "dynamic_padding": dynamic_padding,
@@ -143,4 +193,5 @@ def preprocess_hf_text_fill_mask(
         ignore_index=label_pad_value,
     )
 
-    return (X_train, y_train), (X_test, y_test), meta2
+    from ..tokenization_selection import filter_token_supervision
+    return filter_token_supervision((X_train, y_train), (X_test, y_test), meta2)

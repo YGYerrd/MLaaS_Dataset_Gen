@@ -9,11 +9,12 @@ from typing import Any, Mapping
 import numpy as np
 import pandas as pd
 
-from .catalogue import number
+from .catalogue import finite, number
 from .pool import build_composition_instance, request_object
 from .protocol import (
     LEGACY_OBJECTIVE_VERSION,
     OBJECTIVE_VERSION,
+    RECIPE_OBJECTIVE_VERSION,
     objective_version_for_request,
 )
 from .signatures import compute_composition_mus
@@ -79,6 +80,7 @@ def generate_compositions(services: pd.DataFrame, requests: pd.DataFrame, *, can
                 "constraint_penalty": penalty,
                 "composability_score": score,
                 "utility_score": score,
+                **({"predicted_utility_score": score} if objective_version == RECIPE_OBJECTIVE_VERSION else {}),
                 "selected_flag": False,
             })
     compositions = pd.DataFrame(rows)
@@ -89,7 +91,7 @@ def generate_compositions(services: pd.DataFrame, requests: pd.DataFrame, *, can
     for column in (
         "data_parameter_compatibility", "model_parameter_alignment", "compute_time_compatibility",
         "latency_feasibility", "accuracy_compatibility", "reliability_compatibility",
-        "explainability_score", "cost_efficiency", "constraint_penalty", "dhs", "mus", "shs",
+        "trust_score", "explainability_score", "cost_efficiency", "constraint_penalty", "dhs", "mus", "shs",
         "ses", "hsq", "srs", "composability_score", "utility_score",
     ):
         compositions[column] = compositions[column].astype(float).clip(0.0, 1.0)
@@ -102,7 +104,7 @@ def evaluate_provisional_composition(
     qos_requirements: Mapping[str, Any] | None = None,
     objective_version: str = OBJECTIVE_VERSION,
 ) -> dict[str, Any]:
-    """Score a collaborative group using the paper's eight dimensions.
+    """Score a collaborative group with an explicit trust dimension.
 
     Update-signature cosine similarity is the available proxy for model-update
     alignment. This remains a ranking surrogate, not a measured ensemble result.
@@ -112,15 +114,23 @@ def evaluate_provisional_composition(
     total_latency = float(selected["latency"].astype(float).sum())
     mean_compute_time = float(selected["compute_time_s"].astype(float).mean())
     mean_accuracy = float(selected["metric_score"].astype(float).mean())
+    if objective_version == RECIPE_OBJECTIVE_VERSION:
+        counts = pd.to_numeric(selected["realised_sample_count"], errors="coerce").to_numpy(dtype=float)
+        quality = pd.to_numeric(selected["metric_score"], errors="coerce").to_numpy(dtype=float)
+        if not np.isfinite(counts).all() or (counts <= 0).any() or not np.isfinite(quality).all():
+            raise ValueError("recipe scoring requires verified training counts and finite quality")
+        mean_accuracy = float(np.average(quality, weights=counts))
+        total_latency = mean_latency
     mean_reliability = float(selected["reliability_score"].astype(float).mean())
-    mean_explainability = float(selected["explainability_score"].astype(float).mean())
+    mean_trust = _complete_mean(selected["trust_score"])
+    mean_explainability = _complete_mean(selected["explainability_score"])
     mean_resource_cost = float(selected["resource_cost_score"].astype(float).mean())
     if objective_version == LEGACY_OBJECTIVE_VERSION:
         data_compatibility = _dominant_fraction(selected["data_distribution"])
         data_evidence: dict[str, Any] | None = None
         indeterminate_fraction = None
         cost_efficiency = float(np.clip(1.0 - mean_resource_cost, 0.0, 1.0))
-    elif objective_version == OBJECTIVE_VERSION:
+    elif objective_version in {OBJECTIVE_VERSION, RECIPE_OBJECTIVE_VERSION}:
         data_compatibility, data_evidence, indeterminate_fraction = _data_parameter_compatibility(selected)
         cost_efficiency = float(np.clip(mean_resource_cost, 0.0, 1.0))
     else:
@@ -137,13 +147,15 @@ def evaluate_provisional_composition(
         "model_parameter_alignment": compute_composition_mus(selected.to_dict(orient="records")),
         "compute_time_compatibility": _homogeneity(selected["compute_time_s"]),
         "latency_feasibility": float(latency_feasibility),
-        "accuracy_compatibility": _homogeneity(selected["metric_score"]),
+        "accuracy_compatibility": mean_accuracy if objective_version == RECIPE_OBJECTIVE_VERSION else _homogeneity(selected["metric_score"]),
         "reliability_compatibility": _homogeneity(selected["reliability_score"]),
+        "trust_score": mean_trust,
         "explainability_score": mean_explainability,
         "cost_efficiency": cost_efficiency,
         # Aggregates are retained for QoS-target penalties and reportability.
         "mean_accuracy": mean_accuracy,
         "mean_reliability": mean_reliability,
+        "mean_trust": mean_trust,
         "mean_explainability": mean_explainability,
         "mean_compute_time": mean_compute_time,
         "total_latency": total_latency,
@@ -153,7 +165,7 @@ def evaluate_provisional_composition(
         "shs": float(np.mean([_dominant_fraction(selected[key]) for key in ("task_family", "modality", "model_type")])),
         "ses": _service_efficiency_score(selected, objective_version=objective_version),
         "hsq": mean_accuracy,
-        "srs": float(np.mean([selected[key].astype(float).mean() for key in ("reliability_score", "trust_score", "explainability_score")])),
+        "srs": float(np.mean([mean_reliability, mean_trust, mean_explainability])),
         "mean_latency": mean_latency,
     }
     if objective_version == LEGACY_OBJECTIVE_VERSION:
@@ -164,7 +176,18 @@ def evaluate_provisional_composition(
             data_evidence, sort_keys=True, separators=(",", ":")
         )
         scores["data_parameter_indeterminate_fraction"] = indeterminate_fraction
+    if objective_version == RECIPE_OBJECTIVE_VERSION:
+        scores.update(predicted_quality_score=mean_accuracy, predicted_latency_s_per_example=mean_latency,
+                      prediction_method="sample_weighted_catalogue_quality_v1",
+                      quality_metric_name=str(selected["primary_metric_name"].iloc[0]),
+                      latency_unit="seconds_per_example")
     return scores
+
+
+def _complete_mean(values: pd.Series) -> float:
+    """A group has no measured mean if any member lacks a measurement."""
+    numeric = pd.to_numeric(values, errors="coerce")
+    return float(numeric.mean()) if len(numeric) and numeric.map(finite).all() else float("nan")
 
 
 def calculate_utility(
@@ -183,7 +206,8 @@ def calculate_utility(
         "latency": scores.get("latency_feasibility", 1.0 / (1.0 + scores["mean_latency"])),
         "accuracy": scores.get("accuracy_compatibility", scores["hsq"]),
         "reliability": scores.get("reliability_compatibility", scores["srs"]),
-        "explainability": scores.get("explainability_score", scores["srs"]),
+        "trust": scores.get("trust_score", float("nan")),
+        "explainability": scores.get("explainability_score", float("nan")),
         "resource_cost": scores.get(
             "cost_efficiency",
             (
@@ -203,7 +227,12 @@ def calculate_utility(
     if total == 0.0:
         effective_weights = {name: 1.0 for name in dimensions}
         total = float(len(effective_weights))
-    objective = sum(dimensions[name] * effective_weights[name] for name in dimensions) / total
+    active = {name: weight for name, weight in effective_weights.items() if weight > 0.0}
+    missing = [name for name in active if not finite(dimensions[name])]
+    if missing:
+        raise ValueError(f"Requested objective dimensions lack measured scores: {missing}")
+    # Never multiply missing, unrequested dimensions by zero (NaN * 0 is NaN).
+    objective = sum(dimensions[name] * weight for name, weight in active.items()) / total
     return float(np.clip(
         objective
         - calculate_constraint_penalty(
@@ -233,11 +262,12 @@ def calculate_constraint_penalty(
         "max_latency": scores["total_latency"],
         "max_compute_time": scores["mean_compute_time"],
         "min_reliability": scores["mean_reliability"],
+        "min_trust": scores.get("mean_trust", float("nan")),
         "min_explainability": scores["mean_explainability"],
     }
     if objective_version == LEGACY_OBJECTIVE_VERSION:
         actuals["max_resource_cost"] = scores["mean_resource_cost"]
-    elif objective_version == OBJECTIVE_VERSION:
+    elif objective_version in {OBJECTIVE_VERSION, RECIPE_OBJECTIVE_VERSION}:
         actuals["min_resource_cost_score"] = scores.get(
             "mean_resource_cost_score", scores.get("mean_resource_cost", 0.5)
         )
@@ -248,6 +278,8 @@ def calculate_constraint_penalty(
         target = number(qos_requirements.get(name), np.nan)
         if not np.isfinite(target):
             continue
+        if not finite(actual):
+            raise ValueError(f"Requested QoS target '{name}' lacks a measured score")
         shortfall = target - actual if name.startswith("min_") else actual - target
         deviation = max(0.0, shortfall) / max(abs(target), 1e-12)
         violations.append((max(0.0, number(penalties.get(name), 1.0)), deviation**2))

@@ -2,6 +2,7 @@ PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS services (
   service_id              TEXT PRIMARY KEY,
+  family_id               TEXT,
   created_at              TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at              TEXT NOT NULL DEFAULT (datetime('now')),
   status                  TEXT NOT NULL DEFAULT 'completed',
@@ -140,7 +141,8 @@ CREATE TABLE IF NOT EXISTS service_generation_provenance (
   initial_state_hash          TEXT,
   family_document_ref         TEXT,
   family_document_hash        TEXT,
-  manifest_reference          TEXT,
+  client_recipe_ref           TEXT,
+  client_recipe_hash          TEXT,
   composition_compatible      INTEGER,
   parent_checkpoint_id        TEXT,
   cohort_id                   TEXT,

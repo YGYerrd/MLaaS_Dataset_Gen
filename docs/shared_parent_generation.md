@@ -85,7 +85,15 @@ all available rows instead of failing a preferred benchmark size: WNLI's 71 rows
 provide 36 catalogue examples and 35 audit examples. Only two evaluation examples
 are required to keep both partitions non-empty and disjoint. Ordinary classification
 is label-stratified; regression and token examples use deterministic sampling.
-The remaining evaluation examples form the common catalogue benchmark.
+The remaining evaluation pool is capped at **1,024 dataset examples** by default,
+using all remaining examples when fewer are available. Set `benchmark_sample_size`
+in config to change the cap and `evaluation_seed` (default `42`) to change the
+deterministic subset. Every service in a family uses that same frozen subset;
+the audit holdout and task-specific metric calculations are unchanged. The cap
+never depends on task, dataset, model, or training quantity.
+New independent families use preparation version `raw_source_family_v4`. Older
+frozen preparations remain readable for reconstruction, but executing the new
+policy requires a new manifest and service IDs, preserving historical metrics.
 Prepared feature/label hashes also detect changed data when clients or compositions
 reload the frozen source, even when example IDs and output shapes are unchanged.
 
@@ -209,7 +217,7 @@ Every CSV/XLSX row contains a hashed authoritative `client_recipe`. The manifest
 also binds complete cohort membership. Regenerate the manifest to change recipes;
 editing individual training fields invalidates their hashes.
 
-Data profiles (IID, Dirichlet, shard, quantity skew) are balanced. Each family has one explicit training space without resource tiers.
+Data profiles (IID, Dirichlet, shard) are balanced independently of sample counts. Each family has one explicit training space without resource tiers.
 New training recipes use `conditional_balancing_v4` and the shared
 [coarse task/backend policies](generation-policies.md). Compatibility families
 share these policies; the selected parent's recipe and quality do not add values

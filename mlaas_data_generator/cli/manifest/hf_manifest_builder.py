@@ -14,6 +14,8 @@ import pandas as pd
 from mlaas_data_generator.clients import recipes, training
 from mlaas_data_generator.provenance import sha256_json, canonical_json
 from mlaas_data_generator.family_preflight import hf_dataset_error, manifest_family_error
+from mlaas_data_generator.evaluation_sampling import evaluation_settings, task_benchmark_sample_size
+from mlaas_data_generator.evaluation_protocol import PLAN_CONFIG_KEYS, manifest_evaluation_defaults, resolve_evaluation_plan
 
 from mlaas_data_generator.clients.resources import (
     _as_float, _estimated_model_params_m, _unique_ints,
@@ -78,6 +80,7 @@ MANIFEST_PROFILES: dict[str, ManifestProfile] = {
 
 
 MANIFEST_COLUMNS = [
+    *PLAN_CONFIG_KEYS,
     "checkpoint_patch_operation_policy", "checkpoint_measure_full", "checkpoint_weight_format",
     "checkpoint_reduced_compression", "checkpoint_reduced_compression_level", "checkpoint_validation_samples", "checkpoint_quality_tolerance",
     "recipe_sampler_version", "training_policy", "training_policy_hash",
@@ -406,6 +409,7 @@ def _service_config(row: dict[str, Any]) -> str:
         "sample_seed": row.get("sample_seed"),
         "initialization_seed": row.get("initialization_seed"),
         "evaluation_seed": row.get("evaluation_seed"),
+        "benchmark_sample_size": row.get("benchmark_sample_size"),
         "training_seed": row.get("training_seed"),
         "max_length": row.get("max_length"),
         "timeout_s": row.get("timeout_s"),
@@ -416,8 +420,10 @@ def _service_config(row: dict[str, Any]) -> str:
         "precision_type": row.get("precision_type"),
         "save_weights": row.get("save_weights"),
         "enable_perturbation_metrics": row.get("enable_perturbation_metrics"),
+        "explainability_enabled": row.get("explainability_enabled"),
         "perturbation_sample_count": row.get("perturbation_sample_count"),
     }
+    payload.update({key: row[key] for key in PLAN_CONFIG_KEYS if key in row})
     if str(row.get("generation_mode") or "independent").strip().lower() == "fedavg":
         payload.update(
             {
@@ -720,7 +726,7 @@ def _row_from_registry(
         "momentum": knobs["momentum"],
         "sample_seed": sample_seed,
         "sample_size": sample_size,
-        "benchmark_sample_size": target_sample_size if training_regime == "inference_only" else None,
+        "benchmark_sample_size": task_benchmark_sample_size({"hf_task": task_spec.hf_task}),
         "max_length": max_length,
         "timeout_s": budgets["timeout_s"],
         "max_train_time_s": budgets["max_train_time_s"],
@@ -749,13 +755,10 @@ def _row_from_registry(
         "dynamic_padding": dataset_spec.get("dynamic_padding") if dataset_spec.get("dynamic_padding") is not None else task_spec.modality == "text",
         "column_mapping": json.dumps(dataset_spec.get("column_mapping"), sort_keys=True) if dataset_spec.get("column_mapping") else None,
         "explainability_enabled": bool((model.get("explainability") or dataset_spec.get("explainability") or {}).get("supported", True)),
-        "enable_perturbation_metrics": bool((model.get("explainability") or dataset_spec.get("explainability") or {}).get("supported", True)),
+        "enable_perturbation_metrics": True,
         "perturbation_stage_logging": True,
         "perturbation_progress_logging": False,
-        "perturbation_sample_count": 1,
-        "perturbation_candidate_units": 4,
-        "perturbation_target_units": 1,
-        "perturbation_trust_trials": 2,
+        **manifest_evaluation_defaults(),
         "perturbation_progress_sample_interval": 1,
         "perturbation_random_strength": 0.02,
         "explainability_method": _preferred_explainability(model, dataset_spec),
@@ -909,6 +912,7 @@ def _row_from_generic_case(
         "weight_decay": training_knobs["weight_decay"],
         "momentum": training_knobs["momentum"],
         "sample_size": target_sample_size,
+        "benchmark_sample_size": evaluation_settings({})["benchmark_sample_size"],
         "timeout_s": budgets["timeout_s"],
         "max_train_time_s": budgets["max_train_time_s"],
         "max_eval_time_s": budgets["max_eval_time_s"],
@@ -924,10 +928,7 @@ def _row_from_generic_case(
         "enable_perturbation_metrics": True,
         "perturbation_stage_logging": True,
         "perturbation_progress_logging": False,
-        "perturbation_sample_count": 1,
-        "perturbation_candidate_units": 4,
-        "perturbation_target_units": 1,
-        "perturbation_trust_trials": 2,
+        **manifest_evaluation_defaults(),
         "perturbation_progress_sample_interval": 1,
         "perturbation_random_strength": 0.02,
         "device": "auto",
@@ -1118,6 +1119,7 @@ def build_hf_manifest(
     clients_per_family: int | None = None,
     initialization_seed: int | None = None,
     evaluation_seed: int | None = None,
+    metric_evaluation_profile: str = "benchmark",
     heterogeneity_intensity: float = 0.5,
     average_samples: int | None = None,
     regression_support_policy: str = "general",
@@ -1136,7 +1138,8 @@ def build_hf_manifest(
     knob_variants_per_pair = (knob_variants_per_pair or 1) if variants_explicit or generation_mode == "fedavg" else (clients_per_family or 100)
     seed = _resolve_manifest_seed(seed)
     initialization_seed = seed if initialization_seed is None else int(initialization_seed)
-    evaluation_seed = seed if evaluation_seed is None else int(evaluation_seed)
+    evaluation_seed = evaluation_settings({"evaluation_seed": evaluation_seed})["evaluation_seed"]
+    resolve_evaluation_plan({"metric_evaluation_profile": metric_evaluation_profile})
     rng = random.Random(seed)
     profile = _resolve_manifest_profile(manifest_profile)
     budgets = {"timeout_s": timeout_s, "max_train_time_s": max_train_time_s, "max_eval_time_s": max_eval_time_s}
@@ -1196,6 +1199,8 @@ def build_hf_manifest(
         for run_index, (base_row, intensity) in enumerate(zip(run_seeds, intensities)):
             base_row = dict(base_row)
             base_row["fedavg_source_pool_cap"] = fedavg_source_pool_cap
+            base_row["evaluation_seed"] = evaluation_seed
+            base_row.update(manifest_evaluation_defaults(metric_evaluation_profile))
             rows.extend(
                 expand_fedavg_run(
                     base_row,
@@ -1386,6 +1391,9 @@ def build_hf_manifest(
                     training.validate_training_recipe(row)
                 row["service_id"] = _service_id("svc", {k: v for k, v in row.items() if k != "service_config"})
                 row["service_config"] = _service_config(row)
+    for row in rows:
+        row.update(manifest_evaluation_defaults(metric_evaluation_profile))
+        row["service_config"] = _service_config(row)
     df = pd.DataFrame(rows)
     if not df.empty:
         df["seed"] = seed
@@ -1400,7 +1408,9 @@ def build_hf_manifest(
             df["training_seed"] = df["sample_seed"]
         else:
             df["training_seed"] = df["training_seed"].fillna(df["sample_seed"])
-        df["service_id"] = df["service_id"].map(lambda sid: _service_id("svc", {"recipe": sid, "initialization_seed": initialization_seed, "evaluation_seed": evaluation_seed}))
+        evaluation_plan = resolve_evaluation_plan({"metric_evaluation_profile": metric_evaluation_profile, "evaluation_seed": evaluation_seed})
+        df["service_id"] = df["service_id"].map(lambda sid: _service_id("svc", {"recipe": sid,
+            "initialization_seed": initialization_seed, "evaluation_seed": evaluation_seed, "metric_evaluation_plan": evaluation_plan}))
         df["service_config"] = df.apply(lambda row: json.dumps({
             **json.loads(row["service_config"]),
             **{key: int(row[key]) for key in ("seed", "sample_seed", "initialization_seed", "evaluation_seed", "training_seed")},
@@ -1528,6 +1538,7 @@ def main() -> None:
     parser.add_argument("--clients-per-family", type=int)
     parser.add_argument("--initialization-seed", type=int, help="Optional initialization override; defaults to --seed.")
     parser.add_argument("--evaluation-seed", type=int, help="Optional evaluation override; defaults to --seed.")
+    parser.add_argument("--metric-evaluation-profile", choices=("benchmark", "diagnostic", "pilot", "production"), default="benchmark")
     parser.add_argument("--heterogeneity-intensity", type=float, default=0.5)
     parser.add_argument("--regression-support-policy", choices=("general", "specialist"), default="general")
     parser.add_argument("--min-target-bin-fraction", type=float, default=0.6)
@@ -1554,6 +1565,7 @@ def main() -> None:
         clients_per_family=args.clients_per_family,
         initialization_seed=args.initialization_seed,
         evaluation_seed=args.evaluation_seed,
+        metric_evaluation_profile=args.metric_evaluation_profile,
         heterogeneity_intensity=args.heterogeneity_intensity,
         regression_support_policy=args.regression_support_policy,
         min_target_bin_fraction=args.min_target_bin_fraction,

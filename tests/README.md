@@ -13,8 +13,10 @@ restored token, generation-preprocessor and image-adapter fixtures:
 | --- | --- |
 | Manifest creation, validation and resume | `generator/test_service_manifest_pipeline.py` |
 | Historical recipe calibration, diversity and replay | `generator/test_recipe_calibration.py` |
+| Distribution profiles, independent sample counts and frozen roster replay | `generator/test_distribution_profiles.py` |
 | Prediction diversity and frozen family diagnostics | `generator/test_behavioural_diagnostics.py` |
 | Service execution and metrics | `generator/test_service_runner.py` |
+| Versioned evaluation, task outputs and evidence | `generator/test_production_evaluation.py`, `generator/test_evaluation_outputs.py`, `generator/test_evaluation_integration.py` |
 | SQLite records and artifacts | `generator/test_service_storage.py` |
 | Exact checkpoint integrity and reconstruction | `generator/test_checkpoint_store.py` |
 | Checkpoint quality verification | `generator/test_checkpoint_verification.py` |

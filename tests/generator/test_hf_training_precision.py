@@ -66,6 +66,61 @@ def test_half_loaded_model_updates_with_scaler_and_accumulation(bad_call):
     assert result["train_loss"] == pytest.approx(1.)
 
 
+@pytest.mark.parametrize("accumulation", [1, 2])
+@pytest.mark.parametrize("use_scaler,skipped_steps", [
+    (False, ()), (True, ()), (True, (1,)), (True, (2,)), (True, (1, 2, 3)),
+])
+@pytest.mark.filterwarnings("error:Detected call of.*lr_scheduler.step")
+def test_warmup_advances_only_after_optimizer_updates(monkeypatch, accumulation,
+                                                      use_scaler, skipped_steps):
+    core = tiny_core()
+    if use_scaler:
+        core.grad_scaler = torch.amp.GradScaler("cpu", init_scale=128., growth_interval=1)
+    else:
+        core.grad_scaler = None
+        core.autocast_enabled = False
+
+    backward_calls = 0
+
+    def overflow_selected_steps(grad):
+        nonlocal backward_calls
+        backward_calls += 1
+        step = (backward_calls - 1) // accumulation + 1
+        return grad * float("inf") if step in skipped_steps else grad
+
+    core.model.weight.register_hook(overflow_selected_steps)
+    schedulers = []
+    update_lrs = []
+    original_scheduler = torch.optim.lr_scheduler.LambdaLR
+
+    def record_scheduler(optimizer, **kwargs):
+        optimizer.register_step_pre_hook(
+            lambda opt, *_: update_lrs.append(opt.param_groups[0]["lr"]))
+        scheduler = original_scheduler(optimizer, **kwargs)
+        schedulers.append(scheduler)
+        return scheduler
+
+    monkeypatch.setattr(torch.optim.lr_scheduler, "LambdaLR", record_scheduler)
+    # Three update attempts, including a partial final accumulation window.
+    samples = core.batch_size * (2 * accumulation + 1)
+    result = core.finetune(np.ones(samples), np.zeros(samples), epochs=1, lr=.1,
+                          optimizer="sgd", warmup_ratio=1.,
+                          gradient_accumulation_steps=accumulation,
+                          max_train_time_s=None)
+
+    successful_steps = 3 - len(skipped_steps)
+    assert result["optimizer_step_count"] == result["planned_optimizer_step_count"] == 3
+    assert result["successful_optimizer_step_count"] == successful_steps
+    assert result["skipped_optimizer_step_count"] == len(skipped_steps)
+    assert result["train_sequence_count"] == samples
+    assert result["warmup_steps"] == 3
+    assert schedulers[0].last_epoch == successful_steps
+    assert update_lrs == pytest.approx([.1 / 3, .2 / 3, .1][:successful_steps])
+    assert schedulers[0].get_last_lr() == pytest.approx([.1 * min(successful_steps + 1, 3) / 3])
+    if successful_steps == 0:
+        assert core.model.weight.item() == 1.
+
+
 def test_nonfinite_fp32_retry_still_fails_without_update():
     core = tiny_core(always_bad=True)
     with pytest.raises(ValueError, match="nonfinite_training_loss"):

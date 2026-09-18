@@ -21,6 +21,7 @@ from mlaas_data_generator.fedavg_aggregation import (
 
 from .regeneration import execute_tensor_state_prediction
 from .validation import CohortPlan
+from .raw_family import RAW_FAMILY_VERSIONS
 
 
 class FedAvgValidationError(ValueError):
@@ -47,6 +48,11 @@ class FedAvgProvenanceError(FedAvgValidationError):
 class FedAvgCheckpointError(FedAvgValidationError):
     stage = "checkpoint"
     code = "checkpoint_integrity_failed"
+
+
+class FedAvgReconstructionError(FedAvgValidationError):
+    stage = "reconstruction"
+    code = "recipe_reconstruction_failed"
 
 
 class FedAvgAggregationExecutionError(FedAvgValidationError):
@@ -113,6 +119,11 @@ def resolve_selected_fedavg_members(
             marks = ",".join("?" for _ in ordered_ids)
             versions = [r[0] for r in conn.execute(
                 f"SELECT family_contract_version FROM service_generation_provenance WHERE service_id IN ({marks})", ordered_ids)]
+            if any(v in RAW_FAMILY_VERSIONS for v in versions):
+                if len(versions) != len(ordered_ids) or len(set(versions)) != 1:
+                    raise FedAvgProvenanceError("composition mixes raw-source and historical families")
+                from .recipe_execution import resolve_members
+                return resolve_members(db_path, ordered_ids)
             if any(v in {"independent_family_v1", "independent_family_v2"} for v in versions):
                 if len(versions) != len(ordered_ids) or len(set(versions)) != 1:
                     raise FedAvgProvenanceError("composition mixes independent families and historical services")
@@ -406,11 +417,14 @@ def _resolve_shared_parent_members(db_path, service_ids) -> list[SelectedFedAvgM
 
 
 def execute_selected_fedavg_composition(
-    *, db_path: str | Path, service_ids: Sequence[str], plan: CohortPlan
+    *, db_path: str | Path, service_ids: Sequence[str], plan: CohortPlan, device: str = "cpu"
 ) -> FedAvgCompositionExecution:
     """Aggregate selected client parameters and execute one resulting model."""
     members = resolve_selected_fedavg_members(db_path, service_ids)
     first = members[0]
+    if first.row.get("family_contract_version") in RAW_FAMILY_VERSIONS:
+        from .recipe_execution import execute_composition
+        return execute_composition(db_path, members, plan, device=device)
     if first.row.get("generation_mode") == "shared_parent" or first.row.get("family_contract_version") in {"independent_family_v1", "independent_family_v2"}:
         reservation = first.row["parent_document"]["reservation"]
         for requested, field in ((plan.training_ids, "training_ids"),

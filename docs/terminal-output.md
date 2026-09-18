@@ -89,7 +89,7 @@ Illustrative FedAvg excerpt (the shared run summary above the rounds is unchange
 Participants: 3/4
 Not participating: client_001
 
-[1/3] client_000 | quantity_skew ×2.69 | n=1501 | classes=753/748 | majority=50.2% | H=1.000
+[1/3] client_000 | iid | n=1501 | classes=753/748 | majority=50.2% | H=1.000
 AdamW | bs=8 | lr=2e-05 | epochs=1 | acc=0.721 | F1=0.716 | train=10.1s
 
 [2/3] client_002 | dirichlet α=0.124 | n=557 | classes=412/145 | majority=74.0% | H=0.827

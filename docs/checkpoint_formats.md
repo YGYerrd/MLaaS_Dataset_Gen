@@ -1,6 +1,7 @@
 # Checkpoint formats and settings
 
-New manifests save final neural-model weights as INT8 Safetensors. Training,
+Supported independent services default to [recipe-only retention](client-reconstruction.md).
+When client checkpoints are retained, new manifests save final neural-model weights as INT8 Safetensors. Training,
 catalogue evaluation, update signatures, original model hashes and execution dtypes
 remain unchanged. Only the stored representation is reduced. Existing manifests and
 checkpoint artifacts retain their saved behavior.
@@ -37,10 +38,12 @@ reported separately as `reduced_quality` in the checkpoint profile.
 
 ## Identity, integrity and downstream loading
 
-Normal manifest startup skips a service immediately when its database status is
-`completed`. It does not bind its family preparation, inspect checkpoint files,
-hash payloads or reconstruct weights. Checkpoint verification remains separate from
-normal resume. `--rerun-existing` explicitly bypasses this skip. Manifest progress
+Normal manifest startup skips a service when its `(family_id, service_id)` database
+record is `completed`. Older inputs that omit a computed family ID retain the
+globally unique service-ID lookup for compatibility. Resume does not depend on a
+manifest filename, row position, size, hash or sidecar binding. Checkpoint
+verification remains separate from normal resume. `--rerun-existing` explicitly
+bypasses this skip. Manifest progress
 prints at most once every ten seconds plus a final summary, without redrawing a bar
 after other output.
 
@@ -78,10 +81,10 @@ reload_hash = restore_service_state("outputs/service_artifacts_int8", service_id
 remains in the service's `final_model_hash` and the representation's source hash.
 
 New HF exports freeze storage settings in both expanded and compact manifests. New
-cohort exports carry `checkpoint_storage_options` separately from the frozen training
-recipe. Existing manifests keep their original settings. Regenerating a manifest does
-not convert or overwrite completed services. All 1,000 current-run recipe bindings
-were checked against the updated resolver and matched.
+cohort exports carry `checkpoint_storage_options` separately from the training
+recipe. Regenerating, renaming or reordering a manifest does not convert or overwrite
+completed services; the database and referenced artifacts are authoritative after
+execution.
 
 Representations are implemented through `reduced_checkpoint.REPRESENTATIONS` with
 separate encode/decode methods and versioned layout metadata. The default `int8`

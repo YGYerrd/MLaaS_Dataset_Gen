@@ -4,6 +4,7 @@ These reference workloads are not quality thresholds or clearance for new
 quantities/recipes. Existing frozen policies do not acquire them retroactively.
 """
 from copy import deepcopy
+from .legacy_profiles import UNIFORM_PROFILE as LEGACY_UNIFORM_PROFILE
 
 
 VIT_SVHN_REFERENCE = {
@@ -46,7 +47,7 @@ def requirements(recipe):
 
 
 def validate_realized_coverage(recipe, targets):
-    if recipe.get("split_strategy", "iid") in {"iid", "quantity_skew"}:
+    if recipe.get("split_strategy", "iid") in {"iid", LEGACY_UNIFORM_PROFILE}:
         # Uniform sampling does not promise class coverage. Missing a rare
         # source class must not invalidate an otherwise valid IID client.
         return

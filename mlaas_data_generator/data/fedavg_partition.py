@@ -12,6 +12,8 @@ import numpy as np
 from .image_store import DiskArrayStore
 
 from mlaas_data_generator.fedavg_manifest import PARTITION_GENERATOR_VERSION
+from ..clients.legacy_profiles import UNIFORM_PROFILE as LEGACY_UNIFORM_PROFILE
+from ..clients.legacy_profiles import ALIASES as LEGACY_PROFILE_ALIASES
 
 from .skew_axes import ResolvedSkewAxis, resolve_skew_axis
 from .splitters import split_data
@@ -61,8 +63,7 @@ def _take_rows(value, indices: np.ndarray):
 def _strategy(value: Any) -> str:
     strategy = str(value or "iid").strip().lower().replace("-", "_")
     aliases = {
-        "quantity": "quantity_skew",
-        "quantity_skewed": "quantity_skew",
+        **LEGACY_PROFILE_ALIASES,
         "niid": "dirichlet",
         "non_iid": "dirichlet",
         "non_iid_dirichlet": "dirichlet",
@@ -212,11 +213,11 @@ def scale_requested_quotas(
             effective[donor] -= 1
             effective[low] += 1
             continue
-        raise ValueError("Integer quota scaling cannot satisfy the quantity-skew ratio")
+        raise ValueError("Integer quota scaling cannot satisfy the historical quota ratio")
     if len(quantity_indices) >= 2:
         values = effective[quantity_indices]
         if int(values.max()) / int(values.min()) > bound + 1e-12:
-            raise ValueError("Integer quota scaling violates the quantity-skew ratio")
+            raise ValueError("Integer quota scaling violates the historical quota ratio")
     return effective
 
 
@@ -287,7 +288,7 @@ def _target_counts(
             selected_bucket_count=selected_count,
             selected_bucket_labels=[bucket_labels[index] for index in selected],
         )
-    elif strategy not in {"iid", "quantity_skew", "dirichlet", "shard"}:
+    elif strategy not in {"iid", LEGACY_UNIFORM_PROFILE, "dirichlet", "shard"}:
         raise ValueError(f"Unsupported FedAvg partition strategy: {strategy}")
 
     counts = _largest_remainder_counts(
@@ -311,7 +312,7 @@ def _sample_target_counts(
 ) -> np.ndarray:
     """Keep feasible targets intact; redraw only clients that cannot fit.
 
-    Reserve fixed IID/quantity targets first, then restricted shard targets,
+    Reserve uniform targets first, then restricted shard targets,
     then Dirichlet targets. The order is stable under input permutations.
     No allocation is enlarged to consume unused source rows.
     """
@@ -319,7 +320,7 @@ def _sample_target_counts(
     if np.all(accepted.sum(axis=0) <= capacities):
         return accepted
     remaining = capacities.copy()
-    priority = {"iid": 0, "quantity_skew": 0, "shard": 1, "dirichlet": 2}
+    priority = {"iid": 0, LEGACY_UNIFORM_PROFILE: 0, "shard": 1, "dirichlet": 2}
     order = sorted(
         range(len(specs)),
         key=lambda i: (priority[_strategy(specs[i].strategy)], specs[i].client_id),
@@ -432,7 +433,7 @@ def plan_fedavg_partitions(
         total,
         client_ids=[spec.client_id for spec in ordered_specs],
         quantity_clients=[
-            _strategy(spec.strategy) == "quantity_skew"
+            _strategy(spec.strategy) == LEGACY_UNIFORM_PROFILE
             and not (spec.requested_partition_params or {}).get("quantity_sampler_version")
             for spec in ordered_specs
         ],

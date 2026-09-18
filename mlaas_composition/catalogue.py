@@ -23,6 +23,9 @@ SERVICE_COLUMNS = [
     "fl_run_id", "client_id", "round_id", "compatibility_contract_hash",
     "family_id", "parent_checkpoint_id", "cohort_id", "cohort_succeeded",
     "family_contract_version", "initial_state_hash", "composition_compatible",
+    "family_document_ref", "family_document_hash", "client_recipe_ref", "client_recipe_hash",
+    "weight_retention", "realised_sample_count", "composition_eligibility_reason",
+    "composition_latency_s_per_example", "composition_latency_source",
     "parent_global_round", "parent_state_hash", "participated", "fedavg_succeeded",
     "partition_generator_version", "heterogeneity_intensity", "target_deviation_count",
     # Independently measured service quality and QoS.
@@ -30,6 +33,9 @@ SERVICE_COLUMNS = [
     "data_volume", "resource_cost_score", "data_distribution", "compute_time_s",
     "batch_size", "model_parameters", "training_loss", "reliability_score",
     "trust_score", "explainability_score",
+    "trust_independent_inputs", "explainability_independent_inputs",
+    "evaluation_protocol_version", "trust_status", "explainability_status",
+    "trust_evidence_sufficient", "explainability_evidence_sufficient",
     # Optional artifacts consumed by downstream collaborative evaluation.
     "prediction_artifact_path", "prediction_artifact_type", "update_signature_id",
     "update_signature_path", "signature_dim", "signature_norm",
@@ -116,6 +122,35 @@ def load_services_from_db(
                                              ("evaluation_protocol_hash", contract.protocol_hash),
                                              ("task_tag", contract.semantics.get("task_tag"))):
                             rows.loc[mask, field] = value
+            if "client_recipe_ref" in provenance_fields:
+                from .raw_family import RAW_FAMILY_VERSIONS, verified_member, latency_per_example
+                raw = pd.read_sql_query("SELECT * FROM service_generation_provenance", conn)
+                raw = raw[raw.family_contract_version.isin(RAW_FAMILY_VERSIONS)].set_index("service_id")
+                cache = {}
+                for index in rows.index[rows.service_id.isin(raw.index)]:
+                    sid = rows.at[index, "service_id"]
+                    for field in ("family_id", "family_contract_version", "initial_state_hash",
+                                  "family_document_ref", "family_document_hash", "client_recipe_ref",
+                                  "client_recipe_hash", "client_id", "parent_state_hash"):
+                        rows.loc[index, field] = raw.at[sid, field]
+                    rows.loc[index, "composition_compatible"] = 0
+                    try:
+                        member = verified_member(db_path, sid, cache=cache)
+                        if not finite(rows.at[index, "metric_score"]) or not 0 <= float(rows.at[index, "metric_score"]) <= 1:
+                            raise ValueError("raw-source service has no valid measured quality score")
+                        if not finite(rows.at[index, "latency"]) or float(rows.at[index, "latency"]) < 0:
+                            raise ValueError("raw-source service has no measured inference latency")
+                        if not _present_text(rows.at[index, "primary_metric_name"]):
+                            raise ValueError("raw-source service has no named primary quality metric")
+                        latency, latency_source = latency_per_example(member["recipe"])
+                        rows.loc[index, "composition_latency_s_per_example"] = latency
+                        rows.loc[index, "composition_latency_source"] = latency_source
+                        rows.loc[index, "composition_compatible"] = 1
+                        rows.loc[index, "weight_retention"] = member["weight_retention"]
+                        rows.loc[index, "realised_sample_count"] = member["sample_count"]
+                        rows.loc[index, "composition_eligibility_reason"] = "verified_raw_source_family"
+                    except Exception as error:
+                        rows.loc[index, "composition_eligibility_reason"] = f"{type(error).__name__}: {error}"
         elif "flattened_services" in tables:
             rows = pd.read_sql_query(_FLATTENED_SERVICE_QUERY, conn)
         else:
@@ -215,7 +250,14 @@ def _normalized_service_query(
             MAX(CASE WHEN metric_name = 'batch_size' THEN num_value END) AS batch_size,
             MAX(CASE WHEN metric_name = 'reliability_score' THEN num_value END) AS reliability_score,
             MAX(CASE WHEN metric_name = 'trust_score' THEN num_value END) AS trust_score,
-            MAX(CASE WHEN metric_name = 'explainability_score' THEN num_value END) AS explainability_score
+            MAX(CASE WHEN metric_name = 'explainability_score' THEN num_value END) AS explainability_score,
+            MAX(CASE WHEN metric_name = 'trust_independent_inputs' THEN num_value END) AS trust_independent_inputs,
+            MAX(CASE WHEN metric_name = 'explainability_independent_inputs' THEN num_value END) AS explainability_independent_inputs,
+            MAX(CASE WHEN metric_name = 'evaluation_protocol_version' THEN text_value END) AS evaluation_protocol_version,
+            MAX(CASE WHEN metric_name = 'trust_status' THEN text_value END) AS trust_status,
+            MAX(CASE WHEN metric_name = 'explainability_status' THEN text_value END) AS explainability_status,
+            MAX(CASE WHEN metric_name = 'trust_evidence_sufficient' THEN text_value END) AS trust_evidence_sufficient,
+            MAX(CASE WHEN metric_name = 'explainability_evidence_sufficient' THEN text_value END) AS explainability_evidence_sufficient
         FROM m GROUP BY service_id
     ), a AS (
         SELECT service_id,
@@ -239,6 +281,9 @@ def _normalized_service_query(
         p.update_signature_id, COALESCE(p.update_signature_path, a.artifact_update_signature_path) AS update_signature_path,
         p.signature_dim, p.signature_norm, p.compute_time_s, p.batch_size,
         p.reliability_score, p.trust_score, p.explainability_score,
+        p.trust_independent_inputs, p.explainability_independent_inputs,
+        p.evaluation_protocol_version, p.trust_status, p.explainability_status,
+        p.trust_evidence_sufficient, p.explainability_evidence_sufficient,
         a.prediction_artifact_path, a.prediction_artifact_type
     FROM services s LEFT JOIN p ON p.service_id = s.service_id
     LEFT JOIN a ON a.service_id = s.service_id
@@ -303,7 +348,7 @@ _FLATTENED_SERVICE_QUERY = """
         "Mean compute time" AS compute_time_s,
         "Batch size" AS batch_size,
         0.5 AS reliability_score,
-        0.5 AS trust_score,
+        NULL AS trust_score,
         "Explainability score" AS explainability_score,
         '' AS prediction_artifact_path,
         '' AS prediction_artifact_type,
@@ -340,8 +385,24 @@ def normalise_service_rows(rows: pd.DataFrame) -> pd.DataFrame:
         services[column] = services[column].map(lambda value: max(0.0, number(value, 0.0)))
     services["resource_cost_score"] = services["resource_cost_score"].map(lambda value: bounded_number(value, 0.5))
     services["batch_size"] = services["batch_size"].map(lambda value: max(1, int(number(value, 1.0))))
-    for column in ("reliability_score", "trust_score", "explainability_score"):
-        services[column] = services[column].map(lambda value: bounded_number(value, 0.5))
+    services["reliability_score"] = services["reliability_score"].map(lambda value: bounded_number(value, 0.5))
+    services["evaluation_protocol_version"] = services["evaluation_protocol_version"].map(
+        lambda value: str(value).strip() if _present_text(value) else "legacy_unversioned"
+    )
+    for dimension in ("trust", "explainability"):
+        services[f"{dimension}_independent_inputs"] = services[f"{dimension}_independent_inputs"].map(
+            lambda value: int(float(value)) if finite(value) and float(value) >= 0 and float(value).is_integer() else np.nan)
+        # Missing, non-finite and invalid scores remain missing; they are never
+        # replaced by a plausible-looking neutral quality measurement.
+        services[f"{dimension}_score"] = services[f"{dimension}_score"].map(
+            lambda value: number(value) if finite(value) and 0.0 <= float(value) <= 1.0 else np.nan
+        )
+        services[f"{dimension}_status"] = services[f"{dimension}_status"].map(
+            lambda value: str(value).strip().lower() if _present_text(value) else "insufficient_evidence"
+        )
+        services[f"{dimension}_evidence_sufficient"] = services[f"{dimension}_evidence_sufficient"].map(
+            lambda value: str(value).strip().lower() in {"true", "1", "1.0"}
+        )
     services["signature_dim"] = services["signature_dim"].map(lambda value: int(number(value, 0.0)) if finite(value) else None)
     services["signature_norm"] = services["signature_norm"].map(lambda value: number(value, np.nan))
     for column in ("round_id", "parent_global_round", "participated", "fedavg_succeeded", "cohort_succeeded", "composition_compatible"):

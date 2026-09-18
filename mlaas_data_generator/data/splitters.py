@@ -2,6 +2,7 @@ import numpy as np
 from numpy.random import Generator, default_rng
 
 from .skew_axes import axis_supports_strategy, bucket_distribution, resolve_skew_axis
+from ..clients.legacy_profiles import UNIFORM_PROFILE as LEGACY_UNIFORM_PROFILE
 
 
 def _take(x, idx):
@@ -91,7 +92,8 @@ def _split_iid(x, y, num_clients, rng=None):
     return _build_clients_from_indices(x, y, {f"client_{i+1}": split for i, split in enumerate(splits)})
 
 
-def _split_quantity_skew(x, y, num_clients, alpha, rng=None, bucket_ids=None):
+def _split_legacy_client_sizes(x, y, num_clients, alpha, rng=None, bucket_ids=None):
+    """Replay historical multi-client size draws; new recipes freeze each quota."""
     n = _num_samples(x)
     seed = _seed(rng)
     proportions = seed.dirichlet([alpha] * num_clients)
@@ -276,12 +278,12 @@ def split_data(
         clients = _split_iid(x, y, num_clients, rng=rng)
         return _resize_clients_to_sample_size(clients, x, y, sample_size, rng=rng), resolved
 
-    if strategy == "quantity_skew":
+    if strategy == LEGACY_UNIFORM_PROFILE:
         alpha = float(distribution_param) if distribution_param is not None else 1.0
         if alpha <= 0:
-            raise ValueError("alpha must be > 0 for quantity_skew.")
+            raise ValueError("alpha must be > 0 for historical client-size sampling.")
         resolved["distribution_param"] = alpha
-        clients = _split_quantity_skew(x, y, num_clients, alpha, rng=rng, bucket_ids=axis.bucket_ids)
+        clients = _split_legacy_client_sizes(x, y, num_clients, alpha, rng=rng, bucket_ids=axis.bucket_ids)
         return _resize_clients_to_sample_size(clients, x, y, sample_size, rng=rng), resolved
 
     if strategy == "custom":

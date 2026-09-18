@@ -117,6 +117,29 @@ def print_service_summary(config, metrics, checkpoint=None, *, status="success",
           f"| eval={seconds(metric('evaluation_runtime_s', 'eval_runtime_s'))} | checkpoint={seconds(save_time)}", flush=True)
     if runtime is not None and float(runtime) > 0 and save_time is not None:
         print(f"  checkpoint={100 * float(save_time) / float(runtime):.1f}% of runtime", flush=True)
+    print("\nTrust / Explainability", flush=True)
+    for dimension in ("trust", "explainability"):
+        evidence = metric(f"{dimension}_evaluation") or {}
+        score = metric(f"{dimension}_score")
+        evidence_status = ("disabled" if metric("metric_evaluation_disabled") else
+                           metric(f"{dimension}_status") or ("unverified" if score is not None else "unavailable"))
+        duration = metric(f"{dimension}_duration_s")
+        if duration is None:
+            duration = evidence.get("duration_s")
+        parts = [f"{dimension}_score={_number(score, '.4f')}", f"status={evidence_status}",
+                 f"time={seconds(duration)}"]
+        count = metric(f"{dimension}_independent_inputs")
+        if count is not None:
+            parts.append(f"n={_number(count, ',.0f')}")
+        if evidence.get("sample_coverage") is not None:
+            parts.append(f"coverage={_number(evidence['sample_coverage'], '.1%')}")
+        print("  " + " | ".join(parts), flush=True)
+        reasons = metric(f"{dimension}_insufficiency_reasons") or evidence.get("insufficiency_reasons") or []
+        causes = list(evidence.get("exclusion_reasons", {})) + list(evidence.get("failure_reasons", {}))
+        if reasons or causes:
+            print("    reasons=" + ", ".join(dict.fromkeys([*reasons, *causes])), flush=True)
+    if metric("metric_evaluation_resumed"):
+        print("  Evaluation times include work from earlier attempts.", flush=True)
     latency = scaled(metric("inference_latency_s", "eval_latency_s_mean", "latency"), 1000)
     p95 = scaled(metric("inference_latency_s_p95", "eval_latency_s_p95", "tail_latency"), 1000)
     print(f"\nInference\n  latency={_number(latency, '.1f')}ms | p95={_number(p95, '.1f')}ms "
@@ -129,6 +152,12 @@ def print_service_summary(config, metrics, checkpoint=None, *, status="success",
     from .debug_mode import weights_disabled
     if weights_disabled(config):
         selected_format = "disabled (debug: no weight files)"
+    elif config.get("weight_retention") == "recipe_only":
+        from .client_reconstruction import retention_settings
+        if not retention_settings(config)["client_checkpoint_retained"]:
+            selected_format = "recipe_only (family + recipe; no client weights)"
+        else:
+            selected_format += " (recipe_only validation reference)"
     print(f"\nCheckpoint\n  format={selected_format} | size={_number(scaled(selected, 1e-6), '.2f')} MB "
           f"| compression={_number(ratio, '.2f')}x", flush=True)
     if restore_verify_s is None:
@@ -168,8 +197,6 @@ def _compact_client(config, partition, metrics, *, position, participants):
         params = json.loads(params)
     if strategy == "dirichlet":
         strategy += f" α={_number(params.get('alpha', config.get('distribution_param')), '.3g')}"
-    elif strategy == "quantity_skew":
-        strategy += f" ×{_number(params.get('quota_multiplier', config.get('distribution_param')), '.3g')}"
     elif strategy == "shard":
         strategy += f" k={params.get('selected_bucket_count', partition.get('represented_bucket_count', 'n/a'))}"
     histogram = partition.get("realised_bucket_counts") or partition.get("bucket_histogram") or {}
@@ -220,7 +247,6 @@ def print_client_completion(config, partition, metrics, *, status, error=None, p
         params = json.loads(params)
     important = {
         "dirichlet": ("alpha", params.get("alpha", config.get("distribution_param"))),
-        "quantity_skew": ("quota multiplier", params.get("quota_multiplier", config.get("distribution_param"))),
         "shard": ("selected buckets", params.get("selected_bucket_count", partition.get("represented_bucket_count"))),
     }.get(strategy, ("strategy parameter", config.get("distribution_param")))
     histogram = partition.get("realised_bucket_counts") or partition.get("bucket_histogram") or {}

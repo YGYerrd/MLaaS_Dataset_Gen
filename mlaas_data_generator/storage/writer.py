@@ -107,7 +107,8 @@ class SQLiteWriter:
             ("initial_state_hash", "TEXT"),
             ("family_document_ref", "TEXT"),
             ("family_document_hash", "TEXT"),
-            ("manifest_reference", "TEXT"),
+            ("client_recipe_ref", "TEXT"),
+            ("client_recipe_hash", "TEXT"),
             ("composition_compatible", "INTEGER"),
             ("parent_checkpoint_id", "TEXT"),
             ("cohort_id", "TEXT"),
@@ -123,6 +124,22 @@ class SQLiteWriter:
                 self.conn.execute(
                     f"ALTER TABLE service_generation_provenance ADD COLUMN {name} {sql_type}"
                 )
+
+        service_columns = {
+            row[1] for row in self.conn.execute("PRAGMA table_info(services)")
+        }
+        if "family_id" not in service_columns:
+            self.conn.execute("ALTER TABLE services ADD COLUMN family_id TEXT")
+            self.conn.execute(
+                "UPDATE services SET family_id=("
+                "SELECT family_id FROM service_generation_provenance "
+                "WHERE service_generation_provenance.service_id=services.service_id"
+                ") WHERE family_id IS NULL"
+            )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_services_family_service "
+            "ON services(family_id,service_id,status)"
+        )
 
         checkpoint_columns = {
             row[1] for row in self.conn.execute("PRAGMA table_info(service_checkpoint_storage)")
@@ -430,7 +447,7 @@ class SQLiteWriter:
 
     def write_service_metrics(self, service_id: str, values: Mapping[str, Any]) -> None:
         for metric_name, spec in (values or {}).items():
-            if spec is None:
+            if spec is None and metric_name not in {"trust_score", "explainability_score"}:
                 continue
             self.write_service_metric(service_id, metric_name, spec)
 
@@ -446,7 +463,7 @@ class SQLiteWriter:
             unit = None
             direction = _infer_metric_direction(metric_name)
 
-        if value is None:
+        if value is None and metric_name not in {"trust_score", "explainability_score"}:
             return
         if domain not in ALLOWED_METRIC_DOMAINS:
             domain = "metadata"
@@ -976,7 +993,7 @@ class SQLiteWriter:
             return out
 
         if isinstance(value, float):
-            if np.isnan(value):
+            if not np.isfinite(value):
                 out["value_json"] = json.dumps(None)
             else:
                 out["value_num"] = value

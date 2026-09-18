@@ -1,14 +1,15 @@
 # Catalogue-informed recipe generation
 
 Client data selection now follows [Stage A + B](tokenization-selection.md): IID
-and quantity skew use uniform raw rows, skewed profiles require an explicit axis,
+uses uniform raw rows, skewed profiles require an explicit axis,
 and `sample_size` is honored without a second capacity scaling in the allocator.
 This supersedes the historical sampling descriptions below; training-budget
 policies remain unchanged.
 
 New structured tasks also freeze a [task contract](task-capabilities.md).
-Segmentation and summarisation recipes use IID or quantity skew; shared-parent
-recipes take their permitted profiles from the parent's frozen contract.
+Fill-mask, segmentation and summarisation recipes use IID with independently varied
+sample counts. Shared-parent recipes take their supported current profiles from
+the parent's frozen contract.
 Historical recipes retain their existing readers and identities.
 Historical calibration templates are not applied to new task protocols: they do
 not bind the new semantic and evaluation hashes. These recipes remain explicitly
@@ -22,7 +23,7 @@ filtering happen during manifest generation.
 
 ## What changes
 
-IID, Dirichlet, shard and quantity-skew remain available, as do Adam, AdamW, SGD
+IID, Dirichlet and shard remain available, as do Adam, AdamW, SGD
 and RMSprop for HF text. Quantities retain their independently shuffled fixed
 +/-75% spread before capacity adjustment. An average of 1,000 gives initial
 draws between 250 and 1,750. When a true training capacity is known and is below
@@ -64,7 +65,7 @@ source proportions; supported shards retain at least two available classes.
 Required selected classes receive at least one example when capacity permits.
 Challenging Dirichlet clients retain a 10% source mixture; challenging and stress
 shards can remain single-class. Stress Dirichlet uses the original unblended
-sampling. IID and quantity-skew proportions retain the source distribution.
+sampling. IID sampling retains the source distribution in expectation.
 This keeps non-IID variation while reserving the most extreme binary profiles
 for the difficult portion of the catalogue. Binary supported shards necessarily
 retain both labels; multiclass shards can still specialize in a subset.

@@ -279,7 +279,7 @@ def measure_model_outputs(
         if values.ndim != 2 or values.shape[0] != len(plan.audit_ids):
             raise ValueError("aggregated classifier returned invalid probability dimensions")
         predicted = np.argmax(values, axis=1)
-        truth = expected.astype(int).reshape(-1)
+        truth = expected.argmax(axis=-1) if expected.ndim > 1 and expected.shape[-1] > 1 else expected.astype(int).reshape(-1)
         accuracy = float(np.mean(predicted == truth))
         return {
             "accuracy": accuracy,
@@ -303,6 +303,35 @@ def measure_model_outputs(
             "inference_latency_s": float(inference_latency_s),
         }
     raise ValueError("runtime composition validation supports classification or regression")
+
+
+def measured_recipe_quality(actual, outputs, labels, selected):
+    """Use the catalogue's named metric and normalisation for a fair comparison."""
+    from mlaas_data_generator.services.taxonomy import metric_score_value
+    names = selected["primary_metric_name"].astype(str).str.lower().unique()
+    if len(names) != 1:
+        raise ValueError("selected services disagree on the primary quality metric")
+    name = str(names[0])
+    task = str(selected["task_family"].iloc[0])
+    result = dict(actual)
+    if task == "regression":
+        truth = np.asarray(labels, dtype=float).reshape(-1)
+        prediction = np.asarray(outputs, dtype=float).reshape(-1)
+        result["mse"] = float(np.mean((prediction - truth) ** 2))
+        if name in {"pearson", "spearman"}:
+            from scipy.stats import pearsonr, spearmanr
+            result["pearson"] = float(pearsonr(truth, prediction).statistic)
+            result["spearman"] = float(spearmanr(truth, prediction).statistic)
+    if name == "f1" and "f1" not in result and "f1_macro" in result:
+        result["f1"] = result["f1_macro"]
+    if name not in result or not np.isfinite(result[name]):
+        raise ValueError(f"audit cannot measure the catalogue primary metric {name!r}")
+    quality = metric_score_value(task, name, result[name])
+    if not np.isfinite(quality) or not 0 <= quality <= 1:
+        raise ValueError("audit quality normalisation is invalid")
+    result.update(quality_score=float(quality), primary_metric_name=name,
+                  secondary_metric_name=str(selected["auxiliary_metric_name"].iloc[0]))
+    return result
 
 
 def aggregate_and_measure(

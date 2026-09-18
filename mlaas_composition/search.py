@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 
 from .pool import CompositionInstance, build_composition_instance, request_object
-from .protocol import OBJECTIVE_VERSION, objective_version_for_request
+from .protocol import OBJECTIVE_VERSION, RECIPE_OBJECTIVE_VERSION, objective_version_for_request
 from .sampler import calculate_utility, evaluate_provisional_composition
 
 
@@ -176,7 +176,10 @@ def run_search_algorithms(
                 "search_status": result.status,
                 "service_ids": json.dumps(result.service_ids),
                 "utility_score": result.utility_score,
+                **({"predicted_utility_score": result.utility_score} if objective_version == RECIPE_OBJECTIVE_VERSION else {}),
                 "evaluations": result.evaluations,
+                "search_budget": budget,
+                "search_seed": seed + request_position * 1_000 + method_index,
                 "runtime_s": result.runtime_s,
                 "eligible_pool_size": len(instance.C_R),
                 "candidate_space_size": result.candidate_space_size,

@@ -11,6 +11,7 @@ def test_service_writer_persists_service_metrics_artifacts_and_failures(tmp_path
     writer.write_service(
         {
             "service_id": "svc_1",
+            "family_id": "family_1",
             "status": "completed",
             "task_family": "classification",
             "task_type": "classification",
@@ -55,6 +56,7 @@ def test_service_writer_persists_service_metrics_artifacts_and_failures(tmp_path
 
     with sqlite3.connect(db_path) as conn:
         assert conn.execute("SELECT COUNT(*) FROM services").fetchone()[0] == 1
+        assert conn.execute("SELECT family_id FROM services WHERE service_id='svc_1'").fetchone()[0] == "family_1"
         assert conn.execute("SELECT COUNT(*) FROM service_metrics").fetchone()[0] == 3
         assert conn.execute("SELECT COUNT(*) FROM service_artifacts").fetchone()[0] == 1
         assert conn.execute("SELECT COUNT(*) FROM service_split_provenance").fetchone()[0] == 1
@@ -67,6 +69,28 @@ def test_service_writer_persists_service_metrics_artifacts_and_failures(tmp_path
             )
         }
         assert old_tables == set()
+
+
+def test_service_writer_migrates_family_identity_from_generation_provenance(tmp_path):
+    db_path = tmp_path / "legacy-services.db"
+    writer = make_writer("sqlite", db_path=str(db_path))
+    writer.start()
+    writer.finish()
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("DROP INDEX idx_services_family_service")
+        conn.execute("ALTER TABLE services DROP COLUMN family_id")
+        conn.execute("INSERT INTO services(service_id,status) VALUES ('svc_legacy','completed')")
+        conn.execute(
+            "INSERT INTO service_generation_provenance "
+            "(service_id,provenance_version,family_id,provenance_json) VALUES (?,?,?,?)",
+            ("svc_legacy", 1, "family_legacy", "{}"),
+        )
+    writer.start()
+    writer.finish()
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute(
+            "SELECT family_id FROM services WHERE service_id='svc_legacy'"
+        ).fetchone()[0] == "family_legacy"
 
 
 def test_fedavg_recovery_marks_abandoned_run_and_round_interrupted(tmp_path):

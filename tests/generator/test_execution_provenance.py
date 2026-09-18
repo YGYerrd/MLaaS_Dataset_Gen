@@ -10,7 +10,8 @@ from mlaas_data_generator.storage.writer import make_writer
 
 def test_execution_evidence_is_untruncated_and_independent(tmp_path):
     requested = configuration_evidence({"batch_size": 16, "recipe": {"values": list(range(5000))},
-                                        "long_setting": "x" * 150000, "_prepared_dataset": object()})
+                                        "long_setting": "x" * 150000, "_prepared_dataset": object(),
+                                        "row_index": 7, "manifest_group_id": "invocation"})
     effective = {**requested, "batch_size": 4, "learning_rate": 0.001}
     document = execution_document(requested=requested, effective=effective,
         metrics={"microbatch_retries": {"value": 2}}, record={},
@@ -35,6 +36,8 @@ def test_execution_evidence_is_untruncated_and_independent(tmp_path):
         assert stored["configuration_adjustments"]["batch_size"]["before"] == 16
         assert stored["configuration_adjustments"]["batch_size"]["after"] == 4
         assert "_prepared_dataset" not in stored["requested_config"]
+        assert "row_index" not in stored["requested_config"]
+        assert "manifest_group_id" not in stored["requested_config"]
         for sql in (
             "UPDATE service_execution_provenance SET document_json='{}'",
             "DELETE FROM service_execution_provenance",

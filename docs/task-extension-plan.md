@@ -208,8 +208,8 @@ separately reported capability until its own implementation and smoke gate pass.
    initial profile: nearest-neighbour target resizing, fixed resolution rules,
    and declared class inclusion/absent-class conventions. A future original-image
    benchmark protocol gets its own identity and metrics.
-3. Sample whole images and group related crops by original image. Enable IID and
-   quantity skew first. Exclude shard/Dirichlet requests until a declared
+3. Sample whole images and group related crops by original image. Enable IID with
+   independently varied sample counts first. Exclude shard/Dirichlet requests until a declared
    image-level bucket policy exists; do not silently relabel an IID fallback.
 4. Count images for aggregation and valid pixels for supervision. Require usable
    pixels after transforms. Stream per-class confusion statistics for macro IoU
@@ -239,7 +239,7 @@ and verification; they do not inherit support from this smoke run.
    prefix, truncation, label masking and decoder-start behavior. Require the same
    parent and tensor schema, including tied parameter handling on restoration.
 2. Sample whole source-target examples; group derived examples by source document.
-   Start with IID and quantity skew. Require nonzero target supervision after
+   Start with IID with independently varied sample counts. Require nonzero target supervision after
    masking and truncation, and record examples, supervised tokens and updates.
 3. Separate teacher-forced token loss from decoded-output metrics. Freeze maximum
    generated length, deterministic decoding settings, stop conditions, text

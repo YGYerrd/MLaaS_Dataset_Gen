@@ -48,7 +48,9 @@ def test_raw_split_reuse_preserves_recipe_sampling_revisions_and_formats(monkeyp
         assert second[0][0].to_dict() == expected[0][0].to_dict()
         assert second[1][0].to_dict() == expected[1][0].to_dict()
         assert second[2] == expected[2]  # Includes source IDs and accounting.
-        changed = load_huggingface_source(**{**kwargs, "seed": 8})
+        changed_training = load_huggingface_source(**{**kwargs, "seed": 8})
+        assert changed_training[2]["selected_test_rows"] == second[2]["selected_test_rows"]
+        changed = load_huggingface_source(**{**kwargs, "evaluation_seed": 8})
         assert len(calls) == 2
         assert changed[2]["selected_train_rows"] == second[2]["selected_train_rows"]
         assert changed[2]["selected_test_rows"] != second[2]["selected_test_rows"]

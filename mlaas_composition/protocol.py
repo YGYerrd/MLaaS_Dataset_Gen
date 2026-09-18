@@ -19,13 +19,16 @@ V2_REQUEST_SCHEMA_VERSION = "2.0.0"
 REQUEST_SCHEMA_VERSION = "3.0.0"
 FAMILY_REQUEST_SCHEMA_VERSION = "4.0.0"
 TASK_REQUEST_SCHEMA_VERSION = "5.0.0"
+RECIPE_REQUEST_SCHEMA_VERSION = "6.0.0"
+RECIPE_OBJECTIVE_VERSION = "collaborative_objective.v3"
 LEGACY_OBJECTIVE_VERSION = "collaborative_objective.v1"
 OBJECTIVE_VERSION = "collaborative_objective.v2"
 DEFAULT_PROFILE_ID = "controlled_collaborative_v3"
 DEFAULT_PRINCIPLE_ID = "feasible_reference_bounds_v1"
 
-SUPPORTED_REQUEST_SCHEMA_VERSIONS = (LEGACY_REQUEST_SCHEMA_VERSION, V2_REQUEST_SCHEMA_VERSION, REQUEST_SCHEMA_VERSION, FAMILY_REQUEST_SCHEMA_VERSION, TASK_REQUEST_SCHEMA_VERSION)
+SUPPORTED_REQUEST_SCHEMA_VERSIONS = (LEGACY_REQUEST_SCHEMA_VERSION, V2_REQUEST_SCHEMA_VERSION, REQUEST_SCHEMA_VERSION, FAMILY_REQUEST_SCHEMA_VERSION, TASK_REQUEST_SCHEMA_VERSION, RECIPE_REQUEST_SCHEMA_VERSION)
 OBJECTIVE_BY_REQUEST_SCHEMA = {
+    RECIPE_REQUEST_SCHEMA_VERSION: RECIPE_OBJECTIVE_VERSION,
     TASK_REQUEST_SCHEMA_VERSION: OBJECTIVE_VERSION,
     FAMILY_REQUEST_SCHEMA_VERSION: OBJECTIVE_VERSION,
     LEGACY_REQUEST_SCHEMA_VERSION: LEGACY_OBJECTIVE_VERSION,
@@ -56,6 +59,9 @@ PROTOCOL_ASSETS_BY_REQUEST_SCHEMA[FAMILY_REQUEST_SCHEMA_VERSION] = (
 PROTOCOL_ASSETS_BY_REQUEST_SCHEMA[TASK_REQUEST_SCHEMA_VERSION] = (
     "request_profiles.v5.json", "request_principles.v1.json", "request.schema.v5.json", "objective.v2.json",
 )
+PROTOCOL_ASSETS_BY_REQUEST_SCHEMA[RECIPE_REQUEST_SCHEMA_VERSION] = (
+    "request_profiles.v6.json", "request_principles.v1.json", "request.schema.v6.json", "objective.v3.json",
+)
 
 _STRICT_COMPATIBILITY_FIELDS = {
     "compatibility_contract_hash",
@@ -77,7 +83,7 @@ def load_protocol_asset(name: str) -> dict[str, Any]:
 
 
 def load_request_profile(profile_id: str = DEFAULT_PROFILE_ID) -> dict[str, Any]:
-    for asset in ("request_profiles.v5.json", "request_profiles.v4.json", "request_profiles.v3.json", "request_profiles.v2.json", "request_profiles.v1.json"):
+    for asset in ("request_profiles.v6.json", "request_profiles.v5.json", "request_profiles.v4.json", "request_profiles.v3.json", "request_profiles.v2.json", "request_profiles.v1.json"):
         library = load_protocol_asset(asset)
         if profile_id in library["profiles"]:
             profile = dict(library["profiles"][profile_id])
@@ -163,9 +169,11 @@ def validate_request_frame(frame: pd.DataFrame) -> None:
             raise ValueError("Only collaborative composition requests are supported")
         for field in ("functional_requirements", "qos_requirements", "hard_constraints", "preference_weights", "constraint_penalties"):
             _request_object(request, field)
+        from .evidence import requested_evaluation_dimensions
+        requested_evaluation_dimensions(request)
         if int(request["composition_size"]) < 1:
             raise ValueError("composition_size must be positive")
-        if schema_version in {V2_REQUEST_SCHEMA_VERSION, REQUEST_SCHEMA_VERSION, FAMILY_REQUEST_SCHEMA_VERSION, TASK_REQUEST_SCHEMA_VERSION}:
+        if schema_version in {V2_REQUEST_SCHEMA_VERSION, REQUEST_SCHEMA_VERSION, FAMILY_REQUEST_SCHEMA_VERSION, TASK_REQUEST_SCHEMA_VERSION, RECIPE_REQUEST_SCHEMA_VERSION}:
             _validate_v2_request(request)
         elif _present(request.get("compatibility_mode")) and str(request["compatibility_mode"]).lower() != "functional":
             raise ValueError("Request schema 1.0.0 supports functional compatibility only")
@@ -195,7 +203,7 @@ def objective_version_for_schema(schema_version: str) -> str:
 
 def _validate_v2_request(request: Mapping[str, Any]) -> None:
     mode = str(request.get("compatibility_mode") or "").lower()
-    if request_schema_version(request) in {FAMILY_REQUEST_SCHEMA_VERSION, TASK_REQUEST_SCHEMA_VERSION} and mode != "strict":
+    if request_schema_version(request) in {FAMILY_REQUEST_SCHEMA_VERSION, TASK_REQUEST_SCHEMA_VERSION, RECIPE_REQUEST_SCHEMA_VERSION} and mode != "strict":
         raise ValueError("family requests require strict compatibility")
     if mode not in {"functional", "strict"}:
         raise ValueError("compatibility_mode must be 'functional' or 'strict'")
@@ -217,8 +225,10 @@ def _validate_v2_request(request: Mapping[str, Any]) -> None:
         return
     fields = ({"cohort_id", "parent_state_hash", "compatibility_contract_hash"}
               if request_schema_version(request) == REQUEST_SCHEMA_VERSION else _STRICT_COMPATIBILITY_FIELDS)
-    if request_schema_version(request) == FAMILY_REQUEST_SCHEMA_VERSION:
+    if request_schema_version(request) in {FAMILY_REQUEST_SCHEMA_VERSION, RECIPE_REQUEST_SCHEMA_VERSION}:
         fields = {"family_id", "initial_state_hash", "compatibility_contract_hash"}
+    if request_schema_version(request) == RECIPE_REQUEST_SCHEMA_VERSION and int(request["composition_size"]) < 2:
+        raise ValueError("recipe composition requires at least two services")
     if request_schema_version(request) == TASK_REQUEST_SCHEMA_VERSION:
         fields = ({"family_id", "initial_state_hash"} if "family_id" in requirements else {"cohort_id", "parent_state_hash"}) | {
             "compatibility_contract_hash", "task_semantics_hash", "evaluation_protocol_hash"}
@@ -333,7 +343,7 @@ def _json_record(record: Mapping[str, Any]) -> dict[str, Any]:
             value = value.item()
         if isinstance(value, float) and pd.isna(value):
             value = None
-        if key in {"functional_requirements", "compatibility_requirements", "qos_requirements", "hard_constraints", "preference_weights", "constraint_penalties"} and isinstance(value, str):
+        if key in {"functional_requirements", "compatibility_requirements", "qos_requirements", "hard_constraints", "preference_weights", "constraint_penalties", "evaluation_requirements"} and isinstance(value, str):
             value = json.loads(value)
         result[key] = value
     return result

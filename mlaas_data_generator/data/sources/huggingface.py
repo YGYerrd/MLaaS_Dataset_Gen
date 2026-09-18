@@ -75,6 +75,11 @@ def load_huggingface_source(**kwargs):
     def _is_unlabelled(ds):
         if modality == "multimodal":
             return False
+        from ...hf_tasks import normalize_hf_task
+        if normalize_hf_task(hf_task) in {"causal_lm_generation", "seq2seq_generation", "fill_mask"}:
+            # These tasks derive supervision from text/target columns during
+            # preparation. A numeric classification label is not required.
+            return False
         label_column = kwargs.get("label_column", "label")
         try:
             ys = ds[label_column]
@@ -119,13 +124,14 @@ def load_huggingface_source(**kwargs):
     post_split_train_count = len(ds_train)
     post_split_test_count = len(ds_test)
 
-    # Evaluation size is independent of client training quantities.
-    benchmark_size = kwargs.get("benchmark_sample_size")
-    if benchmark_size is not None:
-        benchmark_size = max(1, int(benchmark_size))
-        benchmark_seed = kwargs.get("benchmark_sample_seed")
-        ds_test = ds_test.shuffle(seed=int(benchmark_seed if benchmark_seed is not None else seed + 1))
-        ds_test = ds_test.select(range(min(benchmark_size, len(ds_test))))
+    # Sample dataset rows before tokenization/decoding. Families reserve their
+    # metric and audit cohorts together after loading the complete source.
+    evaluation_sampling = None
+    if not kwargs.get("_defer_evaluation_sampling"):
+        from ...evaluation_sampling import evaluation_indices
+        positions, evaluation_sampling = evaluation_indices(len(ds_test), kwargs)
+        if len(positions) < len(ds_test):
+            ds_test = ds_test.select(positions.tolist())
 
     def _selected_rows(ds):
         indices = getattr(ds, "_indices", None)
@@ -314,6 +320,7 @@ def load_huggingface_source(**kwargs):
         "dataset_args": dataset_args,
         "selected_train_rows": selected_train_rows,
         "selected_test_rows": selected_test_rows,
+        "evaluation_sampling": evaluation_sampling,
     }
 
     group_column = kwargs.get("source_group_column")

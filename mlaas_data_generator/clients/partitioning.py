@@ -8,6 +8,8 @@ import numpy as np
 from ..provenance import sha256_json
 from ..data.fedavg_partition import _largest_remainder_counts, _take_rows
 from ..data.skew_axes import resolve_skew_axis
+from .profiles import PROFILES
+from .legacy_profiles import UNIFORM_PROFILE as LEGACY_UNIFORM_PROFILE
 
 LEGACY_PARTITION_VERSION = "independent_source_pool_v1"
 FRACTIONAL_PARTITION_VERSION = "independent_source_pool_v2"
@@ -79,15 +81,15 @@ def client_partition(x: Any, y: Any, config: Mapping[str, Any], *,
     if quota < 1:
         raise ValueError("client quantity must be positive")
     strategy = str(config.get("split_strategy", "iid"))
-    if strategy not in {"iid", "dirichlet", "shard", "quantity_skew"}:
+    if strategy not in {*PROFILES, LEGACY_UNIFORM_PROFILE}:
         raise ValueError(f"unsupported client data profile: {strategy}")
     intensity = float(config.get("heterogeneity_intensity", 0.5))
     if not 0 <= intensity <= 1:
         raise ValueError("heterogeneity intensity must be in [0,1]")
     rng = np.random.default_rng(int(config["sample_seed"]))
-    if strategy in {"iid", "quantity_skew"}:
-        # Quantity is resolved in the client recipe. Neither profile imposes
-        # label quotas or needs any prepared-feature metadata.
+    if strategy in {"iid", LEGACY_UNIFORM_PROFILE}:
+        # Keep the historical name in saved partition hashes. New recipes use
+        # IID with independently assigned quantities and no label quotas.
         order = rng.permutation(total)
         indices = order[:min(quota, total)]
         doc = {
@@ -105,13 +107,15 @@ def client_partition(x: Any, y: Any, config: Mapping[str, Any], *,
         }
         doc["partition_hash"] = sha256_json(doc)
         return {"indices": indices, "candidate_indices": order, "metadata": doc}
-    if not config.get("skew_axis"):
+    from ..data.raw_text_axis import configured_skew_axis
+    skew_axis = configured_skew_axis(config)
+    if not skew_axis:
         raise ValueError(f"{strategy} requires an explicit skew_axis")
     axis = resolve_skew_axis(x, y, meta, split_name="train", task_family=task_family,
-                             hf_task=config.get("hf_task"), requested_axis=config.get("skew_axis"),
+                             hf_task=config.get("hf_task"), requested_axis=skew_axis,
                              axis_config=config.get("skew_axis_config"))
     if axis.bucket_ids is None or axis.fallback_reason:
-        raise ValueError(f"requested skew axis is unavailable: {config.get('skew_axis')}: {axis.fallback_reason}")
+        raise ValueError(f"requested skew axis is unavailable: {skew_axis}: {axis.fallback_reason}")
     bucket_ids = np.zeros(total, dtype=int) if axis.bucket_ids is None else np.asarray(axis.bucket_ids)
     if len(bucket_ids) != total:
         raise ValueError("skew axis does not align with source rows")

@@ -11,7 +11,11 @@ from mlaas_data_generator.cli.manifest import preparation
 
 
 @pytest.fixture(params=["reduced", "patch", "base_only"])
-def saved(tmp_path, request):
+def saved(tmp_path, request, monkeypatch):
+    # These fixtures isolate checkpoint byte verification; recipe integrity is
+    # covered with real recipe artifacts in test_client_reconstruction.py.
+    monkeypatch.setattr("mlaas_data_generator.client_reconstruction.read_recipe",
+                        lambda *a: {"retention": {"policy": "checkpoint", "client_checkpoint_retained": True}})
     conn = sqlite3.connect(tmp_path / "test.db")
     conn.row_factory = sqlite3.Row
     conn.executescript('''

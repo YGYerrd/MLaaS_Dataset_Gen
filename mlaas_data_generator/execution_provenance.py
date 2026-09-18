@@ -36,7 +36,10 @@ def evidence_value(value):
 def configuration_evidence(config):
     # Private entries include live models, datasets and worker caches. Public
     # configuration contains the resolved training and evaluation settings.
-    return evidence_value({k: v for k, v in config.items() if not k.startswith("_")})
+    # Manifest transport fields are execution bookkeeping, not service inputs.
+    transport = {"enabled", "family_ref", "row_index", "manifest_group_id", "manifest_reference"}
+    return evidence_value({k: v for k, v in config.items()
+                           if not k.startswith("_") and k not in transport})
 
 
 def execution_document(*, requested, effective, metrics, record, splits,

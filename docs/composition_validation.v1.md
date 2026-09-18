@@ -1,5 +1,11 @@
 # Selected composition validation
 
+For raw-source families and checkpoint-free recipe replay, use the
+[schema v6 workflow and end-to-end commands](recipe-composition.md). It adds
+automatic family audit resolution, comparable quality/latency prediction, and
+`validate-search` for all four algorithms' saved selections. The checkpoint
+workflow below remains available for historical experiments.
+
 Structured task requests use schema v5 and bind task semantics plus evaluation
 protocol hashes. See [task capabilities](task-capabilities.md) for named token,
 segmentation and decoded summarisation metrics, capability decisions and evidence.

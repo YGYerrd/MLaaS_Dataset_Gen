@@ -7,16 +7,19 @@ import numpy as np
 
 from .accounting import append_accounting_stage, update_accounting
 from .fedavg_partition import _take_rows
+from .raw_text_axis import AXIS as RAW_TEXT_LENGTH_AXIS, configured_skew_axis
 
 _ACTIVE = ContextVar("training_row_selection", default=None)
 RAW_AXES = {"class_label", "score_bin", "question_type", "domain_source", "text_domain",
             "image_domain", "source_domain", "query_domain", "document_domain", "pair_type",
-            "relevance_label", "task_format"}
+            "relevance_label", "task_format", RAW_TEXT_LENGTH_AXIS}
 PREPARED_AXES = {"entity_present_sentence", "entity_token_label", "supervised_token_bucket",
                  "prompt_length_bucket", "query_length_bucket", "target_length_bucket", "masked_token_id", "answer_vocab"}
 
 
 def selection_blocker(config):
+    if config.get("_recorded_source_ids") is not None:
+        return None
     if config.get("generation_mode", "independent") != "independent" or config.get("fl_run_id"):
         return "shared-parent/FedAvg uses its existing prepared partition contract"
     if config.get("_prepared_train_partition") is not None:
@@ -24,10 +27,17 @@ def selection_blocker(config):
     if config.get("training_regime") in {"inference", "inference_only"}:
         return "inference-only execution has no client training selection"
     strategy = config.get("split_strategy") or config.get("distribution_type") or "iid"
-    axis = config.get("skew_axis")
+    axis = configured_skew_axis(config)
     if strategy in {"dirichlet", "shard"}:
         if not axis:
             raise ValueError(f"{strategy} requires an explicit skew_axis")
+        if axis == "masked_token_id":
+            raise ValueError(
+                f"{strategy} skew_axis='masked_token_id' is incompatible with raw-row selection: "
+                "masked token IDs only exist after tokenization and masking. "
+                f"Use skew_axis='{RAW_TEXT_LENGTH_AXIS}' or split_strategy='iid'; "
+                "full training-pool tokenization is not allowed for this setting."
+            )
         if axis not in RAW_AXES | PREPARED_AXES:
             raise ValueError(f"unknown explicit skew_axis: {axis}")
         if axis not in RAW_AXES:
@@ -56,6 +66,21 @@ def select_metadata(meta, indices, total, *, split="train"):
         result["split_sidecars"] = {**meta["split_sidecars"], split: {
             key: [values[int(i)] for i in indices] for key, values in meta["split_sidecars"][split].items()}}
     return result
+
+
+def filter_token_supervision(train, test, meta):
+    """Exclude whole sequences with no usable targets and retain their source IDs."""
+    ignore = int(meta.get("label_pad_value", -100))
+    result, pairs = dict(meta), []
+    for split, (x, y) in (("train", train), ("test", test)):
+        positions = np.flatnonzero(np.any(np.asarray(y) != ignore, axis=1))
+        if not len(positions):
+            raise ValueError(f"no samples survived preprocessing for split='{split}': no supervised tokens")
+        result = select_metadata(result, positions, len(y), split=split)
+        if split == "train":
+            result["accepted_train_positions"] = positions.tolist()
+        pairs.append((take_rows(x, positions), take_rows(y, positions)))
+    return pairs[0], pairs[1], result
 
 
 def _concat(values, *, fill=0):
@@ -107,8 +132,21 @@ class TrainingRowSelection:
                 config["sample_size"] = max(1, round(total * float(config.get("sample_frac") or 1)))
             config.setdefault("client_partition_index", 0)
             config["split_strategy"] = config.get("split_strategy") or config.get("distribution_type") or "iid"
+            config["skew_axis"] = configured_skew_axis(config)
             task = canonical_task_family(_resolved_task_type(config, meta), meta.get("hf_task") or config.get("hf_task"))
-            partition = client_partition(x, y, config, source_ids=source_ids, meta=meta, task_family=task)
+            recorded = config.get("_recorded_source_ids")
+            if recorded is not None:
+                positions = {sid: i for i, sid in enumerate(source_ids)}
+                if len(set(recorded)) != len(recorded) or any(sid not in positions for sid in recorded):
+                    raise ValueError("recipe source rows are missing or duplicated")
+                # IDs, not the current sampler implementation, are authoritative.
+                order = np.asarray([positions[sid] for sid in recorded], dtype=int)
+                config.update(sample_size=len(order), split_strategy="iid")
+                partition = {"candidate_indices": order, "metadata": {
+                    "requested_quota": len(order), "effective_strategy": "iid",
+                    "source_pool_sample_count": total, "source_ids": list(recorded)}}
+            else:
+                partition = client_partition(x, y, config, source_ids=source_ids, meta=meta, task_family=task)
             self.selections[original["service_id"]] = dict(config=config, partition=partition,
                 order=partition["candidate_indices"], target=min(int(config["sample_size"]), total),
                 cursor=0, accepted=[], attempted=[], source_ids=source_ids)
@@ -137,6 +175,9 @@ class TrainingRowSelection:
         return np.asarray(sorted(needed), dtype=int)
 
     def _finish(self, meta, raw_meta, total, attempted):
+        for item in self.selections.values():
+            if item["config"].get("_recorded_source_ids") is not None and len(item["accepted"]) != item["target"]:
+                raise ValueError("recorded recipe rows no longer survive preprocessing")
         result = select_metadata(raw_meta, self.indices, total)
         result.update({k: v for k, v in meta.items() if k not in {"selected_train_rows", "train_group_ids", "split_sidecars"}})
         if meta.get("split_sidecars"):
@@ -259,6 +300,9 @@ class TrainingRowSelection:
 
 @contextmanager
 def training_row_selection(configs):
+    # Validate every client before loading data or preparing a grouped union.
+    for config in configs:
+        selection_blocker(config)
     selection = TrainingRowSelection(configs)
     token = _ACTIVE.set(selection)
     try:

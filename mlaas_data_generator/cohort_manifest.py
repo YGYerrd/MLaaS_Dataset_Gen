@@ -67,7 +67,7 @@ def build_cohort_manifest(parents: str | Path, *, file: str | Path | None = None
                 "parent_state_hash": parent["parent_state_hash"], "parent_document_ref": parent["document_ref"],
                 "parent_document_hash": parent["document_hash"],
                 "compatibility_contract_hash": parent["compatibility_contract_hash"], "task": task,
-                "max_eval_time_s": None, "benchmark_sample_size": None, "timeout_s": None}
+                "max_eval_time_s": None, "timeout_s": None}
             validate_training_recipe(recipe)
             recipe_hash = sha256_json(recipe)
             family_rows.append({**recipe, "service_id": "client_" + recipe_hash[:24], "enabled": True,

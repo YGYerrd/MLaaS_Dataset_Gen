@@ -27,6 +27,24 @@ intended service heterogeneity.
 `cost_efficiency` is its group mean, hard and composition-level requirements use
 `min_resource_cost_score`, and no second inversion is applied.
 
-The remaining dimensions, normalized weighted mean, and squared one-sided QoS
+The normalized weighted mean and squared one-sided QoS
 penalty retain the v1 structure. V1 request files continue to select the frozen
 `collaborative_objective.v1` implementation for reproducibility.
+
+## Trust and explanation evidence
+
+Trust has its own `trust` preference weight, `min_trust` QoS bound and
+`min_trust_score` hard bound. Missing trust/explainability scores stay missing.
+An unweighted missing dimension does not affect utility; requesting either
+dimension requires a measured score for every selected service.
+
+Eligibility also requires `benchmark_evaluation_v1` by default, a `complete` metric status
+and a true evidence-sufficiency flag. The request can declare dimensions in
+`evaluation_requirements` in addition to weights/bounds. Explicit
+`allow_legacy=true` permits historical measured scores for experiment replay,
+without accepting missing scores or failed current evaluations. Generated
+synthetic requests include only dimensions supported throughout their compatible
+pool. See the [evaluation protocol](metric-evaluation-protocol.md).
+The previous protocol is available through an explicit
+`evaluation_requirements.protocol_version=production_evaluation_v1`; requests
+never mix protocol versions. Independent sample counts accompany both scores.

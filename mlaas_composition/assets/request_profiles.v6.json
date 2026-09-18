@@ -1,0 +1,16 @@
+{
+  "schema_version": "6.0.0",
+  "library_id": "request_profiles.v6",
+  "profiles": {
+    "recipe_composition_v6": {
+      "description": "Verified raw-source families with sample-weighted quality prediction and single-model latency.",
+      "composition_size": {
+        "minimum": 2,
+        "maximum": 4
+      },
+      "preference_weight_dirichlet_alpha": 1.0,
+      "constraint_penalty_dirichlet_alpha": 1.0,
+      "request_schema_version": "6.0.0"
+    }
+  }
+}

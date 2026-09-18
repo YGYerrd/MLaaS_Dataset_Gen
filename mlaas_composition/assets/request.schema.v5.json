@@ -17,6 +17,7 @@
     "hard_constraints": {"type": ["object", "string"]},
     "composition_size": {"type": "integer", "minimum": 2},
     "preference_weights": {"type": ["object", "string"]},
+    "evaluation_requirements": {"type": ["object", "string"], "description": "Requested trust/explainability dimensions require complete benchmark_evaluation_v1 evidence by default; protocol_version can explicitly select production_evaluation_v1; allow_legacy explicitly enables historical experiments."},
     "constraint_penalties": {"type": ["object", "string"]}
   },
   "additionalProperties": true

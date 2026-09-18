@@ -1,4 +1,3 @@
-import numpy as np
 from ..family_preflight import evaluation_size_error
 
 from .sources.generic import (
@@ -48,21 +47,17 @@ def _apply_preprocessors(train, test, meta, preprocessors, *, min_evaluation_exa
 
 
 def _select_generic_benchmark(train, test, meta, args):
-    if args.get("benchmark_sample_size") is None:
+    if args.get("_defer_evaluation_sampling"):
         return train, test, meta
+    from ..evaluation_sampling import evaluation_indices
+    from .splitters import _take
     meta = dict(meta)
-    splits = []
-    for name, (x, y), cap, seed in (
-        ("train", train, None, args.get("seed", 42)),
-        ("test", test, args["benchmark_sample_size"], args.get("benchmark_sample_seed") or 42),
-    ):
-        indices = np.arange(len(x))
-        if cap is not None and len(indices) > int(cap):
-            indices = np.random.default_rng(int(seed)).permutation(indices)[:int(cap)]
-            x, y = x[indices], y[indices] if y is not None else None
-        meta[f"selected_{name}_rows"] = indices.tolist()
-        splits.append((x, y))
-    return splits[0], splits[1], meta
+    x, y = test
+    indices, info = evaluation_indices(len(y) if y is not None else len(x), args)
+    meta["selected_train_rows"] = list(range(len(train[0])))
+    meta["selected_test_rows"] = indices.tolist()
+    meta["evaluation_sampling"] = info
+    return train, (_take(x, indices), _take(y, indices)), meta
 
 
 def load_raw_dataset(name, **kwargs):
@@ -119,6 +114,8 @@ def load_raw_dataset(name, **kwargs):
 
 def prepare_dataset(name, train, test, meta, **kwargs):
     """Prepare loaded splits within the caller's client-selection scope."""
+    if kwargs.get("_evaluation_preparation_policy") == "bounded_raw_pool_v1":
+        test, meta = _select_family_evaluation_pool(test, meta, kwargs)
     preprocessors = kwargs.get("preprocessors")
     if preprocessors is None:
         key = name.lower()
@@ -153,5 +150,44 @@ def prepare_dataset(name, train, test, meta, **kwargs):
                                min_evaluation_examples=kwargs.get("min_evaluation_examples"))
 
 
+def _select_family_evaluation_pool(test, meta, config):
+    """Bound expensive preparation while leaving room for the audit holdout.
+
+    Called after the complete raw source contract is captured. Reservation
+    still splits the prepared pool into disjoint audit and catalogue rows.
+    """
+    import numpy as np
+    from ..evaluation_sampling import evaluation_settings
+    from .tokenization_selection import take_rows, select_metadata
+    settings = evaluation_settings(config)
+    x, y = test
+    count = len(y) if y is not None else len(x)
+    # reserve_evaluation takes min(512, count // 2) audit rows. Retaining at
+    # least 1024 candidates preserves a 512-row audit for large source splits.
+    limit = max(1024, settings["benchmark_sample_size"] + 512)
+    if count <= limit:
+        return test, meta
+    indices = np.sort(np.random.default_rng(settings["evaluation_seed"]).choice(
+        count, size=limit, replace=False))
+    meta = select_metadata(meta, indices, count, split="test")
+    meta["evaluation_preparation"] = {
+        "policy": "bounded_raw_pool_v1", "available_rows": count,
+        "selected_rows": len(indices), "benchmark_cap": settings["benchmark_sample_size"],
+        "audit_cap": 512,
+    }
+    print(f"Preparation: selected {len(indices):,}/{count:,} evaluation candidates "
+          f"(scoring cap={settings['benchmark_sample_size']}, audit cap=512)", flush=True)
+    return (take_rows(x, indices), take_rows(y, indices) if y is not None else None), meta
+
+
 def load_dataset(name, **kwargs):
-    return prepare_dataset(name, *load_raw_dataset(name, **kwargs), **kwargs)
+    expected = kwargs.pop("_expected_raw_source", None)
+    fitted = kwargs.pop("_shared_fitted_state", None)
+    train, test, meta = load_raw_dataset(name, **kwargs)
+    from .source_contract import source_contract
+    meta = {**meta, "raw_source": source_contract(name, train, test, meta, kwargs)}
+    if expected is not None and meta["raw_source"] != expected:
+        raise ValueError("raw source differs from frozen family")
+    if fitted:
+        meta["shared_fitted_state"] = fitted
+    return prepare_dataset(name, train, test, meta, **kwargs)

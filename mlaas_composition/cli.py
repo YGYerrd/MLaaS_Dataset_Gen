@@ -16,12 +16,13 @@ from .protocol import (
     read_request_file,
     write_request_file,
     write_run_manifest,
+    sha256_file,
 )
 from .reference import DEFAULT_MAX_CANDIDATE_SPACE, generate_exhaustive_references
 from .requirements import generate_service_requests
 from .sampler import generate_compositions
 from .search import run_search_algorithms
-from .validation_cli import validate_from_files
+from .validation_cli import validate_from_files, validate_search_from_files
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -36,6 +37,7 @@ def build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--requests", type=int, default=25, help="Number of controlled synthetic requests")
     generate.add_argument("--seed", type=int, default=42, help="Request-generation seed")
     generate.add_argument("--profile", default=DEFAULT_PROFILE_ID, help="Checked-in request profile identifier")
+    generate.add_argument("--family-id", help="Limit request generation to one family ID")
     generate.add_argument("--principle", default=DEFAULT_PRINCIPLE_ID, help="Checked-in request principle identifier")
     generate.add_argument(
         "--compatibility-mode",
@@ -83,7 +85,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--candidate-id",
         help="Explicit evaluator-selected candidate ID; mutually exclusive with search selection",
     )
-    validate.add_argument("--cohort-file", required=True, help="Immutable raw-ID cohort source JSON")
+    validate.add_argument("--cohort-file", help="Immutable cohort JSON; inferred from raw-source family when omitted")
+    validate.add_argument("--device", default="cpu", help="Recipe reconstruction and aggregate evaluation device (cpu, cuda, auto)")
     validate.add_argument("--predictions-file", help=argparse.SUPPRESS)
     validate.add_argument("--output-dir", required=True, help="Validation result directory")
     validate.add_argument("--audit-seed", type=int, default=42, help="Deterministic audit partition seed")
@@ -93,6 +96,24 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--backfill-missing", action="store_true", help=argparse.SUPPRESS)
     validate.add_argument("--stability-seeds", type=int, default=0, help=argparse.SUPPRESS)
     validate.set_defaults(handler=_validate)
+
+    families = subparsers.add_parser("list-families", help="Show verified raw-source families and eligibility failures")
+    families.add_argument("--db", required=True)
+    families.add_argument("--output", help="Optional CSV with service eligibility details")
+    families.set_defaults(handler=_list_families)
+
+    batch = subparsers.add_parser("validate-search", help="Reconstruct and measure every algorithm's saved selection")
+    batch.add_argument("--db", required=True)
+    batch.add_argument("--requests-file", required=True)
+    batch.add_argument("--evaluation-dir", required=True)
+    batch.add_argument("--output-dir", required=True)
+    batch.add_argument("--request-id", help="Validate only this request; default is every request")
+    batch.add_argument("--cohort-file", help="Optional override; raw-source families supply their own reservation")
+    batch.add_argument("--device", default="cpu")
+    batch.add_argument("--min-audit-samples", type=int, default=64)
+    batch.add_argument("--audit-seed", type=int, default=42)
+    batch.add_argument("--audit-samples", type=int, default=512)
+    batch.set_defaults(handler=_validate_search)
     return parser
 
 
@@ -106,6 +127,8 @@ def _generate_requests(args: argparse.Namespace, *, argv: Sequence[str]) -> None
         args.db,
         include_legacy_fedavg_partitions=args.include_legacy_fedavg_partitions,
     )
+    if args.family_id:
+        services = services[services.family_id.eq(args.family_id)]
     requests = generate_service_requests(
         services,
         request_count=args.requests,
@@ -124,6 +147,18 @@ def _evaluate(args: argparse.Namespace, *, argv: Sequence[str]) -> None:
         include_legacy_fedavg_partitions=args.include_legacy_fedavg_partitions,
     )
     requests = read_request_file(args.requests_file)
+    evidence = {}
+    if str(requests.request_schema_version.iloc[0]) == "6.0.0":
+        for row in services[services.composition_compatible.eq(1)].to_dict("records"):
+            artifacts = []
+            for field in ("family_document_ref", "client_recipe_ref", "update_signature_path"):
+                value = row.get(field)
+                if not isinstance(value, str) or not value:
+                    continue
+                path = Path(value).resolve()
+                artifacts.append({"field": field, "path": str(path),
+                                  "sha256": sha256_file(path) if path.is_file() else None})
+            evidence[row["service_id"]] = artifacts
     compositions = generate_compositions(services, requests, candidates_per_request=args.candidates_per_request, seed=args.seed)
     references = generate_exhaustive_references(services, requests, max_candidate_space=args.reference_max_candidates)
     search_results = run_search_algorithms(services, requests, budget=args.search_budget, seed=args.seed)
@@ -139,6 +174,15 @@ def _evaluate(args: argparse.Namespace, *, argv: Sequence[str]) -> None:
     ]
     for frame, path in zip((services, requests, compositions, references, search_results), output_files):
         frame.to_csv(path, index=False)
+    if str(requests.request_schema_version.iloc[0]) == "6.0.0":
+        for artifacts in evidence.values():
+            for artifact in artifacts:
+                path = Path(artifact["path"])
+                if (sha256_file(path) if path.is_file() else None) != artifact["sha256"]:
+                    raise ValueError("composition evidence changed during search")
+        evidence_path = output_dir / "evidence_hashes.json"
+        evidence_path.write_text(json.dumps(evidence, indent=2) + "\n", encoding="utf-8")
+        output_files.append(evidence_path)
     manifest = build_run_manifest(
         db_path=args.db,
         request_path=args.requests_file,
@@ -166,8 +210,8 @@ def _validate(args: argparse.Namespace, *, argv: Sequence[str]) -> None:
     if retired:
         raise ValueError(
             ", ".join(retired)
-            + " cannot be used for FedAvg parameter validation; exact stored client "
-            "checkpoints are aggregated and one materialized model is executed"
+            + " cannot be used for parameter validation; selected models are "
+            "materialized from checkpoints or recipes and aggregated before execution"
         )
     requests = read_request_file(args.requests_file)
     results, summary = validate_from_files(
@@ -183,6 +227,36 @@ def _validate(args: argparse.Namespace, *, argv: Sequence[str]) -> None:
         selection_source=args.selection_source,
         search_method=args.search_method,
         candidate_id=args.candidate_id,
+        device=args.device,
     )
     print(f"Wrote selected composition validation to {args.output_dir}")
     print(json.dumps(summary, sort_keys=True, default=str))
+    if summary["validation_status"] != "completed":
+        raise SystemExit(1)
+
+
+def _list_families(args: argparse.Namespace, *, argv: Sequence[str]) -> None:
+    from .raw_family import RAW_FAMILY_VERSIONS
+    services = load_services_from_db(args.db)
+    raw = services[services.family_contract_version.isin(RAW_FAMILY_VERSIONS)]
+    for family_id, frame in raw.groupby("family_id", sort=True):
+        print(json.dumps({"family_id": family_id, "completed_services": len(frame),
+            "eligible_services": int(frame.composition_compatible.eq(1).sum()),
+            "task_family": sorted(frame.task_family.unique()),
+            "exclusion_reasons": frame.loc[frame.composition_compatible.ne(1), "composition_eligibility_reason"].value_counts().to_dict()}))
+    if raw.empty:
+        print("No completed raw-source family services found.")
+    if args.output:
+        destination = Path(args.output)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        raw.to_csv(destination, index=False)
+
+
+def _validate_search(args: argparse.Namespace, *, argv: Sequence[str]) -> None:
+    _, summary = validate_search_from_files(db_path=args.db, requests=read_request_file(args.requests_file),
+        evaluation_dir=args.evaluation_dir, output_dir=args.output_dir, request_id=args.request_id,
+        cohort_file=args.cohort_file, device=args.device, min_audit_samples=args.min_audit_samples,
+        audit_seed=args.audit_seed, audit_samples=args.audit_samples)
+    print(json.dumps(summary, sort_keys=True))
+    if summary["failed_count"]:
+        raise SystemExit(1)

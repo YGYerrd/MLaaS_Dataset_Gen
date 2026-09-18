@@ -8,25 +8,20 @@ import json
 import math
 import random
 from .clients.quantities import QUANTITY_SAMPLER_VERSION, SAMPLE_QUANTITY_SPREAD, stratified_sample_quantities
+from .clients.profiles import PROFILES, ROSTER_VERSION
 from typing import Any, Mapping
 
 from mlaas_data_generator.fedavg_eligibility import (
-    fedavg_benchmark_sample_seed,
     fedavg_run_partition_seed,
 )
 
 PARTITION_GENERATOR_VERSION = "source_pool_sampler_v3"
 FEDAVG_CLIENT_SAMPLE_CAP = 1500
 LEGACY_PARTITION_GENERATOR_VERSION = "sequential_depletion_v1"
-FEDAVG_CLIENT_PROFILES: tuple[str, ...] = (
-    "iid",
-    "dirichlet",
-    "shard",
-    "quantity_skew",
-)
+FEDAVG_CLIENT_PROFILES: tuple[str, ...] = PROFILES
 
 # Kept as a public compatibility alias.  V2 does not use the old severity
-# grid: every run contains the four profiles and severity comes from h.
+# grid: every run contains the distribution profiles and severity comes from h.
 FEDAVG_SPLIT_STRATEGIES: tuple[tuple[str, float | None], ...] = tuple(
     (profile, None) for profile in FEDAVG_CLIENT_PROFILES
 )
@@ -143,10 +138,10 @@ def _requested_partition_params(
     profile: str,
     *,
     intensity: float,
-    quantity_multiplier: float | None,
 ) -> dict[str, Any]:
     common = {
         "profile": profile,
+        "profile_roster_version": ROSTER_VERSION,
         "heterogeneity_intensity": float(intensity),
         "target_basis": "global_bucket_proportions",
     }
@@ -161,15 +156,6 @@ def _requested_partition_params(
         common.update(
             bucket_count_formula="max(1, round(K ** (1 - h)))",
             selected_bucket_weighting="global_prevalence",
-        )
-    elif profile == "quantity_skew":
-        common.update(
-            quota_multiplier=float(quantity_multiplier if quantity_multiplier is not None else 1.0),
-            quota_multiplier_interval=[
-                1 - SAMPLE_QUANTITY_SPREAD,
-                1 + SAMPLE_QUANTITY_SPREAD,
-            ],
-            maximum_quantity_quota_ratio=(1 + SAMPLE_QUANTITY_SPREAD) / (1 - SAMPLE_QUANTITY_SPREAD),
         )
     return common
 
@@ -207,6 +193,8 @@ def expand_fedavg_run(
     base["fedavg_clients_per_run"] = int(clients_per_run)
     base["fedavg_rounds"] = int(rounds)
     base["fedavg_client_participation_rate"] = float(participation_rate)
+    from .evaluation_sampling import evaluation_settings
+    evaluation = evaluation_settings(base)
     fl_run_id = service_id_fn(
         "fl_run",
         {
@@ -220,12 +208,14 @@ def expand_fedavg_run(
             "heterogeneity_intensity": intensity,
             "fedavg_source_pool_cap": source_cap,
             "base_sample_size": base_quota,
+            "evaluation": evaluation,
             "quantity_sampler_version": QUANTITY_SAMPLER_VERSION,
+            "profile_roster_version": ROSTER_VERSION,
         },
     )
     lineage_id = f"lineage__{fl_run_id}"
     run_partition_seed = fedavg_run_partition_seed(fl_run_id)
-    benchmark_sample_seed = fedavg_benchmark_sample_seed(fl_run_id)
+    benchmark_sample_seed = evaluation["evaluation_seed"]
     schedule, schedule_seed = fedavg_participation_schedule(
         fl_run_id,
         clients_per_run=int(clients_per_run),
@@ -242,11 +232,9 @@ def expand_fedavg_run(
         )
         profile = roster[client_index]
         requested_quota = quantities[client_index]
-        multiplier = requested_quota / base_quota
         params = _requested_partition_params(
             profile,
             intensity=intensity,
-            quantity_multiplier=multiplier,
         )
         params.update(quantity_sampler_version=QUANTITY_SAMPLER_VERSION,
                       average_samples=base_quota, sample_quantity_spread=SAMPLE_QUANTITY_SPREAD)
@@ -264,7 +252,7 @@ def expand_fedavg_run(
     requested_total_samples = sum(
         max(0, int(knobs.get("sample_size") or 0)) for knobs in client_knobs.values()
     )
-    benchmark_sample_size = max(1, base_quota // 5)
+    benchmark_sample_size = evaluation["benchmark_sample_size"]
     rows: list[dict[str, Any]] = []
     for client_index in range(int(clients_per_run)):
         client_id = f"client_{client_index:03d}"
@@ -278,6 +266,7 @@ def expand_fedavg_run(
             row["client_partition_index"] = client_index
             row["run_partition_seed"] = run_partition_seed
             row["benchmark_sample_seed"] = benchmark_sample_seed
+            row["evaluation_seed"] = evaluation["evaluation_seed"]
             row["benchmark_sample_size"] = benchmark_sample_size
             row["sample_seed"] = fedavg_client_seed(fl_run_id, client_id)
             row["training_seed"] = fedavg_training_seed(fl_run_id, client_id, round_id)

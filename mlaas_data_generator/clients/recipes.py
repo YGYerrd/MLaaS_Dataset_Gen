@@ -10,7 +10,7 @@ from . import training
 from .partitioning import PARTITION_VERSION
 from .quantities import SAMPLE_QUANTITY_SPREAD, sample_quantity_bounds, stratified_sample_quantities
 
-PROFILES = ("iid", "dirichlet", "shard", "quantity_skew")
+from .profiles import PROFILES, current_profiles
 
 
 def recipe_summary(rows: list[dict]) -> dict:
@@ -77,7 +77,7 @@ def sample_client_recipes(policy: dict, *, count: int, seed: str,
     validate_partition_config({"regression_support_policy": regression_support_policy,
                                "min_target_bin_fraction": min_target_bin_fraction})
     rng = np.random.default_rng(_seed(seed, "profiles"))
-    available_profiles = tuple(policy.get("partition_profiles", PROFILES))
+    available_profiles = current_profiles(policy.get("partition_profiles", PROFILES))
     profiles = [available_profiles[i % len(available_profiles)] for i in range(count)]
     rng.shuffle(profiles)
     knobs = training.sample_training_knobs(policy, profiles, seed=seed)

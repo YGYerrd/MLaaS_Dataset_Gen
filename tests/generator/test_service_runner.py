@@ -48,6 +48,7 @@ def test_service_runner_writes_one_service_record(monkeypatch, tmp_path, capsys,
     result = runner.execute_service(
         {
             "log_mode": log_mode,
+            "weight_retention": "checkpoint",
             "service_id": "svc_smoke",
             "db_path": str(db_path),
             "dataset": "synthetic",
@@ -72,6 +73,7 @@ def test_service_runner_writes_one_service_record(monkeypatch, tmp_path, capsys,
         assert "train=2 | eval=2" in output
         assert "Checkpoint" in output
         assert "restore_verify=" in output
+        assert "trust_score=" in output and "explainability_score=" in output
         assert "[Checkpoint]" not in output
     else:
         assert output.count("SERVICE RUN SUMMARY") == 1
@@ -474,6 +476,7 @@ def test_service_runner_rejects_undersized_detection_finetune_run_before_model_b
     result = runner.execute_service(
         {
             "service_id": "svc_tiny_det_runtime",
+            "weight_retention": "checkpoint",
             "db_path": str(db_path),
             "dataset": "synthetic",
             "dataset_name": "tiny_detection",

@@ -181,6 +181,42 @@ def _execute_independent_family_state(evidence, runtime_id, plan, state):
         close_image_stores((train, test))
 
 
+def execute_raw_family_state(member, runtime_id, plan, state, *, device="cpu"):
+    """Build the frozen raw-source interface without training another provider."""
+    from mlaas_data_generator.cli.manifest.preparation import prepare
+    from mlaas_data_generator.checkpoint_store import restore_model_tensor_state
+    from mlaas_data_generator.data.image_store import close_image_stores
+    doc, recipe = member["parent_document"], member["recipe"]
+    config = {**doc["config"], "service_id": member["service_id"], "device": device,
+              "provenance_artifact_dir": doc["store_root"], "_family_reference": recipe["family"],
+              "_recorded_source_ids": recipe["selection"]["ordered_source_row_ids"]}
+    _, _, cfg, prepared, _, _ = prepare(config, allow_legacy_evaluation=True)
+    train, test, meta, task, model, _, test_ids = prepared
+    try:
+        source_ids = tuple(doc["reservation"]["metric_source_ids"])
+        labels = _select(test[1], tuple(test_ids), source_ids)
+        # Dynamic token padding is not part of target identity.
+        from mlaas_data_generator.data.source_contract import unpadded_targets
+        label_values = _frozen_target_values(unpadded_targets(labels, meta), doc["reservation"])
+        if cohort_label_hash(source_ids, label_values) != plan.label_hash:
+            raise CohortIsolationError("raw-source audit labels changed")
+        restore_model_tensor_state(model, state, verify=True)
+        core = getattr(model, "core", None)
+        for key, value in recipe.get("evaluation", {}).get("effective_settings", {}).items():
+            if core is not None:
+                setattr(core, key, value)
+        outputs, latency = _predict_frozen_task(model, test, test_ids, plan, cfg, task)
+        from mlaas_data_generator.tasks.runtime import TaskEvaluation
+        if isinstance(outputs, TaskEvaluation):
+            from dataclasses import replace
+            from mlaas_data_generator.tasks.contracts import target_fingerprints
+            audit_targets = _select(test[1], tuple(test_ids), plan.audit_ids)
+            outputs = replace(outputs, target_fingerprints=tuple(target_fingerprints(unpadded_targets(audit_targets, meta))))
+        return ServicePrediction(runtime_id, plan.audit_ids, outputs, latency, plan.label_hash, task)
+    finally:
+        close_image_stores((train, test))
+
+
 def _execute_shared_parent_state(db_path, parent_id, runtime_id, plan, state):
     from mlaas_data_generator.shared_parent import verify_parent, _prepare, _compatibility, _contracts, prepared_data_hash
     from mlaas_data_generator.checkpoint_store import restore_model_tensor_state
@@ -224,7 +260,7 @@ def _frozen_target_values(labels, reservation):
 
 def _predict_frozen_task(model, test, test_ids, plan, config, task_family):
     x = _select(test[0], tuple(test_ids), plan.audit_ids)
-    if config.get("task_contract"):
+    if config.get("task_contract") and task_family in {"token_classification", "segmentation", "generation", "fill_mask"}:
         from mlaas_data_generator.tasks import TaskContract
         from mlaas_data_generator.tasks.runtime import evaluate_task_model
         y = _select(test[1], tuple(test_ids), plan.audit_ids)

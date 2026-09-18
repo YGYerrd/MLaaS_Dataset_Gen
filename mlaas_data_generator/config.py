@@ -21,6 +21,8 @@ CONFIG = {
     "db_path": str(SQL_DB_PATH),
     "log_mode": os.getenv("MLAAS_LOG_MODE", "concise"),
     "seed": 42,
+    "benchmark_sample_size": 1024,
+    "evaluation_seed": 42,
     "batch_size": 32,
     "learning_rate": 0.001,
     "training_epochs": 1,
@@ -39,10 +41,14 @@ CONFIG = {
     "dataset_args": None,
     "measure_system_metrics": True,
     "explainability_enabled": False,
-    "enable_perturbation_metrics": False,
+    "enable_perturbation_metrics": True,
+    "evaluation_protocol_version": "benchmark_evaluation_v1",
+    "metric_evaluation_profile": "benchmark",
     "perturbation_stage_logging": True,
     "perturbation_progress_logging": False,
     "perturbation_progress_sample_interval": 1,
+    # Historical budgets apply only to explicit legacy_perturbation_v1 runs.
+    # Current benchmark/diagnostic/pilot/production budgets live in evaluation_protocol.py.
     "perturbation_sample_count": 1,
     "perturbation_candidate_units": 4,
     "perturbation_target_units": 1,
@@ -54,6 +60,10 @@ CONFIG = {
     "explainability_selectivity_floor": 0.5,
     "save_weights": False,
     "no_save_weights": False,
+    # Resolve after model/mode selection: recipe_only for supported independent
+    # services, checkpoint otherwise. Explicit policies always take precedence.
+    "weight_retention": None,
+    "retain_validation_checkpoint": False,
     "smoke_test": False,
     "provenance_artifact_dir": None,
     "checkpoint_patch_compression": "zlib",

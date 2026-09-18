@@ -16,7 +16,14 @@ def _register_run_manifest(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument("--log-mode", choices=("concise", "debug"), default=None, help="Terminal output detail (default: concise)")
     p.add_argument("--workers", type=int, default=1)
     p.add_argument("--rerun-existing", action="store_true")
+    p.add_argument("--metric-evaluation-profile", choices=("benchmark", "diagnostic", "pilot", "production"), default=None,
+                   help="Replace frozen metric budgets for unfinished rows; preserve training settings and service IDs")
+    p.add_argument("--no-trust-explainability", action="store_true",
+                   help="Disable trust and explainability scoring, overriding manifest settings and evaluation presets")
     p.add_argument("--no-save-weights", action="store_true", help="Independent debugging: train/evaluate without saving weight checkpoints")
+    p.add_argument("--weight-retention", choices=("checkpoint", "recipe_only"), default=None,
+                   help="Override retention (default: recipe_only for supported independent services; checkpoint otherwise)")
+    p.add_argument("--retain-validation-checkpoint", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--smoke-test", action="store_true", help="Skip perturbation and update signatures; use separate smoke-test service IDs")
     p.add_argument("--no-grouped-hf", dest="grouped_hf", action="store_false")
     p.set_defaults(grouped_hf=True)
@@ -32,7 +39,11 @@ def _register_run_manifest(subparsers: argparse._SubParsersAction) -> None:
             rerun_existing=args.rerun_existing,
             log_mode=args.log_mode,
             no_save_weights=args.no_save_weights,
+            weight_retention=args.weight_retention,
+            retain_validation_checkpoint=args.retain_validation_checkpoint,
             smoke_test=args.smoke_test,
+            metric_evaluation_profile=args.metric_evaluation_profile,
+            no_trust_explainability=args.no_trust_explainability,
         )
 
     p.set_defaults(_handler=_run)
@@ -47,8 +58,13 @@ def build_parser() -> argparse.ArgumentParser:
     capabilities = subparsers.add_parser("task-capabilities", help="Report offline task/backend capabilities as JSON")
     capabilities.add_argument("--task", default=None)
     capabilities.add_argument("--backend", default=None)
+    capabilities.add_argument("--reconstruction-report", help="Inspect a content-addressed comparison for its exact recorded scope")
     def report(args):
         import json
+        if args.reconstruction_report:
+            from ..task_capabilities import reconstruction_report_capabilities
+            print(json.dumps(reconstruction_report_capabilities(args.reconstruction_report), indent=2))
+            return
         from ..task_capabilities import capability_matrix
         rows = [row for row in capability_matrix() if (args.task is None or row["task"] == args.task)
                 and (args.backend is None or row["backend"] == args.backend)]

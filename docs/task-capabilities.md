@@ -12,18 +12,24 @@ run certifies its recorded model, dataset, runtime and protocol combination.
 python -m mlaas_data_generator.cli.main task-capabilities --task token_classification --backend hf_finetune
 ```
 
-Omit the filters to report the whole matrix. Each of the six capabilities has its
+Omit the filters to report the whole matrix. Each capability has its
 own implementation status, instance decision, stage, reason, remediation and
 evidence references. `pending` means a required runtime check has not happened;
 an implemented backend with a missing or corrupt checkpoint is still ineligible.
 Manifest preflight reports declarations; publication records checkpoint checks;
 v5 measured validation reports verified aggregation and audit decisions.
 
+Independent raw-source reconstruction also reports `recipe_persistence`,
+`materialization` and `reconstruction_validation`. These do not require retained
+client weights. A passing reconstruction report establishes measured support only
+for its recorded family/recipe/runtime; see [reconstruction coverage](client-reconstruction.md#inspect-reconstruction-coverage).
+
 | Profile | Primary / secondary metric | Partition profiles | Sampling and aggregation unit |
 | --- | --- | --- | --- |
-| Single-label tokens | Supervised-token weighted F1 / accuracy | IID, quantity, shard, Dirichlet using the existing sequence entity-presence axis | Whole source sequences |
-| Semantic segmentation | Corpus macro IoU / Dice over classes present in truth or predictions | IID, quantity | Whole images |
-| Seq2seq summarisation | Decoded ROUGE-1 / ROUGE-2 F1, example mean, 0–1 | IID, quantity | Source-target examples |
+| Single-label tokens | Supervised-token weighted F1 / accuracy | IID, shard, Dirichlet using the existing sequence entity-presence axis | Whole source sequences |
+| Fill-mask | Masked-token accuracy / perplexity proxy | IID, Dirichlet and shard using raw text character-length buckets | Whole source sequences |
+| Semantic segmentation | Corpus macro IoU / Dice over classes present in truth or predictions | IID with varying sample counts | Whole images |
+| Seq2seq summarisation | Decoded ROUGE-1 / ROUGE-2 F1, example mean, 0–1 | IID with varying sample counts | Source-target examples |
 
 Token F1 is not entity-span F1. Segmentation uses nearest-neighbour target resizing
 to logits resolution, excludes void pixels, and excludes classes absent from both
@@ -40,7 +46,7 @@ statistics; `tasks/diagnostics.py` streams per-example prediction artifacts and
 pairwise comparisons. The central checkpoint, lineage, dataset-content and
 reservation checks remain mandatory.
 
-New independent families use `independent_family_v2`. New reservations use
+New independent families use `raw_source_family_v3`. New task reservations use
 `reserved_evaluation_v2`: per-source target hashes replace embedded masks or token
 arrays. Reconstruction verifies the immutable source content before inference.
 `source_group_column` can declare document or crop provenance; its train/test

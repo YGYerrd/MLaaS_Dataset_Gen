@@ -134,4 +134,5 @@ def preprocess_hf_text_token(train, test, meta, *, hf_model_id, tokens_column, l
     )
     meta2 = finalize_accounting(meta2)
 
-    return (X_train, y_train), (X_test, y_test), meta2
+    from ..tokenization_selection import filter_token_supervision
+    return filter_token_supervision((X_train, y_train), (X_test, y_test), meta2)

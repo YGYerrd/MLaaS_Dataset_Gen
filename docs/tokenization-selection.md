@@ -25,19 +25,37 @@ New partitions record `independent_source_pool_v4`.
 - **IID:** a seeded uniform permutation of raw row positions, without replacement.
   The requested client quantity is its prefix. No label quotas or token-derived
   metadata are resolved, even if an unused `skew_axis` is present.
-- **Quantity skew:** the recipe varies `sample_size` across clients. Within each
-  client, selection is uniform without replacement. It is no longer a Dirichlet
-  alias. The allocator does not scale an already requested count a second time.
-- **Dirichlet / shard:** require an explicit, available `skew_axis`. Scalar class
-  labels, numeric score bins and declared domain sidecars can be resolved from
+- **Sample quantities:** every profile receives independently assigned `sample_size`
+  values. They are rounded, shuffled midpoints of uniform strata around the mean,
+  followed by any policy/capacity adjustment. The allocator does not scale an
+  already requested count a second time; quantity is not a separate profile.
+- **Dirichlet / shard:** require an available `skew_axis`; fill-mask defaults to
+  `raw_text_length_bucket`. Scalar class labels, numeric score bins, raw text
+  lengths and declared domain sidecars can be resolved from
   raw data. Unsupported axes fail instead of silently falling back to another
   axis. Dirichlet records its resolved concentration.
-- **Prepared-feature skew:** explicitly requesting a token-length, aligned entity,
-  masked-token or other prepared axis permits full-pool preparation. Merely using
-  generation, IID or quantity skew never requests this work.
+- **Fill-mask:** new recipes support IID, Dirichlet and shard. Skewed profiles
+  use `raw_text_length_bucket`, computed from the configured `text_column` before
+  tokenization and masking. Character counts use Python `len(text)` (Unicode code
+  points, with no trimming or normalization). Fixed inclusive upper bounds are
+  0, 64, 256, 1024 and 4096, followed by a 4097+ bucket. This produces length skew;
+  the buckets do not represent topics or token identities. Missing/non-string
+  text or fewer than two populated buckets fails explicitly.
+  Grouped clients share one bounded scan of the raw text column; only selected
+  candidates and necessary replacements are tokenized. Bucket evidence records
+  the text column, bounds and `raw_text_char_length_v1` semantics. Tokenizer,
+  truncation and masking settings do not affect candidate partitioning; masking
+  can still affect which candidates survive preparation.
+  Explicit `masked_token_id` requests remain rejected; change existing skewed
+  rows to `raw_text_length_bucket` rather than silently changing their semantics.
+  Recorded source IDs remain authoritative for replay, which prepares only those
+  rows. Frozen IID-only task contracts keep their recorded capability lists.
+- **Other prepared-feature skew:** explicitly requesting a token-length, aligned
+  entity or other prepared axis retains the existing full-pool preparation path.
+  Merely using generation or IID never requests this work.
 
 Generated recipes declare their skew axis for skewed profiles. Tasks without a
-raw scalar axis use IID/quantity profiles unless an axis is explicitly configured.
+raw scalar axis use IID unless a supported axis is explicitly configured.
 Quantity ranges are still generated using the existing recipe policy; `sample_size`
 is the resulting requested count for that client.
 

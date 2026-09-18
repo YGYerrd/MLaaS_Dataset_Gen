@@ -1,4 +1,4 @@
-"""Frozen variant expansion rules for legacy manifests."""
+"""Explicit variant expansion and historical service-local sampling."""
 from __future__ import annotations
 
 import hashlib
@@ -7,6 +7,7 @@ import numpy as np
 from typing import Mapping
 from ..data.skew_axes import axis_supports_strategy, bucket_distribution
 from typing import Any
+from .legacy_profiles import ALIASES as LEGACY_PROFILE_ALIASES
 from .resources import (
     _as_float, _estimated_model_params_m, _unique_ints,
     _batch_sizes_for, _learning_rates_for, _epochs_for,
@@ -46,7 +47,7 @@ def _default_skew_axis_for_task(task_key: str) -> str | None:
         "text_classification": "class_label",
         "token_classification": "entity_present_sentence",
         "sentence_similarity": "score_bin",
-        "fill_mask": "masked_token_id",
+        "fill_mask": "raw_text_length_bucket",
         "text_generation": "supervised_token_bucket",
         "text2text_generation": "supervised_token_bucket",
         "image_classification": "class_label",
@@ -176,8 +177,6 @@ def _generic_split_knobs_for_variant(
         ("dirichlet", 0.2),
         ("dirichlet", 0.5),
         ("dirichlet", 1.0),
-        ("quantity_skew", 0.1),
-        ("quantity_skew", 0.3),
     )
     split_strategy, distribution_param = options[int(split_variant) % len(options)]
     return split_strategy, distribution_param, skew_axis, skew_axis_config
@@ -252,8 +251,7 @@ def _canonical_split_strategy(value: Any) -> str:
         "non_iid": "dirichlet",
         "non_iid_dirichlet": "dirichlet",
         "shards": "shard",
-        "quantity": "quantity_skew",
-        "quantity_skewed": "quantity_skew",
+        **LEGACY_PROFILE_ALIASES,
     }
     return aliases.get(strategy, strategy)
 

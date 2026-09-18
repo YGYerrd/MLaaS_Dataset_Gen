@@ -94,7 +94,7 @@ def test_selection_before_tokenization_preserves_shared_labels(tokenizer, strate
         assert actual[2].get(key) == baseline[2].get(key)
 
 
-def test_iid_and_quantity_use_uniform_order_without_any_axis_resolution(monkeypatch):
+def test_iid_and_saved_uniform_profile_skip_axis_resolution(monkeypatch):
     from mlaas_data_generator.clients import partitioning
     monkeypatch.setattr(partitioning, "resolve_skew_axis", lambda *a, **k: pytest.fail("IID must not inspect an axis"))
     for strategy, quantity in (("iid", 1000), ("quantity_skew", 37)):
@@ -188,6 +188,100 @@ def test_group_union_and_replacements_are_prepared_once(monkeypatch):
         assert got["resolved"]["accepted_source_row_ids"] == expected
     prepared = [text for text in tok.seen if text.startswith("source")]
     assert len(prepared) == len(set(prepared))
+
+
+def fill_mask_fixture(monkeypatch, *, count, invalid=()):
+    from mlaas_data_generator.data.preprocessors import hf_text_fill_mask
+    from tests.generator.test_hf_fill_mask_memory import Tokenizer
+
+    class RecordingMaskTokenizer(Tokenizer):
+        vocab_size = count + 100
+
+        def __init__(self):
+            super().__init__("right")
+            self.seen = []
+
+        def __call__(self, texts, **kwargs):
+            self.seen.extend(texts)
+            return super().__call__(texts, **kwargs)
+
+    class RawSource:
+        column_names = ["text"]
+
+        def __len__(self):
+            return count
+
+        def __getitem__(self, key):
+            pytest.fail("fill-mask must select raw rows before reading texts")
+
+        def select(self, indices):
+            return Dataset.from_dict({"text": [
+                "" if i in invalid else f"{i + 10} " * 20 for i in indices]})
+
+    tokenizer = RecordingMaskTokenizer()
+    monkeypatch.setitem(sys.modules, "transformers", SimpleNamespace(PreTrainedTokenizerBase=Tokenizer))
+    monkeypatch.setattr(hf_text_fill_mask, "get_cached_tokenizer", lambda **kwargs: (tokenizer, None, None))
+    evaluation = Dataset.from_dict({"text": ["3 " * 20, "4 " * 20]})
+
+    def load():
+        return preprocess_hf((RawSource(), None), (evaluation, None),
+            {"hf_task": "fill_mask", "modality": "text", "max_length": 24,
+             "selected_test_rows": [70, 71]},
+            hf_model_id="offline", mlm_probability=.9)
+
+    return tokenizer, load
+
+
+def test_fill_mask_large_pool_prepares_only_group_union_and_replacements(monkeypatch):
+    count = 2_119_719
+    configs = [config(task="fill_mask", task_type="fill_mask", sample_size=37, seed=s,
+                      skew_axis="masked_token_id") for s in (42, 43)]
+    orders = [np.random.default_rng(cfg["sample_seed"]).permutation(count) for cfg in configs]
+    invalid = {int(order[0]) for order in orders}
+    tokenizer, load = fill_mask_fixture(monkeypatch, count=count, invalid=invalid)
+    with training_row_selection(configs) as selection:
+        actual = load()
+
+    expected_union = set()
+    for cfg, order in zip(configs, orders):
+        expected = [int(i) for i in order[:40] if i not in invalid][:37]
+        split = selection.materialize(cfg["service_id"], actual[0])
+        assert split["resolved"]["accepted_source_row_ids"] == expected
+        assert len(split["y_train"]) == 37
+        expected_union.update(expected)
+    texts = [text for text in tokenizer.seen if text and int(text.split()[0]) >= 10]
+    assert len(texts) == len(expected_union)
+    assert {int(text.split()[0]) - 10 for text in texts} == expected_union
+    assert actual[2]["tokenization_selection"]["mode"] == "client_rows_first"
+    assert actual[2]["accounting"]["tokenized_record_count"] == len(expected_union) + len(invalid)
+    assert actual[2]["selected_test_rows"] == [70, 71]
+
+
+@pytest.mark.parametrize("strategy", ["dirichlet", "shard"])
+@pytest.mark.parametrize("grouped", [False, True])
+def test_masked_token_skew_fails_before_loading_or_tokenizing(monkeypatch, strategy, grouped):
+    from mlaas_data_generator.data.tokenization_selection import active_selection
+
+    tokenizer, _ = fill_mask_fixture(monkeypatch, count=100)
+    cfg = config(task="fill_mask", strategy=strategy, skew_axis="masked_token_id")
+    configs = [config(task="fill_mask", seed=43), cfg] if grouped else [cfg]
+    with pytest.raises(ValueError, match="masked_token_id.*incompatible with raw-row selection"):
+        with training_row_selection(configs):
+            pytest.fail("incompatible skew must fail before dataset loading")
+    assert not tokenizer.seen
+    assert active_selection() is None
+    assert cfg["split_strategy"] == strategy  # Never silently substitute IID.
+
+
+def test_recorded_fill_mask_rows_replay_without_resolving_historical_skew(monkeypatch):
+    tokenizer, load = fill_mask_fixture(monkeypatch, count=100)
+    cfg = config(task="fill_mask", strategy="dirichlet", skew_axis="masked_token_id",
+                 _recorded_source_ids=["train:43", "train:9", "train:61"])
+    with training_row_selection([cfg]) as selection:
+        actual = load()
+    split = selection.materialize(cfg["service_id"], actual[0])
+    assert split["resolved"]["accepted_source_row_ids"] == [43, 9, 61]
+    assert len(tokenizer.seen) == 5
 
 
 def test_replacement_dynamic_padding_and_evaluation_stay_consistent(monkeypatch):
@@ -290,7 +384,7 @@ def test_saved_family_execution_prepares_selected_union_and_retains_checkpoints(
     monkeypatch.setattr(runner, "_resolve_hf_revisions", lambda cfg: cfg.update(hf_model_revision="a" * 40, hf_dataset_revision="b" * 40))
     monkeypatch.setattr(runner, "_fetch_hf_metadata", lambda *a: {})
     monkeypatch.setattr(runner, "capture_hardware_snapshot", lambda: {"platform": "test"})
-    configs = [config(seed=s, no_save_weights=False, model_type="mlp", training_regime="generic",
+    configs = [config(seed=s, no_save_weights=False, weight_retention="checkpoint", model_type="mlp", training_regime="generic",
         hf_model_id="offline", db_path=str(tmp_path / "services.db"), training_epochs=1,
         batch_size=2, enable_perturbation_metrics=False, update_signature_enabled=False,
         measure_system_metrics=False, provenance_artifact_dir=str(tmp_path / "artifacts")) for s in (42, 43)]
@@ -311,14 +405,14 @@ def test_saved_family_execution_prepares_selected_union_and_retains_checkpoints(
             split = json.loads(payload)
             assert split["source_pool_sample_count"] == 40
             assert len(split["partition_source_ids"]) == 6
-    # Reopening one client must reuse the original union stored with this
-    # interim family, even though only that client is being executed now.
+    # A durable family no longer binds a client union. Reopening one client
+    # prepares just its rows under the same family contract.
     cfg = {**configs[0], "_family_reference": {
         "document_ref": configs[0]["family_document_ref"], "document_hash": configs[0]["family_document_hash"]}}
     tokenizer.calls.clear()
     with training_row_selection([cfg]) as selection:
         _, _, _, reloaded, _, _ = preparation.prepare(cfg, load_dataset=lambda *a, **k: prepare(dataset()), build_model=lambda *a: model)
-    assert len(reloaded[0][1]) == len(union)
+    assert len(reloaded[0][1]) == 6
     assert len(selection.materialize(cfg["service_id"], reloaded[0])["y_train"]) == 6
 
 

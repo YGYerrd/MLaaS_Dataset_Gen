@@ -1,6 +1,6 @@
 # Generator checkpoint storage specification
 
-New manifests default to reduced INT8 Safetensors final checkpoints, with separate source/reload hashes and sampled performance validation. FP16 remains selectable. See [the settings, identity contract and measured results](checkpoint_formats.md). The exact-storage specification below remains available through `checkpoint_weight_format="native"` and for legacy manifests.
+Supported independent services default to [recipe-only retention](client-reconstruction.md). When client checkpoints are retained, new manifests default to reduced INT8 Safetensors, with separate source/reload hashes and sampled performance validation. FP16 remains selectable. See [the settings, identity contract and measured results](checkpoint_formats.md). The exact-storage specification below remains available through `checkpoint_weight_format="native"` and for legacy manifests.
 
 ## Current local artifact store
 

@@ -6,6 +6,7 @@ from ..clients.legacy import (
     _sample_count, _to_float, _safe_int,
 )
 from ..clients.partitioning import SUPPORTED_PARTITION_VERSIONS
+from ..clients.legacy_profiles import UNIFORM_PROFILE as LEGACY_UNIFORM_PROFILE
 
 from mlaas_data_generator.terminal import (
     debug_print, debug_enabled, terminal_scope,
@@ -22,6 +23,7 @@ import traceback
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Mapping
 
 import numpy as np
@@ -151,6 +153,12 @@ class ServiceRunner:
         config = dict(config or {})
         self.config = dict(CONFIG)
         self.config.update(dict(config or {}))
+        from ..evaluation_sampling import evaluation_settings
+        self.config.update(evaluation_settings(config))
+        from ..client_reconstruction import apply_retention_defaults, retention_error
+        apply_retention_defaults(self.config)
+        if error := retention_error(self.config):
+            raise ValueError(error)
         self.config.pop("max_samples", None)
         from ..execution_provenance import configuration_evidence
         self._requested_configuration = configuration_evidence(self.config)
@@ -194,6 +202,12 @@ class ServiceRunner:
         self.config["_execution_owner"] = execution_owner()
 
         try:
+            # Construction also serves family model preparation. Require its
+            # durable contract only when executing a complete client service.
+            if self.config["weight_retention"] == "recipe_only" and not self.config.get("_family_document"):
+                raise ServiceExecutionError(
+                    "recipe_only requires durable preparation; execute through the manifest family executor",
+                    failure_stage="service_initialization")
             self._persist_progress("executing", started_at=started_at)
             _resolve_hf_revisions(self.config)
             record, metrics, artifacts, split_provenance_rows, generation_provenance = self._execute_service(started_at=started_at)
@@ -251,6 +265,29 @@ class ServiceRunner:
             record["metadata_json"]["completed_at"] = datetime.now(timezone.utc).isoformat()
             writer.write_service_progress(record)
             writer.write_service_metrics(service_id, completion_metrics)
+            if self.config.get("_family_document"):
+                from ..client_reconstruction import persist_recipe
+                recipe_artifact = persist_recipe(self, metrics, generation_provenance)
+                writer.write_service_artifact(service_id, **recipe_artifact)
+                artifacts.append(recipe_artifact)
+                generation_provenance.update(client_recipe_ref=recipe_artifact["artifact_uri"],
+                    client_recipe_hash=recipe_artifact["metadata"]["sha256"])
+                from ..task_capabilities import resolve_capabilities
+                from ..client_reconstruction import replay_supported
+                capabilities = resolve_capabilities(self.config, stage="publication", checks={
+                    "family_integrity": True, "recipe_integrity": True,
+                    "replay_supported": replay_supported(self._reconstruction_training_observations)})
+                generation_provenance["provenance_json"].setdefault("task_capabilities", {}).update({
+                    k: capabilities[k] for k in ("recipe_persistence", "materialization", "reconstruction_validation")})
+                # Raw-source consumers verify family/recipe evidence themselves;
+                # this flag declares implementation eligibility, not measured fidelity.
+                replay_ok = capabilities["materialization"]["decision"] == "eligible"
+                composition_supported = capabilities["measured_composition_validation"]["decision"] != "ineligible"
+                generation_provenance["composition_compatible"] = int(composition_supported and (
+                    self.config.get("weight_retention") == "checkpoint" or replay_ok))
+                generation_evidence.update(client_recipe_ref=generation_provenance["client_recipe_ref"],
+                    client_recipe_hash=generation_provenance["client_recipe_hash"])
+                writer.write_service_generation_provenance(generation_provenance)
             writer.write_service_execution_provenance(
                 service_id=service_id,
                 run_id=self.config.get("_execution_run_id") or self.config.get("manifest_group_id"),
@@ -266,6 +303,8 @@ class ServiceRunner:
                 ),
             )
             writer.finish()
+            if self.config.get("weight_retention") == "recipe_only":
+                self._final_tensor_state = None
             _log_service_timing(
                 self.config,
                 service_id,
@@ -284,13 +323,10 @@ class ServiceRunner:
                         label += f" service={service_id}"
                     print_results(label, metrics)
             weights_saved = bool(
-                self.config.get("fl_run_id")
-                and _safe_int(self.config.get("round_id")) is not None
-                and _safe_int(self.config.get("round_id")) == _safe_int(self.config.get("fedavg_rounds"))
-                and service_checkpoint_storage
+                service_checkpoint_storage
                 and service_checkpoint_storage.get("round_trip_status") == "passed"
             )
-            if weights_saved and not self.config.get("_defer_terminal_results"):
+            if weights_saved and self.config.get("fl_run_id") and not self.config.get("_defer_terminal_results"):
                 print(
                     f"Round {self.config['round_id']} Client {self.config.get('client_id')} "
                     "weights have been saved.",
@@ -331,6 +367,8 @@ class ServiceRunner:
         prepared_dataset = self.config.get("_prepared_dataset")
         if prepared_dataset is None:
             dataset_args = dict(self.config.get("dataset_args") or {})
+            from ..evaluation_sampling import evaluation_settings
+            dataset_args.update(evaluation_settings(self.config))
             dataset_args.setdefault("task", self.config.get("task") or self.config.get("task_type"))
             dataset_args.setdefault("inference_only", training_regime in {"inference_only", "inference"})
             dataset_args.setdefault("hf_dataset_revision", self.config.get("hf_dataset_revision"))
@@ -399,15 +437,29 @@ class ServiceRunner:
         prepared_benchmark_info = self.config.get("_prepared_benchmark_sample_info")
         if isinstance(prepared_benchmark_info, Mapping):
             benchmark_sample_info = dict(prepared_benchmark_info)
+            from ..evaluation_sampling import evaluation_settings
+            if _sample_count(x_test, y_test) > evaluation_settings(self.config)["benchmark_sample_size"]:
+                raise ValueError("frozen evaluation cohort exceeds the configured cap; prepare a new family or run")
         else:
             x_test, y_test, benchmark_sample_info = _cap_benchmark_split(
                 x_test,
                 y_test,
                 config=self.config,
             )
+            source_sampling = meta.get("evaluation_sampling")
+            if (source_sampling and source_sampling["effective_sample_size_total"] == _sample_count(x_test, y_test)
+                    and source_sampling["requested_sample_size_total"] == benchmark_sample_info["requested_sample_size_total"]):
+                benchmark_sample_info = dict(source_sampling)
         split_provenance_rows = list(split_info["provenance_rows"])
 
         task_family = canonical_task_family(resolved_task_type, resolved_hf_task)
+        if self.config.get("_family_document"):
+            from ..data.source_contract import prepared_fingerprint
+            self._reconstruction_inputs = {
+                "selection": split_info["resolved"],
+                "prepared_train_hash": prepared_fingerprint((x_train, y_train), meta),
+                "prepared_evaluation_hash": prepared_fingerprint((x_test, y_test), meta),
+            }
         if str(resolved_hf_task or "").strip().lower().replace("-", "_") == "sentence_similarity" and task_family == "regression":
             resolved_task_type = "regression"
         train_samples = _sample_count(x_train, y_train)
@@ -658,6 +710,7 @@ class ServiceRunner:
             stage_timings["pretrain_snapshot_s"] = snapshot_timer.elapsed_s()
             train_start = time.perf_counter()
             train_metrics = self._train_model(model, x_train, y_train, task_family=task_family)
+            self._reconstruction_training_observations = dict(train_metrics)
             from ..clients.training import OPPORTUNITY_SAMPLER_VERSIONS
             if self.config.get("recipe_sampler_version") in OPPORTUNITY_SAMPLER_VERSIONS and self.config.get("optimizer") != "none":
                 steps = train_metrics.get("successful_optimizer_step_count", train_metrics.get("optimizer_step_count"))
@@ -693,6 +746,12 @@ class ServiceRunner:
             train_metrics.setdefault("train_runtime_s", train_runtime_s)
 
         workload_runtime_s = time.perf_counter() - workload_start
+        core = getattr(model, "core", None)
+        if core is not None and independent_family:
+            self._reconstruction_evaluation_settings = {
+                key: getattr(core, key) for key in ("generation_config", "batch_size", "max_length", "mixed_precision", "precision_type")
+                if hasattr(core, key)
+            }
         primary_score = _service_metric_score_value(
             task_family=task_family,
             hf_task=resolved_hf_task,
@@ -900,6 +959,16 @@ class ServiceRunner:
                 if configured_retention is not None
                 else round_id == _safe_int(self.config.get("fedavg_rounds"))
             )
+        if independent_family:
+            from ..client_reconstruction import retention_settings, replay_supported, REPLAY_REQUIREMENTS
+            retention = retention_settings(self.config)
+            retain_trained_weights = retention["client_checkpoint_retained"]
+            if not retain_trained_weights and not replay_supported(train_metrics, self.config.get("training_memory_metadata")):
+                raise ServiceExecutionError(
+                    f"recipe_only without a validation checkpoint requires {REPLAY_REQUIREMENTS}",
+                    failure_stage="recipe_replay_support")
+            record["metadata_json"]["checkpoint_persistence"] = retention
+            metrics["weights_saved"] = _metric(retain_trained_weights, "metadata")
         if _config_bool(self.config.get("service_stage_timing_logging"), True):
             debug_print(
                 f"[Checkpoint] service stage starts | service_id={self.service_id} "
@@ -1116,13 +1185,13 @@ class ServiceRunner:
         else:
             checkpoint_storage = {
                 "provenance": {
-                    "storage_policy_version": "fedavg_historical_provenance_only_v1",
+                    "storage_policy_version": "client_recipe_only_v1" if independent_family else "fedavg_historical_provenance_only_v1",
                     "storage_mode": "not_retained",
                     "client_weights_retained": False,
                     "target_state_sha256": fallback_target_state.sha256,
                     "parent_global_round": parent_round,
                     "parent_state_sha256": parent_state.sha256,
-                    "reason": "only final-round FedAvg client weights are retained",
+                    "reason": "family + authoritative client recipe" if independent_family else "only final-round FedAvg client weights are retained",
                 },
                 "reconstruction_manifest": None,
             }
@@ -1194,6 +1263,8 @@ class ServiceRunner:
             "checkpoint_profile": checkpoint_profile.as_dict(),
             "runtime": runtime_provenance(),
         }
+        if independent_family:
+            full_provenance["weight_retention"] = retention
         if self.config.get("task_contract"):
             from ..task_capabilities import resolve_capabilities
             full_provenance["task_contract"] = self.config["task_contract"]
@@ -1205,7 +1276,7 @@ class ServiceRunner:
         if independent_family:
             full_provenance["independent_family"] = {
                 key: self.config.get(key) for key in ("family_id", "initial_state_hash", "family_document_ref",
-                    "family_document_hash", "manifest_reference", "compatibility_contract_hash", "training_seed")
+                    "family_document_hash", "compatibility_contract_hash", "training_seed")
             }
             full_provenance["independent_family"]["source_ids"] = split_info["resolved"]["partition_source_ids"]
         if shared_parent:
@@ -1282,7 +1353,7 @@ class ServiceRunner:
         final_capture_timer = _StageTimer()
         if independent_family:
             generation_provenance.update({key: self.config.get(key) for key in (
-                "family_contract_version", "initial_state_hash", "family_document_ref", "family_document_hash", "manifest_reference")})
+                "family_contract_version", "initial_state_hash", "family_document_ref", "family_document_hash")})
             generation_provenance["composition_compatible"] = 0
         if isinstance(parent_state, TensorState):
             self._final_tensor_state = (
@@ -1525,8 +1596,7 @@ class ServiceRunner:
                 config["sample_size"] = max(1, round(total * float(config.get("sample_frac") or 1)))
             config["split_strategy"] = _canonical_split_strategy(config.get("split_strategy") or config.get("distribution_type") or "iid")
             partition = partitioning.client_partition(x_train, y_train, config,
-                source_ids=(family["reservation"]["training_ids"] if family else
-                            [f"{meta.get('train_split') or 'train'}:{i}" for i in meta.get("selected_train_rows", range(total))]), meta=meta,
+                source_ids=[f"{meta.get('train_split') or 'train'}:{i}" for i in meta.get("selected_train_rows", range(total))], meta=meta,
                 task_family=canonical_task_family(_resolved_task_type(self.config, meta), hf_task))
             return self._split_info_from_prepared_partition(
                 partitioning.materialize_partition(x_train, y_train, partition), meta=meta)
@@ -1537,7 +1607,7 @@ class ServiceRunner:
             or "iid"
         )
         strategy = _canonical_split_strategy(requested_strategy)
-        if strategy not in {"iid", "dirichlet", "quantity_skew"}:
+        if strategy not in {"iid", "dirichlet", LEGACY_UNIFORM_PROFILE}:
             raise ServiceExecutionError(
                 f"service-local split strategy '{strategy}' is not supported; use iid or dirichlet",
                 failure_stage="service_validation",
@@ -1696,10 +1766,8 @@ class ServiceRunner:
             "save_weights": _config_bool(self.config.get("save_weights"), False),
             "checkpoint_patch_compression": self.config.get("checkpoint_patch_compression"),
             "checkpoint_patch_compression_level": self.config.get("checkpoint_patch_compression_level"),
-            "explainability_enabled": _config_bool(
-                self.config.get("enable_perturbation_metrics", self.config.get("explainability_enabled")),
-                True,
-            ),
+            "explainability_enabled": _config_bool(self.config.get("enable_perturbation_metrics"), False)
+                or _config_bool(self.config.get("explainability_enabled"), False),
         }
 
     def _build_model(self, *, meta: Mapping[str, Any], task_family: str):
@@ -1748,6 +1816,9 @@ class ServiceRunner:
             validate_realized_coverage(effective, y_train)
             metrics = self._train_model_effective(model, x_train, y_train, task_family=task_family)
             metrics.update(runtime_evidence(effective, metrics, _sample_count(x_train, y_train)))
+            optimizer = getattr(model, "optimizer", None)
+            if callable(getattr(optimizer, "get_config", None)):
+                self._observed_optimizer = {"class_name": type(optimizer).__name__, "config": optimizer.get_config()}
         finally:
             from ..execution_provenance import configuration_evidence
             self._effective_training_configuration = configuration_evidence(effective)
@@ -1827,6 +1898,7 @@ class ServiceRunner:
                     print(f"Training: epoch={epoch + 1}/{epochs} finished "
                           f"loss={(logs or {}).get('loss')}", flush=True)
 
+            self._adapter_fit_arguments = {"epochs": epochs, "batch_size": batch_size, "shuffle": True, "verbose": 0}
             history = model.fit(x_train, y_train, epochs=epochs, batch_size=batch_size, verbose=0,
                                 callbacks=[LocalBudget()])
             return {"training_epochs": epochs, "completed_training_epochs": counts["epochs"],
@@ -1839,7 +1911,7 @@ class ServiceRunner:
     def _evaluate_model(self, model, x_test, y_test, *, inference_only: bool, task_family: str,
                         enforce_time_limit: bool = True) -> tuple[float, float, float, dict[str, Any]]:
         try:
-            if self.config.get("task_contract") and task_family in {"token_classification", "segmentation", "generation"}:
+            if self.config.get("task_contract") and task_family in {"token_classification", "segmentation", "generation", "fill_mask"}:
                 from ..tasks.contracts import TaskContract
                 from ..tasks.runtime import evaluate_task_model
                 contract = TaskContract.from_dict(self.config["task_contract"])
@@ -1895,6 +1967,7 @@ class ServiceRunner:
         training_regime = self.config.get("training_regime")
         return {
             "service_id": self.service_id,
+            "family_id": self.config.get("family_id"),
             "status": status,
             "case_name": self.config.get("case_name"),
             "task_family": task_family or self.config.get("task_type"),
@@ -1921,8 +1994,7 @@ class ServiceRunner:
                 "training_memory_metadata": self.config.get("training_memory_metadata"),
                 "evaluation_memory_metadata": self.config.get("evaluation_memory_metadata"),
                 "execution_owner": self.config.get("_execution_owner"),
-                "execution_run_id": self.config.get("_execution_run_id"),
-                "manifest_group_id": self.config.get("manifest_group_id")},
+                "execution_run_id": self.config.get("_execution_run_id")},
         }
 
     def _persist_progress(self, phase: str, *, started_at: str) -> None:
@@ -2277,42 +2349,12 @@ def _parse_jsonish(value: Any) -> Any:
 
 
 def _cap_benchmark_split(x, y, *, config: Mapping[str, Any]) -> tuple[Any, Any, dict[str, Any]]:
-    cap = (
-        config.get("benchmark_sample_size")
-        or config.get("max_benchmark_samples")
-        or config.get("max_eval_samples")
-    )
-    requested = _safe_int(cap)
+    from ..evaluation_sampling import evaluation_indices
     total = _sample_count(x, y)
-    if requested is None:
-        return x, y, {
-            "requested_sample_size_total": None,
-            "effective_sample_size_total": total,
-            "sample_strategy_effective": "all",
-        }
-    requested = max(0, min(total, int(requested)))
-    if requested == total:
-        return x, y, {
-            "requested_sample_size_total": requested,
-            "effective_sample_size_total": total,
-            "sample_strategy_effective": "all",
-        }
-
-    seed = _safe_int(config.get("benchmark_sample_seed"))
-    if seed is None:
-        seed = _safe_int(config.get("sample_seed"))
-    if seed is None:
-        seed = _stable_sample_seed(config)
-    benchmark_offset = 1 if config.get("benchmark_sample_seed") is None else 0
-    rng = np.random.default_rng(int(seed) + benchmark_offset)
-    idx = rng.choice(total, size=requested, replace=False)
-    return _take_rows(x, idx), _take_rows(y, idx), {
-        "requested_sample_size_total": requested,
-        "effective_sample_size_total": requested,
-        "sample_strategy_effective": "iid",
-        "sample_seed": int(seed) + benchmark_offset,
-        "benchmark_sample_seed": config.get("benchmark_sample_seed"),
-    }
+    indices, info = evaluation_indices(total, config)
+    if len(indices) == total:
+        return x, y, info
+    return _take_rows(x, indices), _take_rows(y, indices), info
 
 
 def _scalar_label_array(y) -> np.ndarray | None:
@@ -2567,7 +2609,46 @@ def _first_number(mapping: Mapping[str, Any], *keys: str) -> float | None:
     return None
 
 
+def _evaluation_evidence_config(config: Mapping[str, Any], meta: Mapping[str, Any], count: int) -> dict[str, Any]:
+    """Align source and independent-group identities with the frozen metric slice."""
+    result = dict(config)
+    prepared = config.get("_prepared_benchmark_sample_info") or {}
+    if result.get("metric_evaluation_source_ids") is None and isinstance(prepared, Mapping):
+        source_ids = prepared.get("source_ids")
+        if source_ids is not None:
+            if len(source_ids) != count:
+                raise ValueError("prepared evaluation source IDs do not match the metric slice")
+            result["metric_evaluation_source_ids"] = list(source_ids)
+    if result.get("metric_evaluation_group_ids") is not None or meta.get("metric_evaluation_group_ids") is not None:
+        return result
+    source_groups = config.get("task_source_groups") or {}
+    groups = source_groups.get("test") if isinstance(source_groups, Mapping) else None
+    if groups is None:
+        groups = meta.get("test_group_ids")
+    if groups is None:
+        return result
+    family = config.get("_family_document") or {}
+    reservation = family.get("reservation") or {}
+    full_ids = reservation.get("metric_source_ids")
+    positions = reservation.get("catalogue_positions")
+    if (full_ids is not None and positions is not None and len(groups) == len(full_ids)
+            and len(positions) == count):
+        if any(isinstance(i, bool) or int(i) != i or not 0 <= int(i) < len(groups) for i in positions):
+            raise ValueError("frozen evaluation group positions are invalid")
+        selected_ids = result.get("metric_evaluation_source_ids")
+        if selected_ids is not None and list(selected_ids) != [full_ids[int(i)] for i in positions]:
+            raise ValueError("frozen evaluation source IDs disagree with group positions")
+        groups = [groups[int(i)] for i in positions]
+    elif len(groups) != count:
+        raise ValueError("evaluation group IDs cannot be aligned to the metric slice")
+    result["metric_evaluation_group_ids"] = list(groups)
+    return result
+
+
 def _service_perturbation_metrics(model, x_eval, y_eval, *, config: Mapping[str, Any], meta: Mapping[str, Any], task_family: str):
+    from ..evaluation_protocol import BENCHMARK_PROTOCOL_VERSION, CURRENT_PROTOCOL_VERSIONS, resolve_evaluation_plan
+    version = config.get("evaluation_protocol_version") or (
+        resolve_evaluation_plan(config)["protocol_version"])
     # ``explainability_enabled`` is retained as the user-facing compatibility
     # switch. Either explicit switch enables the probe; a disabled default must
     # not erase an explicitly enabled legacy manifest field.
@@ -2575,12 +2656,19 @@ def _service_perturbation_metrics(model, x_eval, y_eval, *, config: Mapping[str,
         config.get("explainability_enabled"), False
     )
     if not enabled:
-        return {
-            "perturbation_enabled_flag": _metric(False, "explainability"),
-            "explainability_supported_flag": _metric(False, "explainability"),
-            "faithfulness_alignment_supported_flag": _metric(False, "explainability"),
-            "explainability_support_status": _metric("disabled", "explainability"),
-        }, None
+        values = {
+            "perturbation_enabled_flag": False,
+            "explainability_supported_flag": False,
+            "faithfulness_alignment_supported_flag": False,
+            "explainability_support_status": "disabled",
+            "evaluation_protocol_version": version,
+            "trust_status": "unsupported", "explainability_status": "unsupported",
+            "trust_evidence_sufficient": False, "explainability_evidence_sufficient": False,
+            "trust_score": None, "explainability_score": None,
+            "metric_evaluation_disabled": True,
+            "trust_independent_inputs": 0, "explainability_independent_inputs": 0,
+        }
+        return {key: _metric(value, metric_domain(key)) for key, value in values.items()}, None
     log_stage = _config_bool(config.get("perturbation_stage_logging"), True)
     start = time.perf_counter()
     if log_stage:
@@ -2590,13 +2678,23 @@ def _service_perturbation_metrics(model, x_eval, y_eval, *, config: Mapping[str,
             flush=True,
         )
     try:
+        evaluation_config = _evaluation_evidence_config(config, meta, _sample_count(x_eval, y_eval))
+        if version in CURRENT_PROTOCOL_VERSIONS:
+            progress_root = Path(config.get("provenance_artifact_dir") or Path(config.get("db_path") or "outputs/services.db").parent / "artifacts")
+            progress_id = hashlib.sha256(str(config.get("service_id") or "anonymous").encode()).hexdigest()
+            if version == BENCHMARK_PROTOCOL_VERSION:
+                plan = resolve_evaluation_plan(evaluation_config)
+                identity_plan = {key: value for key, value in plan.items() if not key.endswith("_max_duration_s")}
+                plan_hash = hashlib.sha256(json.dumps(identity_plan, sort_keys=True).encode()).hexdigest()
+                progress_root = progress_root / version / plan_hash
+            evaluation_config.setdefault("metric_evaluation_progress_path", str(progress_root / "evaluation_progress" / f"{progress_id}.json"))
         values = run_perturbation_stage(
             model,
             x_eval,
             y_eval,
             task_family=task_family,
             hf_task=config.get("hf_task") or meta.get("hf_task"),
-            config=dict(config),
+            config=evaluation_config,
             meta=dict(meta),
             service_id=config.get("service_id"),
         )
@@ -2610,9 +2708,17 @@ def _service_perturbation_metrics(model, x_eval, y_eval, *, config: Mapping[str,
             "explainability_support_status": "unsupported_probe_error",
             "perturbation_error": f"{type(exc).__name__}: {exc}",
             "perturbation_duration_s": elapsed,
+            "evaluation_protocol_version": version,
+            "trust_status": "failed", "explainability_status": "failed",
+            "trust_evidence_sufficient": False, "explainability_evidence_sufficient": False,
+            "trust_score": None, "explainability_score": None,
         }
     if isinstance(values, dict):
+        for dimension in ("trust", "explainability"):
+            if values.get(f"{dimension}_score") is None:
+                values.setdefault(f"{dimension}_independent_inputs", 0)
         values.setdefault("perturbation_duration_s", time.perf_counter() - start)
+        values.setdefault("evaluation_protocol_version", version)
     if log_stage:
         debug_print(
             f"[Perturbation] service stage ends | service_id={config.get('service_id') or 'unknown'} "
@@ -2624,11 +2730,16 @@ def _service_perturbation_metrics(model, x_eval, y_eval, *, config: Mapping[str,
         )
     artifact = None
     samples = values.pop("perturbation_samples", None) if isinstance(values, dict) else None
-    if samples:
+    if values.get("evaluation_protocol_version") in CURRENT_PROTOCOL_VERSIONS:
+        from .evaluation_artifacts import persist_evaluation_evidence
+        artifact = persist_evaluation_evidence(_provenance_artifact_root(config), values, samples)
+        values["metric_evaluation_evidence_ref"] = artifact["artifact_uri"]
+        values["metric_evaluation_evidence_sha256"] = artifact["metadata"]["sha256"]
+    elif samples is not None or values.get("evaluation_protocol_version"):
         artifact = {
             "artifact_type": "perturbation_samples",
             "artifact_uri": f"service://{config.get('service_id')}/perturbation_samples",
-            "metadata": {"perturbation_samples": samples},
+            "metadata": {"perturbation_samples": samples, "evaluation": dict(values)},
         }
     return {key: _metric(value, metric_domain(key)) for key, value in (values or {}).items()}, artifact
 
@@ -2717,6 +2828,8 @@ def _service_config(config: Mapping[str, Any]) -> dict[str, Any]:
         "training_memory_metadata",
         "evaluation_memory_metadata",
         "no_save_weights",
+        "weight_retention",
+        "retain_validation_checkpoint",
         "enable_perturbation_metrics",
         "explainability_enabled",
         "update_signature_enabled",

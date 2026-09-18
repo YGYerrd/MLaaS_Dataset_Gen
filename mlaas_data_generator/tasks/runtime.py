@@ -78,7 +78,7 @@ class TaskEvaluation:
 def evaluate_task_model(model, x, y, contract: TaskContract, source_ids, *, collect=False,
                         max_eval_time_s=None, progress_seconds=10, prediction_sink=None):
     core = getattr(model, "core", None)
-    if core is None or contract.family not in {"token_classification", "segmentation", "generation"}:
+    if core is None or contract.family not in {"token_classification", "segmentation", "generation", "fill_mask"}:
         raise TaskContractError("validation_not_implemented", "structured task evaluation requires its HF backend")
     torch = core.torch
     from ..models.adapters.microbatch import evaluation_batches
@@ -221,6 +221,9 @@ def evaluate_task_model(model, x, y, contract: TaskContract, source_ids, *, coll
                    "input_tokens": input_tokens, "generated_tokens": generated_tokens}
     else:
         metrics = accumulator.finalise()
+        if contract.family == "fill_mask":
+            metrics.update(masked_accuracy=metrics["accuracy"],
+                           perplexity_proxy=float(np.exp(np.clip(loss_total / supervision, -50, 50))))
     metrics.update(loss=loss_total / supervision, example_count=count, supervision_count=supervision,
                    prediction_hash=prediction_digest.hexdigest(),
                    inference_latency_s=latency, evaluation_wall_s=time.perf_counter() - start,

@@ -12,6 +12,8 @@ from typing import Any, Iterator, Mapping
 import pandas as pd
 
 from .catalogue import finite, normalise_service_rows, number
+from .evidence import filter_evaluation_evidence
+from .raw_family import FAMILY_VERSIONS, RAW_FAMILY_VERSIONS
 from .protocol import (
     LEGACY_REQUEST_SCHEMA_VERSION,
     REQUEST_SCHEMA_VERSION,
@@ -24,6 +26,7 @@ from .requirements import FUNCTIONAL_FIELDS
 LOWER_BOUND_CONSTRAINTS = {
     "min_metric_score": "metric_score",
     "min_reliability_score": "reliability_score",
+    "min_trust_score": "trust_score",
     "min_explainability_score": "explainability_score",
     "min_data_volume": "data_volume",
 }
@@ -135,7 +138,9 @@ def build_composition_instance(services: pd.DataFrame, request: Mapping[str, Any
     _validate_hard_constraints(hard_constraints, schema_version=schema_version)
 
     normalized = normalise_service_rows(services)
-    if schema_version == "5.0.0":
+    if schema_version == "6.0.0":
+        normalized["latency"] = pd.to_numeric(normalized["composition_latency_s_per_example"], errors="coerce")
+    if schema_version in {"5.0.0", "6.0.0"}:
         from .protocol import _validate_v2_request
         _validate_v2_request(request)
     strict_provenance_available = bool(
@@ -150,16 +155,19 @@ def build_composition_instance(services: pd.DataFrame, request: Mapping[str, Any
         )
     )
     eligible = normalized
-    if schema_version not in {"4.0.0", "5.0.0"}:
+    if schema_version not in {"4.0.0", "5.0.0", "6.0.0"}:
         eligible = eligible[eligible["family_contract_version"].isna()]
     elif str(request.get("compatibility_mode")) != "strict":
         raise ValueError("family requests require strict compatibility")
+    if schema_version == "6.0.0":
+        eligible = eligible[eligible.family_contract_version.isin(RAW_FAMILY_VERSIONS)]
     for field, required_value in functional_requirements.items():
         eligible = eligible[
             eligible[field].astype(str).str.lower() == str(required_value).strip().lower()
         ]
 
     if schema_version == LEGACY_REQUEST_SCHEMA_VERSION:
+        eligible = filter_evaluation_evidence(eligible, request)
         eligible = _apply_hard_constraints(
             eligible,
             hard_constraints,
@@ -192,7 +200,9 @@ def build_composition_instance(services: pd.DataFrame, request: Mapping[str, Any
             )
         eligible = _filter_strict_snapshot(eligible, compatibility_requirements)
         if not eligible.empty:
-            if schema_version == "5.0.0":
+            if schema_version == "6.0.0" and eligible.primary_metric_name.nunique() != 1:
+                raise ProvenanceIntegrityError("recipe family members disagree on the quality metric")
+            if schema_version in {"5.0.0", "6.0.0"}:
                 from .validation import supported_composition_reason
                 if reason := supported_composition_reason(eligible):
                     raise ProvenanceIntegrityError(reason)
@@ -200,6 +210,8 @@ def build_composition_instance(services: pd.DataFrame, request: Mapping[str, Any
             _validate_strict_provenance(eligible)
         else:
             empty_hash = eligible_pool_snapshot_hash(())
+            if schema_version == "6.0.0" and str(request.get("eligible_pool_snapshot_hash")) != empty_hash:
+                raise PoolSnapshotMismatch(str(request.get("eligible_pool_snapshot_hash")), empty_hash)
             return CompositionInstance(
                 eligible_services=eligible.reset_index(drop=True),
                 composition_size=composition_size,
@@ -215,6 +227,7 @@ def build_composition_instance(services: pd.DataFrame, request: Mapping[str, Any
     else:
         raise ValueError("compatibility_mode must be 'functional' or 'strict'")
 
+    eligible = filter_evaluation_evidence(eligible, request)
     eligible = _apply_hard_constraints(
         eligible,
         hard_constraints,
@@ -279,7 +292,7 @@ def _filter_strict_snapshot(
             services = services[services[field].astype(str).eq(str(requirements[field]))]
     if "family_id" in requirements:
         mask = services["generation_mode"].eq("independent") & services["composition_compatible"].eq(1)
-        mask &= services["family_contract_version"].isin(("independent_family_v1", "independent_family_v2"))
+        mask &= services["family_contract_version"].isin(FAMILY_VERSIONS)
         for field in ("family_id", "initial_state_hash", "compatibility_contract_hash"):
             mask &= services[field].astype(str).eq(str(requirements[field]))
         return services[mask].copy()
@@ -299,7 +312,7 @@ def _filter_strict_snapshot(
 
 
 def _deduplicate_strict_snapshot(services: pd.DataFrame) -> pd.DataFrame:
-    if services["family_contract_version"].isin(("independent_family_v1", "independent_family_v2")).all():
+    if services["family_contract_version"].isin(FAMILY_VERSIONS).all():
         if services.service_id.duplicated().any():
             raise ProvenanceIntegrityError("duplicate service in frozen family")
         return services.sort_values("service_id", kind="stable")

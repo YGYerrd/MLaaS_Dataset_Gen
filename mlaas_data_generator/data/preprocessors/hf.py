@@ -99,6 +99,13 @@ def prepare_hf_candidates(selection, train, test, meta, dataset_args, prepare):
     """Fit cheap raw label metadata, then prepare only selected candidates."""
     task = _resolve_text_hf_task(meta, dataset_args)
     raw_labels = train[1]
+    from ..raw_text_axis import AXIS, configured_skew_axis, with_raw_text_lengths
+    if any(c.get("_recorded_source_ids") is None
+           and (c.get("split_strategy") or c.get("distribution_type")) in {"dirichlet", "shard"}
+           and configured_skew_axis(c) == AXIS for c in selection.configs):
+        column = dataset_args.get("text_column", "text")
+        print(f"Preparation: raw text length buckets | {len(train[0]):,} training rows", flush=True)
+        meta = with_raw_text_lengths(train[0], {**meta, "text_column": column}, split="train", column=column)
     column = dataset_args.get("label_column", "label")
     if task == "image_classification" and column in train[0].column_names:
         import numpy as np

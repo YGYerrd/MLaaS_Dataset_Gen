@@ -93,6 +93,7 @@ _RUN_SHARED_FIELDS = (
     "requested_total_samples",
     "benchmark_sample_seed",
     "benchmark_sample_size",
+    "evaluation_seed",
     "participation_schedule_seed",
     "participation_schedule_version",
     "heterogeneity_intensity",
@@ -411,10 +412,25 @@ def validate_fedavg_run_entries(entries: list[Any]) -> str | None:
         )
         for client, row in first_by_client.items()
     }
-    if not set(FEDAVG_CLIENT_PROFILES).issubset(profiles.values()):
-        return "FedAvg run must contain IID, Dirichlet, shard, and quantity-skew clients"
+    from .clients.profiles import ROSTER_VERSION
+    from .clients.legacy_profiles import PROFILES as LEGACY_PROFILES, UNIFORM_PROFILE as LEGACY_UNIFORM_PROFILE
+    versions = set()
+    for row in first_by_client.values():
+        params = row.get("requested_partition_params")
+        if not isinstance(params, Mapping):
+            return "FedAvg requested partition parameters are invalid"
+        version = params.get("profile_roster_version")
+        if version is not None and version != ROSTER_VERSION:
+            return "Unsupported FedAvg profile roster version"
+        versions.add(version)
+    if len(versions) != 1:
+        return "FedAvg profile roster versions are inconsistent"
+    # Unversioned saved runs retain their original balanced roster and hashes.
+    roster = LEGACY_PROFILES if versions == {None} else FEDAVG_CLIENT_PROFILES
+    if not set(roster).issubset(profiles.values()):
+        return "FedAvg run must contain every declared distribution profile"
     expected_profile_counts = Counter(
-        FEDAVG_CLIENT_PROFILES[index % len(FEDAVG_CLIENT_PROFILES)]
+        roster[index % len(roster)]
         for index in range(declared_clients)
     )
     if Counter(profiles.values()) != expected_profile_counts:
@@ -450,17 +466,17 @@ def validate_fedavg_run_entries(entries: list[Any]) -> str | None:
         non_quantity_quotas = {
             requested_quotas[client]
             for client in clients
-            if profiles[client] != "quantity_skew"
+            if profiles[client] != LEGACY_UNIFORM_PROFILE
         }
         if len(non_quantity_quotas) != 1:
             return "FedAvg non-quantity clients must share one requested base quota"
         quantity_quotas = [
             requested_quotas[client]
             for client in clients
-            if profiles[client] == "quantity_skew"
+            if profiles[client] == LEGACY_UNIFORM_PROFILE
         ]
         if len(quantity_quotas) >= 2 and max(quantity_quotas) / min(quantity_quotas) > 8.0**intensity + 1e-12:
-            return "FedAvg requested quantity-skew quota ratio exceeds its intensity bound"
+            return "FedAvg requested historical quota ratio exceeds its intensity bound"
     if sum(requested_quotas.values()) != _safe_int(first.get("requested_total_samples")):
         return "FedAvg requested_total_samples does not equal requested client quotas"
     source_cap = first.get("fedavg_source_pool_cap")

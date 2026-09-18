@@ -1065,7 +1065,7 @@ class HFCore:
             successful_optimizer_step_count += 1
 
         # GradScaler can skip an attempted update. Count actual optimizer calls
-        # without changing historical scheduler or optimization behavior.
+        # so scheduler progress follows successful updates.
         step_counter = optimizer_obj.register_step_post_hook(record_successful_step)
 
         prefetch_depth = self._batch_prefetch_depth(xs)
@@ -1135,6 +1135,7 @@ class HFCore:
                                 memory_state.get("gradient_norm_max", 0.0), float(norm))
                             memory_state["gradient_clipped_step_count"] = (
                                 memory_state.get("gradient_clipped_step_count", 0) + int(norm > max_grad_norm))
+                        successful_steps_before = successful_optimizer_step_count
                         if grad_scaler is not None:
                             grad_scaler.step(optimizer_obj)
                             grad_scaler.update()
@@ -1142,7 +1143,7 @@ class HFCore:
                             optimizer_obj.step()
                         optimizer_obj.zero_grad(set_to_none=True)
                         optimizer_step_count += 1
-                        if scheduler is not None:
+                        if scheduler is not None and successful_optimizer_step_count > successful_steps_before:
                             scheduler.step()
                         total_loss += totals[0]
                         train_loss_denominator_count += totals[1]

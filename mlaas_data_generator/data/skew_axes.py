@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 import numpy as np
+from ..clients.legacy_profiles import UNIFORM_PROFILE as LEGACY_UNIFORM_PROFILE
+from .raw_text_axis import AXIS as RAW_TEXT_LENGTH_AXIS
 
 DEFAULT_NUMERIC_BUCKETS = 5
 DEFAULT_TOPK_BUCKETS = 16
@@ -114,7 +116,7 @@ def axis_supports_strategy(axis: ResolvedSkewAxis, strategy: str) -> tuple[bool,
         if cardinality > int(axis.bucket_spec.get("max_supported_cardinality", 16)):
             return False, f"label_per_client requires low-cardinality buckets; got {cardinality}"
         return True, None
-    if strategy == "quantity_skew":
+    if strategy == LEGACY_UNIFORM_PROFILE:
         return True, None
     if strategy == "custom":
         return False, "custom distributions remain scalar-label only"
@@ -149,6 +151,24 @@ def _try_resolve_axis(axis: str, x, y, meta: Mapping[str, Any], *, split_name: s
         if values is None:
             return None
         return _numeric_bucket_axis(axis, values, source_fields=["y"], num_bins=int(config.get("num_bins") or DEFAULT_NUMERIC_BUCKETS))
+
+    if axis == RAW_TEXT_LENGTH_AXIS:
+        from .raw_text_axis import LENGTH_FIELD, UPPER_BOUNDS, BUCKET_LABELS, raw_text_lengths, text_column
+        column = text_column(meta)
+        values = _sidecar_values(meta, split_name, {}, preferred_keys=(LENGTH_FIELD,))
+        if values is None:
+            values = raw_text_lengths(x, column)
+        if values is None:
+            return None
+        bucket_ids = np.searchsorted(UPPER_BOUNDS, np.asarray(values, dtype=np.int64), side="left")
+        if len(np.unique(bucket_ids)) < 2:
+            return None
+        return ResolvedSkewAxis(axis, axis, "ordered_numeric", bucket_ids, dict(BUCKET_LABELS),
+            {"kind": "fixed_character_length", "version": "raw_text_char_length_v1",
+             "ordered": True, "cardinality": int(len(np.unique(bucket_ids))),
+             "unit": "unicode_code_points", "normalization": "none",
+             "upper_bounds_inclusive": list(UPPER_BOUNDS), "text_column": column},
+            [f"raw.{column}"])
 
     if axis == "supervised_token_bucket":
         values = _supervised_token_counts(y, ignore_index=_ignore_index(meta), pad_value=meta.get("pad_token_id"))
@@ -232,7 +252,7 @@ def _default_axis(task_family: str | None, hf_task: str | None) -> str | None:
     if task in {"causal_lm_generation", "seq2seq_generation"} or family == "generation":
         return "supervised_token_bucket"
     if task in {"fill_mask", "masked_lm"}:
-        return "masked_token_id"
+        return RAW_TEXT_LENGTH_AXIS
     if task == "visual_question_answering" or family == "vqa":
         return "answer_vocab"
     if task == "text_image_retrieval" or family == "retrieval":

@@ -16,7 +16,7 @@ def config(task="token_classification"):
             "hf_model_id": "fixture/model", "num_labels": 3, "max_length": 32}
 
 
-def test_capability_matrix_has_six_independent_answers_and_pending_runtime():
+def test_capability_matrix_has_independent_answers_and_pending_runtime():
     rows = list(capability_matrix())
     assert rows
     assert all(set(row["capabilities"]) == set(CAPABILITIES) for row in rows)
@@ -199,7 +199,7 @@ def test_recipe_profiles_come_from_the_frozen_task_contract():
     cfg = {**config("seq2seq_generation"), "task_type": "generation", "task_tag": "summarization", "training_regime": "finetune_transfer"}
     cfg["task_contract"] = resolve_task_contract(cfg).as_dict()
     policy = build_training_policy({"config": cfg})
-    assert policy["partition_profiles"] == ["iid", "quantity_skew"]
+    assert policy["partition_profiles"] == ["iid"]
     assert not uses_task_protocol({**cfg, "task_tag": "translation"})
 
 

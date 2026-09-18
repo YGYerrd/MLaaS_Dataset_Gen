@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -75,7 +76,9 @@ def test_debug_trains_and_evaluates_without_checkpoints(debug_training, tmp_path
         assert document["training_config"]["batch_size"] == 2
         assert document["metrics"]["runtime_total_s"]["value"] == result.metrics["runtime_total_s"]["value"]
         assert len(document["splits"]) == 2
-    assert not list((tmp_path / "artifacts").rglob("*"))
+    # Weight-free debugging still persists the default benchmark evidence.
+    assert result.metrics["evaluation_protocol_version"]["value"] == "benchmark_evaluation_v1"
+    assert Path(result.metrics["metric_evaluation_evidence_ref"]["value"]).is_file()
 
 
 def test_normal_versioned_client_can_select_without_frozen_pool(debug_training):
@@ -145,6 +148,34 @@ def test_smoke_flag_skips_optional_work_and_both_signature_snapshots(debug_train
                                         (result.service_id,)).fetchone()[0])
         assert stored["smoke_test"] and not stored["update_signature_enabled"]
         assert not stored["enable_perturbation_metrics"] and not stored["explainability_enabled"]
+
+
+@pytest.mark.parametrize("profile", [None, "benchmark"])
+def test_manifest_can_disable_scoring_without_disabling_signatures(debug_training, monkeypatch, tmp_path, profile):
+    cfg, model = debug_training
+    cfg.update(enable_perturbation_metrics=True, explainability_enabled=True,
+               update_signature_enabled=True, update_signature_dir=str(tmp_path / "signatures"))
+    monkeypatch.setattr(runner, "run_perturbation_stage",
+                        lambda *a, **k: pytest.fail("disabled scoring stage invoked"))
+    source = tmp_path / "clients.csv"
+    pd.DataFrame([cfg]).to_csv(source, index=False)
+    results = manifest.run_manifest(str(source), no_trust_explainability=True,
+                                    metric_evaluation_profile=profile)
+    result = pd.read_csv(results).iloc[0]
+    assert result.status == "success", result.get("error_message")
+    assert result.service_id == "client__debug_no_weights"
+    assert model.fit_calls == 1
+    with sqlite3.connect(cfg["db_path"]) as conn:
+        document = json.loads(conn.execute(
+            "SELECT document_json FROM service_execution_provenance"
+        ).fetchone()[0])
+    metrics = document["metrics"]
+    assert metrics["metric_evaluation_disabled"]["value"] is True
+    assert metrics["trust_score"]["value"] is None
+    assert metrics["explainability_score"]["value"] is None
+    assert metrics["accuracy"]["value"] == 0.75
+    assert metrics["update_signature_available"]["value"] is True
+    assert "metric_evaluation_evidence_ref" not in metrics
 
 
 def test_smoke_cli_and_identity_are_idempotent():

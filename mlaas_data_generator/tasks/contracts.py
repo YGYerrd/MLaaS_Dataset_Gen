@@ -93,7 +93,7 @@ class TaskContract:
             valid = values[mask]
             if np.any(valid < 0):
                 raise TaskContractError("invalid_targets", "negative supervised label ID")
-            limit = self.semantics.get("num_labels") if self.family != "generation" else self.semantics.get("vocab_size")
+            limit = self.semantics.get("vocab_size") if self.family in {"generation", "fill_mask"} else self.semantics.get("num_labels")
             if limit and np.any(valid >= limit):
                 raise TaskContractError("invalid_targets", "supervised label is outside the frozen output space")
             count += int(mask.sum())
@@ -137,7 +137,7 @@ def resolve_task_contract(config: Mapping, meta: Mapping | None = None, model=No
         if observed != "unknown" and observed != family:
             raise TaskContractError("target_semantics_mismatch", "loaded dataset and declared task disagree")
     if task not in {"classification", "regression", "sequence_classification", "image_classification",
-                    "sentence_similarity", *EXTENDED_TASKS} or family == "unknown":
+                    "sentence_similarity", "fill_mask", *EXTENDED_TASKS} or family == "unknown":
         raise TaskContractError("unknown_task_contract", f"no protocol implemented for {task}")
     if task == "seq2seq_generation" and str(cfg.get("task_tag") or loaded.get("task_tag") or "").lower() != "summarization":
         raise TaskContractError("unknown_task_contract", "seq2seq validation currently requires the summarization profile")
@@ -149,7 +149,8 @@ def resolve_task_contract(config: Mapping, meta: Mapping | None = None, model=No
     ignore = int(getattr(core, "label_pad_value", loaded.get("label_pad_value", cfg.get("label_pad_value", -100))))
     names = loaded.get("label_mapping") or cfg.get("label_mapping") or getattr(model_config, "id2label", None)
     semantics = {"output_kind": {"classification": "class_probabilities", "regression": "scalar",
-                 "token_classification": "aligned_token_ids", "segmentation": "spatial_class_ids", "generation": "decoded_text"}[family],
+                 "token_classification": "aligned_token_ids", "fill_mask": "masked_token_ids",
+                 "segmentation": "spatial_class_ids", "generation": "decoded_text"}[family],
                  "label_mapping": plain(names), "num_labels": loaded.get("num_labels") or loaded.get("num_classes") or cfg.get("num_labels") or cfg.get("num_classes"),
                  "ignore_index": ignore,
                  "model_revision": cfg.get("hf_model_revision"), "model_id": cfg.get("hf_model_id"),
@@ -167,11 +168,20 @@ def resolve_task_contract(config: Mapping, meta: Mapping | None = None, model=No
                          padding_side=tokenizer.padding_side, truncation_side=tokenizer.truncation_side)
     if family == "token_classification":
         semantics["alignment"] = "first_subword_special_and_padding_ignored_v1"
+    if family == "fill_mask":
+        semantics["masking"] = {
+            "algorithm": loaded.get("masking_policy", "source_row_mask_v1"),
+            "probability": float(loaded.get("mlm_probability", cfg.get("mlm_probability", 0.15))),
+            "seed": int(loaded.get("masking_seed", cfg.get("initialization_seed", 42))),
+            "candidates": "attended_non_special_tokens",
+            "replacement": "80_percent_mask_10_percent_random_10_percent_unchanged",
+        }
     if family == "segmentation":
         semantics["target_resize"] = "nearest_to_logits_v1"
     primary, secondary = {"classification": ("accuracy", "f1_macro"), "regression": ("rmse", "mae"),
                           "token_classification": ("f1", "accuracy"), "segmentation": ("iou", "dice"),
-                          "generation": ("rouge1", "rouge2")}[family]
+                          "generation": ("rouge1", "rouge2"),
+                          "fill_mask": ("masked_accuracy", "perplexity_proxy")}[family]
     if task == "sentence_similarity" and family == "regression":
         primary, secondary = "pearson", "spearman"
     evaluation = {"profile": f"{task}_v1", "primary": primary, "secondary": secondary,
@@ -179,6 +189,10 @@ def resolve_task_contract(config: Mapping, meta: Mapping | None = None, model=No
                   "unit": "supervised_token" if family == "token_classification" else "valid_pixel" if family == "segmentation" else "example",
                   "reduction": "corpus_confusion_weighted_f1" if family == "token_classification" else "corpus_macro_iou_dice_union_present" if family == "segmentation" else "dataset",
                   "minimum_supervision": 1}
+    if family == "fill_mask":
+        evaluation.update(unit="masked_token", reduction="corpus_masked_tokens",
+                          metric_implementation="masked_accuracy_exp_token_mean_cross_entropy_v1",
+                          perplexity_loss_clip=[-50.0, 50.0])
     if family == "generation":
         if cfg.get("prompt_prefix") or cfg.get("task_prefix"):
             raise TaskContractError("unknown_task_contract", "summarisation v1 accepts source text as stored; prompt prefixes require a preprocessing profile")
@@ -211,11 +225,19 @@ def resolve_task_contract(config: Mapping, meta: Mapping | None = None, model=No
                          eos_token_id=getattr(model_config, "eos_token_id", None),
                          pad_token_id=getattr(model_config, "pad_token_id", None),
                          source_prefix="", prepared_padding="right_with_attention_mask; target_padding_ignored")
-    profiles = ["iid", "quantity_skew"] if family in {"segmentation", "generation"} else ["iid", "dirichlet", "shard", "quantity_skew"]
+    from ..clients.profiles import PROFILES
+    profiles = ["iid"] if family in {"segmentation", "generation"} else list(PROFILES)
+    if cfg.get("task_contract"):
+        from ..clients.legacy_profiles import restored_task_profiles
+        previous = TaskContract.from_dict(cfg["task_contract"])
+        profiles = restored_task_profiles(profiles, previous.sampling["profiles"])
+        # Expanding new fill-mask capabilities must not rewrite frozen recipes.
+        if family == "fill_mask" and previous.sampling["profiles"] in (["iid"], ["iid", "quantity_skew"]):
+            profiles = list(previous.sampling["profiles"])
     return TaskContract(task, family, semantics,
-        {"unit": "image" if family == "segmentation" else "sequence" if family in {"token_classification", "generation"} else "example",
+        {"unit": "image" if family == "segmentation" else "sequence" if family in {"token_classification", "generation", "fill_mask"} else "example",
          "profiles": profiles, "grouping": "declared_source_group", "aggregation_weight_unit": "training_examples"},
-        {"objective": "masked_cross_entropy" if family in {"token_classification", "segmentation", "generation"} else "regression" if family == "regression" else "cross_entropy",
+        {"objective": "masked_cross_entropy" if family in {"token_classification", "segmentation", "generation", "fill_mask"} else "regression" if family == "regression" else "cross_entropy",
          "budget_unit": "optimizer_updates", "minimum_successful_updates": 1}, evaluation)
 
 

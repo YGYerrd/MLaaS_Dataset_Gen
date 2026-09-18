@@ -243,9 +243,45 @@ def test_manifest_fill_mask_knob_variants_include_mlm_probability():
 
     assert list(df["knob_variant"]) == [0, 1, 2, 3]
     assert list(df["mlm_probability"]) == [0.10, 0.15, 0.20, 0.30]
+    assert list(df["split_strategy"]) == list(df["distribution_type"]) == ["iid", "dirichlet", "iid", "dirichlet"]
+    assert set(df["skew_axis"]) == {"raw_text_length_bucket"}
     for payload, expected in zip(df["service_config"], df["mlm_probability"], strict=False):
         config = json.loads(payload)
         assert config["mlm_probability"] == expected
+        assert config["skew_axis"] == "raw_text_length_bucket"
+
+
+def test_new_fill_mask_recipe_roster_enables_raw_dirichlet():
+    df = build_hf_manifest(task_keys=["fill_mask"], models_per_task=1, datasets_per_model=1,
+        training_regimes=["finetune_transfer"], clients_per_family=6, average_samples=50, seed=123)
+    assert set(df["split_strategy"]) == {"iid", "dirichlet", "shard"}
+    assert set(df.loc[df["split_strategy"] != "iid", "skew_axis"]) == {"raw_text_length_bucket"}
+    for _, row in df.iterrows():
+        validation = _validate_row(_resolve_row(row, {}))
+        assert validation.ok, validation.error
+
+
+@pytest.mark.parametrize("strategy", ["iid", "dirichlet", "shard"])
+def test_manifest_validates_masked_token_skew_before_grouping(strategy):
+    row = pd.Series({
+        "service_id": f"fill_mask_{strategy}", "dataset": "hf",
+        "model_type": "hf_finetune", "hf_model_id": "distilroberta-base",
+        "dataset_name": "wikitext", "dataset_config": "wikitext-103-raw-v1",
+        "task_type": "classification", "hf_task": "fill_mask",
+        "training_regime": "finetune_transfer", "batch_size": 4,
+        "training_epochs": 1, "sample_size": 37,
+        "split_strategy": strategy, "distribution_type": strategy,
+        "skew_axis": "masked_token_id",
+    })
+    resolved = _resolve_row(row, {})
+    validation = _validate_row(resolved)
+    if strategy == "iid":
+        assert validation.ok, validation.error
+    else:
+        assert not validation.ok
+        assert "masked_token_id" in validation.error
+        assert "incompatible with raw-row selection" in validation.error
+    assert resolved["split_strategy"] == strategy
 
 
 def test_manifest_inference_uses_explicit_dataset_matches():
@@ -281,7 +317,12 @@ def test_manifest_text2text_inference_honours_explicit_evaluation_budget():
     assert set(t5_base["max_eval_time_s"]) == {240}
     assert set(t5_small["max_eval_time_s"]) == {240}
     assert "max_samples" not in df.columns
-    assert set(t5_base["benchmark_sample_size"]) == set(t5_small["benchmark_sample_size"]) == {768}
+    from mlaas_data_generator.config import CONFIG
+    assert set(t5_base["benchmark_sample_size"]) == set(t5_small["benchmark_sample_size"]) == {CONFIG["benchmark_sample_size"] // 4}
+    assert {
+        json.loads(payload)["benchmark_sample_size"]
+        for payload in df["service_config"]
+    } == {CONFIG["benchmark_sample_size"] // 4}
 
 
 def test_manifest_service_ids_are_deterministic():
@@ -346,7 +387,8 @@ def test_run_manifest_dry_run_validates_service_rows(tmp_path):
     assert "num_clients" not in resolved
 
 
-def test_run_manifest_skips_service_id_already_in_database(monkeypatch, tmp_path):
+@pytest.mark.parametrize("evaluation_profile", [None, "benchmark"])
+def test_run_manifest_skips_service_id_already_in_database(monkeypatch, tmp_path, evaluation_profile):
     manifest = tmp_path / "manifest.csv"
     db_path = tmp_path / "services.db"
     results_path = tmp_path / "service_manifest_results.csv"
@@ -381,7 +423,7 @@ def test_run_manifest_skips_service_id_already_in_database(monkeypatch, tmp_path
     monkeypatch.setattr(run_manifest_module, "_write_multimodal_audit_csv", lambda **kwargs: None)
     monkeypatch.setattr(run_manifest_module, "_write_missing_multimodal_manifest_csv", lambda **kwargs: None)
 
-    run_manifest(str(manifest), db_path=str(db_path))
+    run_manifest(str(manifest), db_path=str(db_path), metric_evaluation_profile=evaluation_profile)
 
     results = pd.read_csv(results_path)
     assert results.iloc[0]["service_id"] == "svc_existing"
@@ -403,6 +445,34 @@ def test_existing_service_lookup_checks_gpu_database_shards(tmp_path):
     assert found == str(shard_path)
 
 
+def test_run_manifest_does_not_skip_same_service_id_from_different_family(monkeypatch, tmp_path):
+    manifest = tmp_path / "manifest.csv"
+    db_path = tmp_path / "services.db"
+    results_path = tmp_path / "service_manifest_results.csv"
+    pd.DataFrame([{
+        "service_id": "same-service", "family_id": "family-b", "enabled": True,
+        "dataset": "fixture", "model_type": "generic", "task_type": "classification",
+        "training_regime": "generic",
+    }]).to_csv(manifest, index=False)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE services(service_id TEXT, family_id TEXT, status TEXT)")
+        conn.execute("INSERT INTO services VALUES ('same-service','family-a','completed')")
+
+    calls = []
+    def fake_execute(config):
+        calls.append((config["family_id"], config["service_id"]))
+        return ServiceExecutionResult(service_id=config["service_id"], status="success",
+                                      db_path=str(db_path), metrics={})
+
+    monkeypatch.setattr(run_manifest_module, "MANIFEST_RESULTS_PATH", results_path)
+    monkeypatch.setattr(run_manifest_module, "_ensure_manifest_preflight", lambda enabled_df: None)
+    monkeypatch.setattr(run_manifest_module, "execute_service", fake_execute)
+    monkeypatch.setattr(run_manifest_module, "_write_multimodal_audit_csv", lambda **kwargs: None)
+    monkeypatch.setattr(run_manifest_module, "_write_missing_multimodal_manifest_csv", lambda **kwargs: None)
+    run_manifest(str(manifest), db_path=str(db_path))
+    assert calls == [("family-b", "same-service")]
+
+
 def test_existing_lookup_only_trusts_completed_status(tmp_path):
     db = tmp_path / "services.db"
     with sqlite3.connect(db) as conn:
@@ -415,6 +485,20 @@ def test_existing_lookup_only_trusts_completed_status(tmp_path):
     assert run_manifest_module._find_existing_service_database(db, "done", cache) == str(db)
     for service_id in ("active", "bad", "unknown", "absent"):
         assert run_manifest_module._find_existing_service_database(db, service_id, cache) is None
+
+
+def test_existing_lookup_uses_exact_family_service_pair_when_family_is_supplied(tmp_path):
+    db = tmp_path / "services.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute("CREATE TABLE services(service_id TEXT, family_id TEXT, status TEXT)")
+        conn.execute("INSERT INTO services VALUES ('same-service','family-a','completed')")
+    cache = {}
+    assert run_manifest_module._find_existing_service_database(
+        db, "same-service", cache, "family-a"
+    ) == str(db)
+    assert run_manifest_module._find_existing_service_database(
+        db, "same-service", cache, "family-b"
+    ) is None
 
 
 def test_manifest_progress_does_not_redraw_for_each_print(monkeypatch, capsys):
@@ -722,6 +806,7 @@ class TransformersGroupedModel:
 
 def _grouped_manifest_rows(db_path):
     base = {
+        "weight_retention": "checkpoint",  # Mock adapter lacks replay completion observations.
         "enabled": True,
         "dataset": "hf",
         "dataset_name": "fixture/dataset",

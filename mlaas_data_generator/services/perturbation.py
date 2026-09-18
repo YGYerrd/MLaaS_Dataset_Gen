@@ -21,6 +21,25 @@ class PredictionProbe:
 
 
 def run_perturbation_stage(
+    model, x_eval, y_eval=None, *, task_family=None, hf_task=None,
+    config=None, meta=None, service_id=None,
+) -> dict:
+    """Dispatch a named protocol and always label legacy measurements."""
+    from ..evaluation_protocol import CURRENT_PROTOCOL_VERSIONS, LEGACY_PROTOCOL_VERSION, resolve_evaluation_plan
+    config = dict(config or {})
+    version = config.get("evaluation_protocol_version") or resolve_evaluation_plan(config)["protocol_version"]
+    kwargs = dict(task_family=task_family, hf_task=hf_task, config=config, meta=meta, service_id=service_id)
+    if version in CURRENT_PROTOCOL_VERSIONS:
+        from .production_evaluation import run_production_evaluation
+        return run_production_evaluation(model, x_eval, y_eval, **kwargs)
+    if version != LEGACY_PROTOCOL_VERSION:
+        raise ValueError(f"unsupported evaluation_protocol_version: {version}")
+    result = _run_legacy_perturbation_stage(model, x_eval, y_eval, **kwargs)
+    result["evaluation_protocol_version"] = LEGACY_PROTOCOL_VERSION
+    return result
+
+
+def _run_legacy_perturbation_stage(
     model,
     x_eval,
     y_eval=None,
@@ -1190,7 +1209,7 @@ def _probe_from_array(raw, *, task_family=None):
         return PredictionProbe(prediction=pred, confidence=float(np.max(probs)), output_value=None, scores=probs)
     if sample.ndim >= 2 and sample.shape[-1] > 1 and (task_family or "") != "regression":
         probs = _as_probability_vector(sample.reshape(-1, sample.shape[-1]).astype("float64"))
-        pred = tuple(np.argmax(probs, axis=-1).astype(int).tolist()[:128])
+        pred = tuple(np.argmax(probs, axis=-1).astype(int).tolist())
         conf = float(np.mean(np.max(probs, axis=-1)))
         return PredictionProbe(prediction=pred, confidence=conf, output_value=None, scores=probs)
     value = float(np.asarray(sample).reshape(-1)[0])
@@ -1245,8 +1264,8 @@ def _probe_from_hf_logits(torch, logits, pred_t, enc, *, task_family=None, hf_ta
     if arr.ndim == 4:
         probs = torch.softmax(logits, dim=1).detach().cpu().numpy()[0]
         max_probs = np.max(probs, axis=0)
-        dominant = int(np.argmax(np.bincount(np.argmax(probs, axis=0).reshape(-1))))
-        return PredictionProbe(prediction=dominant, confidence=float(np.mean(max_probs)), output_value=None, scores=probs)
+        mask = np.argmax(probs, axis=0)
+        return PredictionProbe(prediction=mask, confidence=float(np.mean(max_probs)), output_value=None, scores=probs)
     return PredictionProbe(prediction=pred, confidence=np.nan, output_value=None)
 
 
@@ -1276,17 +1295,13 @@ def _tensor_prediction(value):
             return int(flat[0])
         except Exception:
             return float(flat[0])
-    return tuple(int(v) for v in flat[:128])
+    return tuple(int(v) for v in flat)
 
 
 def _meaningful_units(x_sample, y_sample=None, *, task_family=None, meta=None, limit=8):
     modality = _modality(x_sample, task_family=task_family, meta=meta)
     if modality == "tokens":
         positions = _token_positions(x_sample)
-        if str(task_family or "") == "token_classification":
-            spans = _entity_spans(y_sample, positions)
-            if spans:
-                return _limited(spans, limit)
         return _limited([("token", int(pos)) for pos in positions], limit)
     if modality == "text":
         words = str(x_sample).split()
