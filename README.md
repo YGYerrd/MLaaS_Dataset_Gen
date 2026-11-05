@@ -4,6 +4,10 @@ Generate machine-learning service catalogues, then search and evaluate compatibl
 service compositions. Each service trains independently from a frozen family
 checkpoint.
 
+The retained catalogues are `outputs/legacy/services.db` (19,406 services) and
+`outputs/pooled/services.db` (6,975 services in 70 pools). Their signatures and
+pooled replay dependencies live alongside them. See [dataset layout and limits](docs/datasets.md).
+
 ## Quick start
 
 Use Python 3.12 and a virtual environment. Install a suitable PyTorch build before
@@ -32,6 +36,13 @@ Completed services persist their resolved configuration, provenance and artifact
 references in SQLite, so the original manifest is not required for interpretation,
 reproduction or resume.
 
+To execute a CSV produced by `mlaas-compose generate-manifest`, use
+`mlaas-compose run-manifest --file outputs/pooled/composition_manifest.csv --source-db outputs/pooled/services.db --db outputs/compositions.db`.
+This retrains and evaluates one composition per GPU and stores lightweight service
+references and global results separately. See the
+[batch executor guide](docs/recipe-composition.md#execute-a-composition-manifest)
+for dry-run, resume, CPU execution and source artifact requirements.
+
 ## Key files
 
 | File or folder | Purpose |
@@ -47,9 +58,9 @@ reproduction or resume.
 | [mlaas_composition/](mlaas_composition/) | Request generation, search and validation |
 | [tests/](tests/) | Small core regression suite |
 | [docs/](docs/README.md) | Usage, design contracts and research material |
-| [scripts/](scripts/) | Environment setup and activation only |
+| [scripts/](scripts/) | Environment helpers, pool preparation and reconstruction validation |
 | [sql/](sql/) | Reporting queries |
-| `outputs/` | Local manifests, databases, models and results (ignored by Git) |
+| `outputs/` | Retained legacy and pooled datasets; see [dataset layout](docs/datasets.md) (ignored by Git) |
 
 ## Checks
 
@@ -60,8 +71,8 @@ python -m mlaas_composition --help
 ```
 
 The core suite covers manifest execution, service records, checkpoint integrity,
-composition requests, search and validation. Extended tests and one-off
-investigations are recoverable through the [cleanup archive](docs/cleanup.md).
+composition requests, search and validation. Obsolete diagnostic scripts and their dedicated tests were removed;
+see the [cleanup record](docs/cleanup.md).
 
 See the [full usage guide](docs/usage.md) for installation, manifest options, GPU
 workers, retries and troubleshooting. The optional

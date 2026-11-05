@@ -141,7 +141,8 @@ def test_recipe_only_persists_normal_completed_service_without_client_weights(tr
         assert conn.execute("SELECT service_id,status FROM services").fetchone() == ("recipe", "completed")
         assert conn.execute("SELECT count(*) FROM service_checkpoint_storage").fetchone()[0] == 0
         assert conn.execute("SELECT count(*) FROM lineage_checkpoint_storage").fetchone()[0] == 1
-        assert conn.execute("SELECT composition_compatible FROM service_generation_provenance").fetchone()[0] == 0
+        # Replayable classification recipes are eligible without client checkpoints.
+        assert conn.execute("SELECT composition_compatible FROM service_generation_provenance").fetchone()[0] == 1
         stored = json.loads(conn.execute("SELECT service_config_json FROM services").fetchone()[0])
         assert stored["weight_retention"] == "recipe_only" and not stored["retain_validation_checkpoint"]
     recipe = replay.read_recipe(cfg["db_path"], "recipe")

@@ -36,7 +36,7 @@ def latency_per_example(recipe):
     return latency, source
 
 
-def verified_member(db_path, service_id, *, cache=None):
+def verified_member(db_path, service_id, *, cache=None, require_replay=False, verify_base=True):
     """Verify durable evidence without replaying training or modifying the catalogue.
 
     Older raw-source publications carry composition_compatible=0 because the
@@ -61,7 +61,7 @@ def verified_member(db_path, service_id, *, cache=None):
     if row["family_contract_version"] not in RAW_FAMILY_VERSIONS:
         raise ValueError("unsupported raw-source family version")
     recipe = read_recipe(db_path, service_id)
-    doc = read_preparation(row["family_document_ref"], row["family_document_hash"], cache=cache)
+    doc = read_preparation(row["family_document_ref"], row["family_document_hash"], cache=cache, verify_base=verify_base)
     if doc["version"] != row["family_contract_version"]:
         raise ValueError("service and family versions disagree")
     for field in ("family_id", "initial_state_hash", "compatibility_contract_hash"):
@@ -79,13 +79,13 @@ def verified_member(db_path, service_id, *, cache=None):
     if not ids or set(ids) & set(doc["reservation"]["metric_source_ids"]):
         raise ValueError("client training rows overlap evaluation or are empty")
     policy = recipe["retention"]["policy"]
-    if policy == "recipe_only":
+    if policy not in {"recipe_only", "checkpoint"}:
+        raise ValueError("unsupported weight retention policy")
+    if policy == "recipe_only" or require_replay:
         if not replay_supported(recipe["training"]["observations"], recipe["training"].get("memory_metadata")):
             raise ValueError("client training trajectory is not replayable")
     elif policy == "checkpoint":
         verify_completed(db_path, service_id, invalidate=False, cache=cache)
-    else:
-        raise ValueError("unsupported weight retention policy")
     from mlaas_data_generator.task_capabilities import resolve_capabilities
     decision = resolve_capabilities({**doc["config"], **row, "weight_retention": policy}, stage="composition")["measured_composition_validation"]
     if decision["decision"] == "ineligible":

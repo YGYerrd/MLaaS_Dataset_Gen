@@ -1356,6 +1356,22 @@ python -m pytest \
 
 ## Troubleshooting
 
+If family preparation reports CVE-2025-32434 or says `torch.load` requires
+PyTorch 2.6, check the interpreter used by the failing run:
+
+```bash
+python -c "import sys, torch; print(sys.executable); print(torch.__version__)"
+```
+
+Install PyTorch 2.6 or newer with matching torchvision and torchaudio builds
+for your platform, then restart any running workers or notebook kernels before
+retrying. See the [PyTorch installation guide](https://pytorch.org/get-started/locally/).
+For this repository's Windows ROCm environment, activate it with
+`.\scripts\Activate-ROCm-Venv.ps1`; use the setup script above if it needs to be
+rebuilt. The loader prefers safetensors, but checkpoints that fall back to
+PyTorch `.bin` weights require the patched PyTorch version. Do not bypass the
+Transformers security check; see [CVE-2025-32434](https://nvd.nist.gov/vuln/detail/CVE-2025-32434).
+
 
 
 If `torch.cuda.is_available()` is `False`, check the installed PyTorch build first. On NVIDIA, verify the CUDA install you selected. On AMD Windows ROCm, verify that you used `.\scripts\setup_windows_rocm_venv.ps1`, that Python is 3.12, and that the installed wheel version matches AMD's current Windows ROCm support matrix.

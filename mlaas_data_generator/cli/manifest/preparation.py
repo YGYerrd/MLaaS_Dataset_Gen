@@ -28,6 +28,7 @@ from ...services import runner
 from ...execution_state import persist_terminal
 from ...data.source_contract import prepared_fingerprint, unpadded_targets
 from ...evaluation_sampling import evaluation_settings
+from ...artifact_paths import resolve_artifact_path
 
 VERSION = "raw_source_family_v4"
 TASK_VERSION = VERSION
@@ -191,8 +192,10 @@ def load_prepared(config, *, load_dataset=None, build_model=None):
         raise
 
 
-def read_preparation(path, digest, *, cache=None):
-    key = (str(path), str(digest))
+def read_preparation(path, digest, *, cache=None, verify_base=True):
+    path = resolve_artifact_path(path)
+    # Metadata-only preflight must never populate the fully verified cache entry.
+    key = (str(path), str(digest)) if verify_base else (str(path), str(digest), False)
     if cache is not None and key in cache:
         return cache[key]
     if sha256_file(path) != digest:
@@ -207,18 +210,26 @@ def read_preparation(path, digest, *, cache=None):
             or any(doc[key] != contract[key] for key in ("config", "initial_state_hash", "compatibility", "raw_source", "shared_fitted_state", "evaluation_data_hash"))
             or doc["reservation"]["reservation_hash"] != contract["reservation_hash"]):
         raise ValueError("family document disagrees with its identity contract")
-    if sha256_file(doc["reservation_ref"]) != doc["reservation_file_hash"]:
+    reservation_path = resolve_artifact_path(doc["reservation_ref"])
+    if sha256_file(reservation_path) != doc["reservation_file_hash"]:
         raise ValueError("family evaluation reservation changed")
-    if json.loads(Path(doc["reservation_ref"]).read_text(encoding="utf-8")) != doc["reservation"]:
+    if json.loads(reservation_path.read_text(encoding="utf-8")) != doc["reservation"]:
         raise ValueError("family evaluation reservation disagrees with preparation")
     for artifact in doc.get("reconstruction_support", ()):
-        if path_integrity(artifact["artifact_uri"])["sha256"] != artifact["metadata"]["sha256"]:
+        if path_integrity(resolve_artifact_path(artifact["artifact_uri"]))["sha256"] != artifact["metadata"]["sha256"]:
             raise ValueError("family reconstruction support changed")
     if _support_hashes(doc["reconstruction_support"]) != contract["reconstruction_support_hashes"]:
         raise ValueError("family reconstruction assets disagree with its identity")
-    state = load_lineage_base(doc["store_root"], doc["lineage_id"], expected_parameter_schema_hash=doc["compatibility"]["parameter_schema_hash"])
-    if state.sha256 != doc["initial_state_hash"]:
-        raise ValueError("family initial checkpoint changed")
+    if verify_base:
+        state = load_lineage_base(resolve_artifact_path(doc["store_root"]), doc["lineage_id"], expected_parameter_schema_hash=doc["compatibility"]["parameter_schema_hash"])
+        if state.sha256 != doc["initial_state_hash"]:
+            raise ValueError("family initial checkpoint changed")
+    else:
+        from ...checkpoint_store import inspect_lineage_base
+        base = inspect_lineage_base(resolve_artifact_path(doc["store_root"]), doc["lineage_id"])
+        if (base["tensor_state_sha256"] != doc["initial_state_hash"]
+                or base["parameter_schema_hash"] != doc["compatibility"]["parameter_schema_hash"]):
+            raise ValueError("family initial checkpoint metadata changed")
     if cache is not None:
         cache[key] = doc
     return doc
@@ -312,7 +323,7 @@ def prepare(config, *, load_dataset=None, build_model=None, selection_configs=No
     if error:
         raise ValueError(error)
     reference = config.get("_family_reference")
-    root = Path(runner._provenance_artifact_root(config)).resolve()
+    root = resolve_artifact_path(runner._provenance_artifact_root(config)).resolve()
     selection_keys = ("service_id", "client_id", "client_partition_index", "sample_size", "sample_frac",
         "sample_seed", "seed", "split_strategy", "distribution_type", "distribution_param", "skew_axis",
         "skew_axis_config", "heterogeneity_intensity", "shard_support_quantile", "hf_task", "task_type",
@@ -394,9 +405,10 @@ def prepare(config, *, load_dataset=None, build_model=None, selection_configs=No
                 artifact = write_json_artifact(root, family, "family_preparation", shared._clean(doc))
                 reference = {"document_ref": artifact["artifact_uri"], "document_hash": artifact["metadata"]["sha256"]}
                 _atomic_json(index, reference)
-            state = load_lineage_base(doc["store_root"], doc["lineage_id"])
+            store_root = resolve_artifact_path(doc["store_root"])
+            state = load_lineage_base(store_root, doc["lineage_id"])
             restore_model_tensor_state(model, state, verify=True)
-            base = ensure_lineage_base(doc["store_root"], doc["lineage_id"], model,
+            base = ensure_lineage_base(store_root, doc["lineage_id"], model,
                 parameter_schema_hash=doc["compatibility"]["parameter_schema_hash"])
             return doc, reference, cfg, prepared, state, base
         except BaseException:

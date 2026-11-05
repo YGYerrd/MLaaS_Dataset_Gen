@@ -25,7 +25,7 @@ Backups, per-service quality evidence, verification results, and the cleanup
 record are under `outputs/artifact_store_migration_20260909/`.
 The retired physical store was removed after verification: 2,722 redundant files,
 108.63 GB in total. The consolidated store occupies 43.18 GB. See the local
-[completion audit](../outputs/artifact_store_migration_20260909/REPORT.md).
+completion audit.
 
 ## One-off migration of trained legacy checkpoints
 

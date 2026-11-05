@@ -3,8 +3,8 @@
 The `recipe_composition_v6` request profile searches verified `raw_source_family_v3`
 and `raw_source_family_v4` services. It uses request schema `6.0.0` and
 `collaborative_objective.v3`. Existing request/objective versions retain their
-scoring definitions. No tests or model executions were run while implementing
-this workflow; the commands below are the manual validation procedure.
+scoring definitions. The commands below describe manual validation of this
+workflow and batch execution of generated composition manifests.
 
 ## Prepare a family
 
@@ -30,6 +30,118 @@ The audit reservation must already exist in the family; by default validation
 requires at least 64 audit examples. Validation uses its exact saved rows and
 does not create a new split. A bounded catalogue evaluation may leave additional
 source rows unused; those remain reserved from training too.
+
+## Generate a random composition manifest
+
+Use a prepared pool directory containing `pools.csv`, `services.csv`, and
+`services.db` to select compositions of **2, 3, 5, 7, and 10 services**:
+
+```powershell
+mlaas-compose generate-manifest `
+  --prepared-dir outputs/pooled `
+  --compositions 1000 `
+  --seed 42 `
+  --output outputs/pooled/composition_manifest.csv
+```
+
+From a source checkout, replace `mlaas-compose` with
+`.\.venv\Scripts\python.exe -m mlaas_composition`.
+`--compositions` is a required positive approximate total; the seed defaults to
+42. Every eligible family/size pair receives the same quota: the requested total
+divided by the pair count, rounded to the nearest integer (halves round up), with
+a minimum of one. The current 70 pools give 350 pairs, so requesting 1,000 yields
+1,050 compositions, and requesting fewer than 350 still yields at least 350.
+For a different prepared dataset, pairs lacking enough eligible services are
+skipped. Quotas are capped at the number of unique combinations and sampling
+attempts are bounded; any shortfall is reported without redistribution.
+
+Only verified pools and verified, completed services are eligible. Each
+composition contains distinct services from one family. Services may appear in
+multiple compositions, but duplicate combinations are excluded. Sampling uses a
+small, fixed preference for shorter recorded training times. Sizes are determined
+from actual membership, including 3 and 7 even if the preparation report lists
+older supported sizes.
+
+The CSV contains `combination_id`, `family_id`, `composition_size`, and
+`service_ids` (a sorted JSON array). Combination IDs hash the family and sorted
+membership, so the same selection retains its ID across seeds and runs.
+`composition_manifest.metadata.json` records the generator version, seed,
+requested/actual counts, sizes, eligible pair count, quota, normalized input
+fingerprint, skipped pairs, and shortfalls. Identical normalized inputs, count,
+seed, and generator version produce byte-identical CSV and metadata files,
+independent of source row order or directory location. The fingerprint covers
+membership and training times, rather than every byte of the database.
+
+Both outputs are protected against replacement unless `--overwrite` is supplied;
+prepared input files cannot be replaced by this command. The database is opened
+read-only. Generation performs no training, scoring, artifact replay, or
+aggregation. This selection manifest does not certify aggregation success and
+is not an input to the existing `evaluate` or `validate` commands.
+
+## Execute a composition manifest
+
+Run the generated CSV directly with one complete composition per GPU worker:
+
+```powershell
+python -m mlaas_composition run-manifest `
+  --file outputs/pooled/composition_manifest.csv `
+  --source-db outputs/pooled/services.db `
+  --db outputs/compositions.db `
+  --dry-run
+
+# Remove --dry-run after reviewing the metadata validation results.
+```
+
+`--dry-run` verifies recipes, family contracts, audit reservations and checkpoint
+references without reading tensor payloads, training, or creating results files.
+Tensor integrity and raw-data reconstruction are verified during execution.
+The companion manifest metadata JSON is optional; the CSV and source catalogue
+provide execution inputs.
+
+Automatic execution uses every visible GPU, with at most one process per GPU.
+`--workers 2` caps this at two GPUs; `--device cpu` runs sequentially on the CPU.
+Inherited GPU visibility masks are respected. Automatic mode fails explicitly
+when no GPU is available. Members train sequentially in service-ID order, using
+their saved recipes and the existing trainer. Every composition retrains all its
+members, including services with retained checkpoints and services already used
+in another composition. Training follows the recorded completed budget rather
+than the original wall-clock cutoff, as in normal recipe reconstruction.
+
+The existing sample-weighted parameter aggregator produces one global model.
+Only that model is evaluated, on the family's exact reserved audit set (minimum
+64 examples), using the existing task metrics and quality normalisation. Member
+quality values refer to original catalogue measurements. New member/global
+weights are discarded; the shared initial checkpoint remains a required input.
+`training_wall_s` includes member preparation, replay and state capture.
+
+Results use a separate SQLite database. Its five tables are
+`composition_runs`, `source_services`, `compositions`, `composition_members`,
+and `composition_metrics`. Service snapshots contain identifiers, selected
+catalogue metric references and artifact hashes/locations. Recipes, model
+artifacts and datasets remain in the source store. The coordinator alone writes
+results, and a lock prevents concurrent executors using the same destination.
+
+Repeating the command resumes a matching manifest/source-evidence/executor
+fingerprint. Completed compositions are skipped; failed or interrupted ones
+restart from their first member. Changed inputs create a new run in the same
+database. Use a new destination to deliberately repeat identical inputs.
+A failed member prevents aggregation of that composition; other compositions
+continue, and the command exits nonzero if any failed. Completion and metrics
+are committed together. Worker crashes are recorded and replacement processes
+handle subsequent jobs.
+
+`run-manifest` automatically reads `path_map.json` beside `--source-db`, when
+present. Use `--path-map path/to/map.json` to select a different map. The
+`composition_path_map_v1` format contains a `prefixes` list of `recorded` and
+`resolved` directory paths; relative destinations are resolved against the map's
+directory. The longest matching directory prefix wins. This lets the imported
+catalogue at `outputs/pooled` retain its Linux references while reading local
+recipes, family documents, reservations, support artifacts and checkpoints.
+The same mappings apply during preflight and CPU/GPU replay. Original document
+contents, catalogue records and integrity checks remain unchanged. The map's
+HF cache fields are preparation metadata; configure Hugging Face caches through
+the usual runtime environment separately. A verified preparation roster does
+not establish that local replay will succeed; use dry-run before a long batch.
 
 ## Run from the repository root in PowerShell
 

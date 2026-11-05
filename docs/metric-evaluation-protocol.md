@@ -25,7 +25,7 @@ silently shrink a pilot. `metric_evaluation_budget_fractions` defaults to
 `[0.1, 0.25, 0.5]`. Benchmark validation defaults to empirical replacement only;
 `explanation_replacement_methods=["empirical", "mean"]` explicitly enables the
 second mean/mask replacement. Diagnostic, pilot and production presets retain
-both methods. The [pilot reassessment](benchmark-evaluation-pilot.md#final-budget-and-replacement-review)
+both methods. The pilot reassessment
 records the evidence for this runtime tradeoff. Occlusion ranking remains empirical.
 
 For `benchmark_evaluation_v1`, each stage uses
@@ -181,27 +181,8 @@ current evaluation. Trust has its own preference weight and constraints.
 Use `evaluation_requirements.protocol_version=production_evaluation_v1` to
 request the previous protocol explicitly; versions are not mixed in one request.
 
-## Reconstruction pilot
+## Historical reconstruction pilot
 
-`scripts/pilot_metric_evaluation.py` selects one service per recorded family,
-reconstructs it without reading client checkpoints, and expands the official
-held-out slice with its frozen preprocessing. Original training rows and audit
-reservations are excluded. Source metrics remain unchanged. Evidence and
-progress are written to a separate output directory. The harness now defaults
-to the benchmark preset and its runtime windows; `--evaluation-profile pilot`
-still selects the larger earlier budgets. Unsupported task contracts remain
-unsupported; this pilot adds no new task coverage.
-
-```powershell
-.venv\Scripts\python.exe scripts/pilot_metric_evaluation.py `
-  --source-db outputs/retention_stage_f_final_20260915/services.db `
-  --source-db outputs/reconstruction_tasks_20260915/services.db `
-  --output-dir outputs/benchmark_evaluation_pilot `
-  --evaluation-profile benchmark --workers 2
-```
-
-The harness accepts additional source catalogues and repeated `--service-id`
-filters. Cached/offline operation uses the existing model and dataset cache;
-set `HF_DATASETS_CACHE` to a writable cache and limit CPU threads for reproducible
-timings. Pilot evidence applies to the recorded models, data, preprocessing,
-runtime and interventions. It does not enable the larger profile globally.
+The September 2026 one-off pilot harness and its generated outputs were removed
+during repository cleanup. The versioned evaluation contracts above remain in
+production code and the current regression suite.

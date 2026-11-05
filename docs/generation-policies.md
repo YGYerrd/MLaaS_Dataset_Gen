@@ -199,7 +199,7 @@ two while preserving the requested batch size, precision and BatchNorm behavior.
 The runtime logs `using contiguous DPT convolution inputs` when it installs the
 workaround. It applies to newly initialized runtimes, including existing manifest
 recipes. For diagnostic comparisons, set `MLAAS_ROCM_DPT_CONTIGUOUS_CONV=0` before
-starting the process. See [the controlled diagnostic](dpt-batch-size-diagnostic.md).
+starting the process. See the controlled diagnostic.
 
 The same layout workaround also applies to UPerNet models whose configured
 backbone is ConvNeXt. A controlled `openmmlab/upernet-convnext-tiny` GPU test
@@ -207,7 +207,7 @@ confirmed slow NHWC kernels in the feature-pyramid convolutions, with ample
 free VRAM. Setup logs `using contiguous UPerNet-ConvNeXt convolution inputs`.
 Other UPerNet backbones are excluded. Set
 `MLAAS_ROCM_UPERNET_CONTIGUOUS_CONV=0` before process startup only when running
-diagnostic controls. See [the UPerNet measurements](upernet-layout-diagnostic.md).
+diagnostic controls. See the UPerNet measurements.
 
 Text-classification dataset aliases resolve to classification before preparing
 the parent model and freezing label contracts. Preparation and execution use
@@ -291,4 +291,4 @@ evaluation continues to omit loss.
 
 Previously completed singleton-training services are not retroactively repaired;
 rerun affected services to obtain trained weights and meaningful loss. See
-[the CLIP validation report](clip-contrastive-batch-diagnostic.md).
+the CLIP validation report.

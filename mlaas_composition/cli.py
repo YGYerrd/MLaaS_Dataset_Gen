@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Sequence
 
 from .catalogue import load_services_from_db
+from .manifest import generate_composition_manifest
 from .protocol import (
     DEFAULT_PRINCIPLE_ID,
     DEFAULT_PROFILE_ID,
@@ -27,9 +28,27 @@ from .validation_cli import validate_from_files, validate_search_from_files
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Generate immutable requests or evaluate a frozen collaborative-composition experiment"
+        description="Generate composition manifests or requests, or evaluate a frozen collaborative-composition experiment"
     )
     subparsers = parser.add_subparsers(dest="command_name", required=True)
+
+    manifest = subparsers.add_parser("generate-manifest", help="Sample reproducible compositions from prepared family pools")
+    manifest.add_argument("--prepared-dir", required=True, help="Directory containing pools.csv, services.csv and services.db")
+    manifest.add_argument("--compositions", type=_positive_count, required=True, help="Approximate total, rounded to full pool/size batches")
+    manifest.add_argument("--seed", type=int, default=42, help="Composition sampling seed")
+    manifest.add_argument("--output", required=True, help="Output .csv; a companion .metadata.json is also written")
+    manifest.add_argument("--overwrite", action="store_true", help="Explicitly replace existing manifest output files")
+    manifest.set_defaults(handler=_generate_manifest)
+
+    run = subparsers.add_parser("run-manifest", help="Retrain and measure every composition, one job per GPU")
+    run.add_argument("--file", required=True, help="Composition CSV created by generate-manifest")
+    run.add_argument("--source-db", required=True, help="Read-only source service catalogue")
+    run.add_argument("--db", required=True, help="Separate composition results SQLite database")
+    run.add_argument("--device", choices=("auto", "cpu"), default="auto")
+    run.add_argument("--workers", type=_positive_count, help="Maximum GPU workers; defaults to every visible GPU")
+    run.add_argument("--dry-run", action="store_true", help="Verify metadata without training or writing results")
+    run.add_argument("--path-map", help="Artifact relocation JSON; defaults to path_map.json beside --source-db")
+    run.set_defaults(handler=_run_manifest)
 
     generate = subparsers.add_parser("generate-requests", help="Generate and save versioned synthetic requests")
     generate.add_argument("--db", required=True, help="SQLite database produced by mlaas_data_generator")
@@ -120,6 +139,37 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     args.handler(args, argv=list(argv) if argv is not None else list(sys.argv))
+
+
+def _run_manifest(args: argparse.Namespace, *, argv: Sequence[str]) -> None:
+    from .run_manifest import run_composition_manifest
+    summary = run_composition_manifest(args.file, args.source_db, args.db,
+        device=args.device, workers=args.workers, dry_run=args.dry_run, path_map=args.path_map)
+    print(json.dumps(summary, indent=2))
+    if summary.get("failed"):
+        raise SystemExit(1)
+
+
+def _positive_count(value: str) -> int:
+    try:
+        count = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a positive integer") from error
+    if count <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return count
+
+
+def _generate_manifest(args: argparse.Namespace, *, argv: Sequence[str]) -> None:
+    metadata = generate_composition_manifest(
+        args.prepared_dir, args.output, compositions=args.compositions,
+        seed=args.seed, overwrite=args.overwrite,
+    )
+    print(f"Wrote {metadata['actual_count']} compositions (requested approximately {metadata['requested_count']}; "
+          f"quota {metadata['per_pair_quota']} per eligible pool/size pair) to {args.output}")
+    print(f"Metadata: {Path(args.output).with_suffix('.metadata.json')}")
+    if metadata["skipped_pairs"] or metadata["shortfalls"]:
+        print(f"Skipped pairs: {len(metadata['skipped_pairs'])}; pairs with shortfalls: {len(metadata['shortfalls'])}")
 
 
 def _generate_requests(args: argparse.Namespace, *, argv: Sequence[str]) -> None:

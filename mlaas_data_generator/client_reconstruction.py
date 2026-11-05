@@ -10,6 +10,7 @@ import numpy as np
 
 from .provenance import sha256_json, sha256_file, write_json_artifact, runtime_provenance
 from .shared_parent import _clean
+from .artifact_paths import resolve_artifact_path
 
 VERSION = "client_reconstruction_recipe_v1"
 MAX_SKIPPED_UPDATE_FRACTION = 0.20
@@ -185,9 +186,10 @@ def read_recipe(db, service_id):
         row = conn.execute("SELECT * FROM service_generation_provenance WHERE service_id=?", (service_id,)).fetchone()
     if row is None or "client_recipe_ref" not in row.keys() or not row["client_recipe_ref"]:
         raise ValueError("service has no authoritative client reconstruction recipe")
-    if sha256_file(row["client_recipe_ref"]) != row["client_recipe_hash"]:
+    path = resolve_artifact_path(row["client_recipe_ref"])
+    if sha256_file(path) != row["client_recipe_hash"]:
         raise ValueError("client recipe failed integrity verification")
-    recipe = json.loads(Path(row["client_recipe_ref"]).read_text(encoding="utf-8"))
+    recipe = json.loads(path.read_text(encoding="utf-8"))
     if recipe.get("version") != VERSION or recipe.get("recipe_hash") != sha256_json({k: v for k, v in recipe.items() if k != "recipe_hash"}):
         raise ValueError("invalid client reconstruction recipe")
     family = recipe["family"]

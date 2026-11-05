@@ -23,7 +23,7 @@ exclude = ["*.test", "*.test.*", "*.tests", "*.tests.*"]
 
 [tool.setuptools.package-data]
 mlaas_data_generator = ["storage/schema.sql", "clients/recipe_evidence.json"]
-mlaas_composition = ["assets/*.json"]
+mlaas_composition = ["assets/*.json", "assets/*.sql"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

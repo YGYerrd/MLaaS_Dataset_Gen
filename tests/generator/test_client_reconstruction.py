@@ -52,6 +52,23 @@ def test_family_reuses_fitted_state_and_identity_for_different_clients(raw_famil
     assert sizes == [8, 11]  # Reject source changes before preparation.
 
 
+def test_prepare_reuses_relocated_frozen_family(raw_family, tmp_path):
+    from mlaas_data_generator.artifact_paths import artifact_path_scope
+    cfg, model, _ = raw_family
+    original, relocated = tmp_path / "original", tmp_path / "relocated"
+    cfg = {**cfg, "provenance_artifact_dir": str(original)}
+    doc, ref, _, _, initial, _ = preparation.prepare(cfg, build_model=lambda *a: model)
+    saved = json.loads(Path(ref["document_ref"]).read_text(encoding="utf-8"))
+    before = {p.relative_to(original): p.read_bytes() for p in original.rglob("*") if p.is_file()}
+    original.rename(relocated)
+    with artifact_path_scope(((str(original).replace("\\", "/"), str(relocated)),)):
+        loaded, ref2, _, _, restored, _ = preparation.prepare(
+            {**cfg, "_family_reference": ref}, build_model=lambda *a: model)
+    assert loaded == saved and ref2 == ref and restored.sha256 == initial.sha256
+    assert not original.exists()
+    assert before == {p.relative_to(relocated): p.read_bytes() for p in relocated.rglob("*") if p.is_file()}
+
+
 def test_recorded_rows_bypass_sampler_and_preserve_order(raw_family, monkeypatch):
     cfg, _, x = raw_family
     monkeypatch.setattr("mlaas_data_generator.clients.partitioning.client_partition",

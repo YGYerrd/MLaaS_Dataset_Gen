@@ -91,7 +91,8 @@ separate encode/decode methods and versioned layout metadata. The default `int8`
 representation now stores symmetric blocks of 256 values with FP32 scale tensors,
 using `int8_block256_safetensors_v1`. It reuses the integrity and quality checks;
 FP16 remains available explicitly. The [one-off legacy migration](checkpoint_storage.md#one-off-migration-of-trained-legacy-checkpoints)
-defaults to INT8 and supports explicit FP16 selection. Historical benchmark scripts and measurements are in the [cleanup archive](cleanup.md).
+defaults to INT8 and supports explicit FP16 selection. Historical benchmark scripts
+and local measurements were removed in the [repository cleanup](cleanup.md).
 
 ## Storage measurement
 

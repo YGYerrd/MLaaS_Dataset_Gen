@@ -1430,6 +1430,23 @@ def ensure_lineage_base(
     )
 
 
+def inspect_lineage_base(store_root: str | Path, lineage_id: str) -> dict[str, Any]:
+    """Check base references and payload presence without reading tensor values.
+
+    Full content integrity remains the responsibility of load_lineage_base.
+    """
+    root = Path(store_root).resolve()
+    document = _read_json(_identity_manifest_path(root, "lineages", lineage_id))
+    if document.get("format") != LINEAGE_BASE_MANIFEST_FORMAT or document.get("lineage_id") != str(lineage_id):
+        raise IntegrityError("invalid lineage base manifest")
+    ref = ContentAddressedTensorStore(root).inspect_link(document["base_state"])
+    if ref.object_kind != "tensor_state" or ref.semantic_format != TENSOR_STATE_FORMAT:
+        raise IntegrityError("lineage base does not reference a canonical tensor state")
+    if ref.payload_path.stat().st_size != ref.stored_payload_size_bytes:
+        raise IntegrityError("lineage base payload size mismatch")
+    return document
+
+
 def load_lineage_base(
     store_root: str | Path,
     lineage_id: str,

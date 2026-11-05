@@ -61,8 +61,8 @@ cache at `.test-tmp/stage-f-hf-datasets`, offline HF mode, and
 `OMP_NUM_THREADS=MKL_NUM_THREADS=4`. The profile harness resolves cached revision
 pins and records the exact configuration.
 
-- [Summary and immutable comparison reports](../outputs/reconstruction_tasks_20260915/summary.json)
-- [Exact configurations](../outputs/reconstruction_tasks_20260915/configurations.json)
+- Summary and immutable comparison reports
+- Exact configurations
 - [Reconstruction usage and capability semantics](client-reconstruction.md)
 
 Retention defaults and downstream composition/FedAvg consumers are unchanged by

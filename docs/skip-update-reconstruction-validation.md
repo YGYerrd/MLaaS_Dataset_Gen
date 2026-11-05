@@ -55,11 +55,11 @@ direct counterevidence to treating every run above 5% as unreconstructable.
 
 ## Evidence and regression checks
 
-- [Measured results and hashes](../outputs/skip_reconstruction_20260916/results.json)
-- [ALBERT comparison](../outputs/skip_reconstruction_20260916/svc_8f7393d19b58/comparison.json)
-- [ELECTRA comparison](../outputs/skip_reconstruction_20260916/svc_81d01c101e25/comparison.json)
-- [RoBERTa comparison](../outputs/skip_reconstruction_20260916/svc_6b987d7afa38/comparison.json)
-- [Diagnostic harness](../outputs/skip_reconstruction_20260916/diagnostic.py)
+- Measured results and hashes
+- ALBERT comparison
+- ELECTRA comparison
+- RoBERTa comparison
+- Diagnostic harness
 
 The case directories retain configurations, copied source failure records,
 native references, authoritative recipes, and generation/comparison logs.

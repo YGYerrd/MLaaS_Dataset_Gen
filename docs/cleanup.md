@@ -1,55 +1,39 @@
-# Project cleanup and recovery
+# Repository cleanup: 5 November 2026
 
-The 9 September 2026 cleanup keeps the generation and composition workflows, a
-small core test suite, environment helpers, SQL reports and current documentation.
+The repository keeps the working generator/composition packages, current regression
+tests, environment helpers, SQL queries and authored documentation. Dataset files
+are consolidated under `outputs/legacy/` and `outputs/pooled/`; see
+[retained datasets](datasets.md) for counts, contents and limitations.
 
-107 files were removed from the working tree after a verified backup:
+Removed material includes obsolete benchmark/pilot scripts, family-review and
+diagnostic scripts, their two dedicated test modules, dated investigation reports,
+one-off CSV/JSON/log exports, superseded experiment databases and Lambda source
+shards, the compressed Lambda extract, generated PDF/slide copies, temporary
+tooling, test run directories and local recovery archives.
 
-| Area | Files archived | Reason |
-| --- | ---: | --- |
-| Extended tests and fixtures | 68 | Keep eight core test modules instead of the full suite |
-| Package-local composition tests | 5 | Duplicates or stale copies of the main tests |
-| Generator legacy modules and utilities | 22 | Unused orchestration, old CLI helpers, compatibility shims and one-off audits |
-| Diagnostic and benchmark scripts | 5 | Investigations outside the normal workflow |
-| Dated investigation documents | 7 | Historical evidence; current checkpoint settings extracted into a dedicated guide |
+The active pool-preparation checks formerly imported from the journal audit CLI
+now live in `mlaas_data_generator/artifact_audit.py`. The pool-preparation script
+requires explicit source-root and roster arguments. Reconstruction validation and
+the current optional backend smoke harness remain available.
 
-The retained 114 checks cover manifests, execution, SQLite records, exact
-checkpoints, requests, search, composition validation and update signatures. The
-original suite collected 868 checks. The core suite does not provide the original
-backend, reduced-checkpoint, policy and legacy regression coverage.
+Before removing superseded outputs, both retained databases passed SQLite
+`integrity_check`. Every retained file was hashed before and after relocation.
+Database table counts were preserved; only signature lookup paths and the pooled
+artifact-location lookup table were updated. Signed recipe/family artifacts were
+not rewritten. Both relocated databases passed `quick_check`, and foreign-key
+checks were compared with their pre-cleanup state.
 
-Runtime diagnostics, shared-parent generation, checkpoint migration, request
-schema versions and FedAvg modules imported by the active workflow remain.
-The separate unused `mlaas_data_generator/federated/` implementation is archived.
-Archived Python import paths are no longer supported in the cleaned working tree.
-No run databases, manifests, checkpoint artifacts, credentials or environments
-were removed. Existing Git staging was left intact; review both staged and
-unstaged changes before committing.
+Each dataset's `retention.json` records hashes and coverage. The legacy catalogue
+had 3,998 missing referenced signature files before cleanup; that gap is recorded,
+not silently treated as complete coverage. All 6,975 pooled signatures were retained.
 
-## Recovery archive
+The previous `.project-archive` and `.outputs_cleanup_recovery_*` folders are no
+longer recovery sources. Tracked source history remains in Git; deleted ignored
+run outputs are not recoverable through Git. Existing working-tree changes were
+preserved, and no commit or staging operation was performed.
 
-Local snapshot: [cleanup-20260909-190115.zip](../.project-archive/cleanup-20260909-190115.zip).
-It contains 257 pre-cleanup source/document files, including their uncommitted
-working-tree contents. `CLEANUP_MANIFEST.json` records original paths, SHA-256
-hashes, the removed-file list and the retained test modules. Every archived file
-was verified against its original bytes before removal.
-
-The archive is ignored by Git. Copy it separately if moving or sharing the project;
-it will not be included in a normal commit or clone. It excludes Git state,
-credentials, run outputs and Python environments.
-
-To recover a separate copy, run from the repository root:
-
-```powershell
-Expand-Archive -LiteralPath .project-archive/cleanup-20260909-190115.zip -DestinationPath .project-archive/recovered-20260909
-```
-
-Inspect that copy and restore individual files as needed. For the former full test
-suite or investigation commands, use the recovered source tree with the existing
-environment. Do not extract over ongoing work: the archive contains older copies
-of active files as well as removed files.
-
-Historical sharding, partitioning, RMSprop, regression correction, recipe evidence
-and checkpoint benchmark reports retain their original names under `docs/` inside
-the archive. Benchmark scripts and smoke campaigns also retain their original
-paths and reproduction commands there.
+Validation: the retained suite ran 949 tests (948 initially passed; one stale
+composition-eligibility assertion was corrected). All 73 tests in the affected
+weight-retention and pool-preparation modules then passed. The relocated pooled
+inputs regenerated the same 1,050-composition CSV and metadata. Generator CLI,
+pool-preparation and reconstruction-validation help commands also succeeded.

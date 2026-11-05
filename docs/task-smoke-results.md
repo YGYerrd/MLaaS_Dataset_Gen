@@ -31,9 +31,9 @@ source; these results do not promote the unrestricted production datasets.
 
 Local evidence bundles, including full revisions and task/protocol identities:
 
-- [Token classification](../outputs/task_extensions_smoke/token_final/smoke_evidence.json)
-- [Semantic segmentation](../outputs/task_extensions_smoke/segmentation_final/smoke_evidence.json)
-- [Seq2seq summarisation](../outputs/task_extensions_smoke/summarization_final/smoke_evidence.json)
+- Token classification
+- Semantic segmentation
+- Seq2seq summarisation
 
 Each directory contains the immutable recipe manifests, database, reservations,
 diagnostics and validation reports. `verification.json` and its `shared_parent/`

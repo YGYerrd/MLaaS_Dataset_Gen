@@ -28,9 +28,9 @@ restored token, generation-preprocessor and image-adapter fixtures:
 `generator/conftest.py` isolates manifest result, retry and failure exports from
 local research runs. Tests use temporary files and synthetic/mocked inputs.
 
-The larger backend, policy, legacy and checkpoint-format suites, helper fixtures
-and manual smoke campaigns are in the [cleanup archive](../docs/cleanup.md).
-Restore them when making changes that need that broader coverage.
+Current generator, composition and integration regressions remain. Tests for the
+retired family-review and hang-diagnostic scripts were removed with those scripts.
+Historical local recovery archives were deleted during the November 2026 cleanup.
 
 The opt-in real backend harness is `python -m tests.smoke.run_task_extensions`.
 It is separate from pytest and needs cached model/data files. See

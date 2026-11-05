@@ -16,10 +16,12 @@ query1.sql
 flatten_query.sql
 hf_manifest.xlsx
 outputs/
+output/
+outputs_ml_lambda/
+outputs_ml_lambda.tar.gz
+tmp/
 .hf_token
 storage.local.json
 *.generated.pptx
-.outputs_cleanup_recovery_20260902_185136/
-.project-archive/
 # Temporary Office lock files
 ~$*

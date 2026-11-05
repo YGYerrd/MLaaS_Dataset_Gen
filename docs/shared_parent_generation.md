@@ -360,7 +360,6 @@ Run the retained core checks from the repository root:
 python -m pytest -q
 ```
 
-The extended shared-parent tests and real-backend smoke campaigns are in the
-[cleanup archive](cleanup.md). Restore them into a separate checkout when broader
-research validation is needed; the core suite does not cover every backend or
-shared-parent resume scenario.
+Historical local test archives were removed in the [repository cleanup](cleanup.md).
+The retained suite and optional backend smoke harness do not cover every backend
+or shared-parent resume scenario; research runs still require relevant validation.

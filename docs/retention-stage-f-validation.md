@@ -87,7 +87,7 @@ The completed run used a writable copy of the three raw dataset caches under
 
 Local evidence:
 
-- [Summary and per-service report references](../outputs/retention_stage_f_final_20260915/summary.json)
-- [Database/storage verification](../outputs/retention_stage_f_final_20260915/verification.json)
-- [Exact training configurations](../outputs/retention_stage_f_final_20260915/configurations.json)
+- Summary and per-service report references
+- Database/storage verification
+- Exact training configurations
 - [Usage and gate thresholds](client-reconstruction.md)
