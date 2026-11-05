@@ -205,13 +205,15 @@ def read_recipe(db, service_id):
 
 
 @contextmanager
-def materialize_service(db, service_id, *, device="cpu"):
+def materialize_service(db, service_id, *, device="cpu", capture_client_losses=False):
     """Yield a representative trained model using only family + recipe.
 
     No client checkpoint is read or written. The caller owns the yielded model;
     prepared dataset resources are closed on leaving the context. Interrupted
     or recovery trajectories fail explicitly until their replay is supported.
     Original and reconstructed runs may skip different updates within the 20% limit.
+    Optional client losses evaluate the initial and final models on the exact
+    selected training rows, without using the catalogue/audit partition.
     """
     from .cli.manifest import preparation
     from .data.tokenization_selection import training_row_selection
@@ -237,6 +239,7 @@ def materialize_service(db, service_id, *, device="cpu"):
         raise ValueError("recipe source disagrees with family")
     config = {**doc["config"], "service_id": service_id, "db_path": str(db), "device": device,
         "provenance_artifact_dir": doc["store_root"], "_family_reference": family,
+        "_recorded_model_source": recipe["training"]["observations"].get("hf_model_id"),
         "_recorded_source_ids": recipe["selection"]["ordered_source_row_ids"]}
     with training_row_selection([config]) as selection:
         _, _, cfg, prepared, initial, _ = preparation.prepare(config, allow_legacy_evaluation=True)
@@ -257,6 +260,11 @@ def materialize_service(db, service_id, *, device="cpu"):
         service = ServiceRunner(effective)
         # Optimizer, scheduler and RNG are reset exactly as in the generator.
         restore_model_tensor_state(model, initial, verify=True)
+        if capture_client_losses:
+            from .client_losses import measure_client_losses, client_loss_evidence
+            print(f"Measuring initial-model client losses for {service_id}", flush=True)
+            initial_losses = measure_client_losses(model, *selected, batch_size=effective["batch_size"],
+                                                    max_length=effective.get("max_length"))
         prepare_model_for_local_update(model, effective)
         if recipe["training"].get("optimizer_configuration"):
             import keras
@@ -282,12 +290,20 @@ def materialize_service(db, service_id, *, device="cpu"):
         for key in ("optimizer_step_count", "completed_training_epochs"):
             if key in stopping and training.get(key) != stopping[key]:
                 raise ValueError(f"replay completion differs from recorded {key}")
+        client_losses = {}
+        if capture_client_losses:
+            print(f"Measuring final-local-model client losses for {service_id}", flush=True)
+            final_losses = measure_client_losses(model, *selected, batch_size=effective["batch_size"],
+                                                  max_length=effective.get("max_length"))
+            client_losses = client_loss_evidence(initial_losses, final_losses,
+                initial_state_hash=initial.sha256, source_rows_hash=sha256_json(source_ids))
         core = getattr(model, "core", None)
         for key, value in recipe.get("evaluation", {}).get("effective_settings", {}).items():
             if core is not None:
                 setattr(core, key, value)
         yield {"model": model, "service": service, "recipe": recipe, "family": doc,
                "initial": initial, "benchmark": benchmark, "meta": meta, "task": task, "training": training,
+               "client_losses": client_losses,
                "replay_evidence": {"ordered_source_rows_hash": sha256_json(source_ids),
                    "effective_settings_hash": sha256_json(actual_settings),
                    "selected_rows_match": True, "effective_settings_match": True}}

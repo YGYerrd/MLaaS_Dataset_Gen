@@ -88,10 +88,16 @@ def source(tmp_path, monkeypatch):
     calls, aggregate_values = [], []
 
     @contextmanager
-    def materialize(db, sid, *, device):
+    def materialize(db, sid, *, device, capture_client_losses=False):
         calls.append(sid)
+        from mlaas_data_generator.client_losses import client_loss_evidence
+        observations = {"sample_count": {"a": 2, "b": 6, "c": 4}[sid],
+                        "mean_loss": 0.5, "squared_sample_loss_sum": 3.0,
+                        "loss_definition": "test_loss", "measurement_wall_s": 0.0}
         yield {"model": ToyModel({"a": 2, "b": 6, "c": 10}[sid]), "initial": initial,
                "training": {"train_stopping_reason": "epochs_completed", "completed_training_epochs": 1},
+               "client_losses": client_loss_evidence(observations, dict(observations),
+                   initial_state_hash=initial.sha256, source_rows_hash="rows") if capture_client_losses else {},
                "replay_evidence": {"selected_rows_match": True, "effective_settings_match": True}}
 
     def predict(member, runtime_id, plan, state, *, device):
@@ -127,8 +133,32 @@ def test_replays_shared_and_checkpoint_members_measures_global_and_resumes(sourc
         assert "recipe" not in snapshot and snapshot["metric_reference"]["accuracy"] == 0.75
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
         assert conn.execute("SELECT name FROM sqlite_master WHERE name='services'").fetchone() is None
+        evidence = json.loads(conn.execute("SELECT evidence_json FROM composition_members LIMIT 1").fetchone()[0])
+        assert evidence["squared_sample_loss_sum"] == evidence["local_loss_l2_squared"] == 3.0
+        assert evidence["local_loss_current_model"] == 0.5
+        assert evidence["client_loss_statistics"]["final_local_model"]["model_state_hash"] == evidence["materialized_state_hash"]
+        assert conn.execute("SELECT COUNT(*) FROM composition_metrics WHERE metric_name='client_loss_measurement_wall_s'").fetchone()[0] == 2
+    assert summary["completed_without_client_losses"] == 0
     resumed = batch.run_composition_manifest(path, source.db, db, device="cpu")
     assert resumed["skipped"] == 2 and len(source.calls) == 4
+
+
+def test_resume_preserves_older_completions_and_reports_missing_losses(source, tmp_path, capsys):
+    path = manifest(tmp_path / "manifest.csv", [entry(source.doc["family_id"], "a", "b"),
+                                               entry(source.doc["family_id"], "a", "c")])
+    db = tmp_path / "results.db"
+    first = batch.run_composition_manifest(path, source.db, db, device="cpu")
+    with sqlite3.connect(db) as conn:
+        cid = conn.execute("SELECT combination_id FROM compositions LIMIT 1").fetchone()[0]
+        conn.execute("UPDATE composition_members SET evidence_json=json_remove(evidence_json, '$.client_loss_statistics') WHERE combination_id=?", (cid,))
+        original = conn.execute("SELECT * FROM composition_metrics").fetchall()
+    resumed = batch.run_composition_manifest(path, source.db, db, device="cpu")
+    assert resumed["run_id"] == first["run_id"]
+    assert resumed["skipped"] == 2 and resumed["completed_without_client_losses"] == 1
+    assert len(source.calls) == 4
+    assert "Skipping 1 completed compositions without current client loss statistics" in capsys.readouterr().out
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT * FROM composition_metrics").fetchall() == original
 
 
 def test_dry_run_has_no_tensor_reads_or_output(source, tmp_path, monkeypatch):

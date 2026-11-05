@@ -52,6 +52,25 @@ def tiny_core(bad_call=None, always_bad=False):
     return core
 
 
+@pytest.mark.parametrize("device,is_cuda", [
+    ("cuda", True), ("cuda:0", True), ("cuda:1", True),
+    (torch.device("cuda:2"), True), ("cpu", False), (torch.device("cpu"), False),
+])
+def test_indexed_gpu_devices_keep_requested_mixed_precision(device, is_cuda):
+    core = tiny_core()
+    core.device = device
+    core.mixed_precision, core.precision_type = True, "fp16"
+    # Configure precision without requiring an actual CUDA device or scaler.
+    scaler = object()
+    core.torch = SimpleNamespace(float16=torch.float16,
+        amp=SimpleNamespace(GradScaler=lambda device_type: scaler))
+    core._configure_precision_mode()
+    assert core.autocast_enabled is is_cuda
+    assert core.effective_mixed_precision is is_cuda
+    assert core.effective_precision_type == ("fp16" if is_cuda else "fp32")
+    assert core.grad_scaler is (scaler if is_cuda else None)
+
+
 @pytest.mark.parametrize("bad_call", [None, 2])
 def test_half_loaded_model_updates_with_scaler_and_accumulation(bad_call):
     core = tiny_core(bad_call)

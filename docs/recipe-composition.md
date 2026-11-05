@@ -108,11 +108,59 @@ in another composition. Training follows the recorded completed budget rather
 than the original wall-clock cutoff, as in normal recipe reconstruction.
 
 The existing sample-weighted parameter aggregator produces one global model.
-Only that model is evaluated, on the family's exact reserved audit set (minimum
+Only that model is evaluated on the family's exact reserved audit set (minimum
 64 examples), using the existing task metrics and quality normalisation. Member
 quality values refer to original catalogue measurements. New member/global
 weights are discarded; the shared initial checkpoint remains a required input.
-`training_wall_s` includes member preparation, replay and state capture.
+`training_wall_s` includes member preparation, replay and state capture, excluding
+the separate client-loss measurement passes described below.
+
+Each newly executed member also evaluates its exact selected **training rows**
+once before local training and once after it. These passes use evaluation mode,
+without optimizer updates, and preserve model buffers, training modes and RNG
+state. HF forward passes use native weight precision without autocast, with
+float32 losses and float64 accumulation. Evaluation can reduce its microbatch
+size after an OOM without changing the training recipe. No catalogue or audit
+rows enter these measurements, and no client weights are saved.
+
+The three attributes are stored at the top level of
+`composition_members.evidence_json`:
+
+- `local_loss_current_model`: mean per-example loss of the shared **initial**
+  model on this client's training rows, before its local update.
+- `squared_sample_loss_sum`: sum of squared per-example losses of the **final
+  local** model on those same rows.
+- `local_loss_l2_squared`: the same sum, explicitly defined as the squared L2
+  norm of that per-example loss vector, not the square of its mean.
+
+These are fixed-model evaluation losses, not losses accumulated along the
+training trajectory or the loss of the final aggregated model. Classification
+uses cross-entropy (multilabel: mean binary cross-entropy over labels);
+regression uses per-example mean squared error. Token/sequence tasks and
+segmentation first average over each example's supervised tokens/pixels,
+excluding ignored targets, and then square that example's mean. Segmentation
+uses the existing labels-at-logits-resolution convention; seq2seq uses teacher
+forcing. Keras uses the model's unregularized compile loss without batch
+reduction. Empty supervision, non-finite losses and unsupported models fail
+explicitly rather than recording a substitute value.
+
+`client_loss_statistics` embeds version `client_loss_statistics_v1`, the ordered
+training-row hash, initial/final model hashes, loss definition, sample count,
+sum, mean, squared sum, precision, batching and timing for both passes. The
+separate `client_loss_measurement_wall_s` appears in member evidence and as a
+composition metric summed across members. `total_wall_s` includes this overhead;
+`training.train_time_s` remains the trainer's original measurement.
+
+For example, extract the attributes without retraining:
+
+```sql
+SELECT run_id, combination_id, service_id,
+       json_extract(evidence_json, '$.local_loss_current_model') AS local_loss_current_model,
+       json_extract(evidence_json, '$.squared_sample_loss_sum') AS squared_sample_loss_sum,
+       json_extract(evidence_json, '$.local_loss_l2_squared') AS local_loss_l2_squared
+FROM composition_members
+WHERE status = 'completed';
+```
 
 Results use a separate SQLite database. Its five tables are
 `composition_runs`, `source_services`, `compositions`, `composition_members`,
@@ -130,6 +178,15 @@ continue, and the command exits nonzero if any failed. Completion and metrics
 are committed together. Worker crashes are recorded and replacement processes
 handle subsequent jobs.
 
+Client-loss telemetry is separately versioned and does not change the existing
+training/resume fingerprint. Completed compositions from older executors remain
+skipped and retain their original results; their absent loss attributes stay
+NULL. The executor reports `completed_without_client_losses` and prints a notice
+when skipping them. To measure their final-local-model losses, explicitly replay
+the desired combinations into a separate results database. Existing running
+worker processes need a restart to load the new measurement code; use the same
+manifest, source and destination to resume remaining compositions.
+
 `run-manifest` automatically reads `path_map.json` beside `--source-db`, when
 present. Use `--path-map path/to/map.json` to select a different map. The
 `composition_path_map_v1` format contains a `prefixes` list of `recorded` and
@@ -142,6 +199,13 @@ contents, catalogue records and integrity checks remain unchanged. The map's
 HF cache fields are preparation metadata; configure Hugging Face caches through
 the usual runtime environment separately. A verified preparation roster does
 not establish that local replay will succeed; use dry-run before a long batch.
+
+Historical Hugging Face architecture hashes include the original snapshot cache
+path. During member replay and global evaluation, the verified recipe's recorded
+model source is used for that identity field while the pinned model loads from
+the local cache. The complete original architecture hash must still match; model
+settings, tensor schemas and data checks remain enforced. Family mismatch errors
+name the differing fields, such as `architecture_id` or `evaluation_data_hash`.
 
 ## Run from the repository root in PowerShell
 

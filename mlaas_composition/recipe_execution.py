@@ -25,7 +25,8 @@ def resolve_members(db_path, service_ids, *, require_replay=False, cache=None):
     return [SelectedFedAvgMember(r["service_id"], r["service_id"], r["sample_count"], r) for r in rows]
 
 
-def execute_composition(db_path, members, plan, *, device="cpu", replay=False, on_progress=None):
+def execute_composition(db_path, members, plan, *, device="cpu", replay=False, on_progress=None,
+                        capture_client_losses=False):
     """Execute one average; replay=True always retrains, even retained members.
 
     Progress carries only small observations, never model objects or tensors.
@@ -42,6 +43,8 @@ def execute_composition(db_path, members, plan, *, device="cpu", replay=False, o
     from .validation import assert_cohort_isolation, CohortIsolationError
 
     members = sorted(members, key=lambda member: member.service_id)
+    if capture_client_losses and not replay:
+        raise ValueError("client loss capture requires replay of every composition member")
     if len(members) < 2 or len({m.service_id for m in members}) != len(members):
         raise ValueError("composition requires at least two distinct services")
     first = members[0].row
@@ -74,20 +77,24 @@ def execute_composition(db_path, members, plan, *, device="cpu", replay=False, o
             on_progress({"stage": "training", "service_id": member.service_id})
         try:
             if replay or row["weight_retention"] == "recipe_only":
-                with materialize_service(db_path, member.service_id, device=device) as materialized:
+                options = {"capture_client_losses": True} if capture_client_losses else {}
+                with materialize_service(db_path, member.service_id, device=device, **options) as materialized:
                     if materialized["initial"].sha256 != parent.sha256:
                         raise ValueError("replayed initial state differs from aggregate parent")
                     state = capture_model_tensor_state(materialized["model"])
                     evidence.update(replay_evidence=materialized["replay_evidence"], training=materialized["training"],
                                     materialization_method="recipe_replay", client_checkpoint_reads=0,
                                     reconstruction_fidelity="not_measured_in_this_run")
+                    if capture_client_losses:
+                        evidence.update(materialized["client_losses"])
+                        evidence["client_loss_statistics"]["final_local_model"]["model_state_hash"] = state.sha256
                 del materialized
             else:
                 state = reconstruct_service_state(resolve_artifact_path(doc["store_root"]), member.service_id)
                 evidence.update(materialization_method="retained_checkpoint")
             evidence.update(materialized_state_hash=state.sha256,
                             weights_equal_original=state.sha256 == row["final_model_hash"],
-                            reconstruction_wall_s=time.perf_counter() - started)
+                            reconstruction_wall_s=time.perf_counter() - started - evidence.get("client_loss_measurement_wall_s", 0))
         except Exception as error:
             failure = FedAvgReconstructionError(f"could not materialise {member.service_id}: {error}")
             failure.service_id = member.service_id
@@ -130,6 +137,7 @@ def execute_composition(db_path, members, plan, *, device="cpu", replay=False, o
         unique_training_examples=len(training_ids), local_example_exposures=sum(m.sample_count for m in members),
         cross_client_overlap_allowed=True, parent_training_examples=0,
         materialization=observations, reconstruction_wall_s=sum(o["reconstruction_wall_s"] for o in observations),
+        client_loss_measurement_wall_s=sum(o.get("client_loss_measurement_wall_s", 0) for o in observations),
         audit_reservation_hash=reservation["reservation_hash"], runtime=runtime_provenance(), device=device,
         evaluation_wall_s=time.perf_counter() - evaluation_started)
     return FedAvgCompositionExecution(prediction.outputs, first["task_family"], prediction.label_hash,

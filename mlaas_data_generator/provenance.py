@@ -325,6 +325,13 @@ def model_identity(model: Any, config: Mapping[str, Any]) -> dict[str, Any]:
         config_value = to_dict() if callable(to_dict) else dict(getattr(model_config, "__dict__", {}) or {})
     except Exception:
         config_value = {}
+    recorded_source = config.get("_recorded_model_source")
+    if isinstance(recorded_source, str) and recorded_source and "_name_or_path" in config_value:
+        # Historical HF identities include the machine-local snapshot path.
+        # Replay uses the source recorded in the verified recipe for this one
+        # identity field, while loading from the current pinned source normally.
+        # Keep every other field in the hash and do not mutate the live model.
+        config_value = {**config_value, "_name_or_path": recorded_source}
     result = {
         "framework": parameter_schema(model).get("framework"),
         "model_class": f"{candidate.__class__.__module__}.{candidate.__class__.__qualname__}" if candidate is not None else None,

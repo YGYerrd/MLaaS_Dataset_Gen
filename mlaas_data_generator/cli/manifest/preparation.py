@@ -244,13 +244,20 @@ def verify_loaded(doc, prepared, cfg):
         raise ValueError("training and evaluation source groups overlap")
     contracts = shared._contracts(model, cfg, meta, task)
     compatibility = shared._compatibility(contracts)
-    if (test_ids != doc["reservation"]["metric_source_ids"]
-            or prepared_fingerprint(test, meta) != doc["evaluation_data_hash"]
-            or _raw_contract(cfg, meta) != doc["raw_source"]
-            or _fitted_state(meta) != doc["shared_fitted_state"]
-            or (compatibility != doc["compatibility"]
-                and not _legacy_sampling_metadata_matches(doc, contracts, cfg))):
-        raise ValueError("reloaded model, data, or task interface differs from frozen family")
+    checks = {
+        "evaluation_source_ids": test_ids == doc["reservation"]["metric_source_ids"],
+        "evaluation_data_hash": prepared_fingerprint(test, meta) == doc["evaluation_data_hash"],
+        "raw_source": _raw_contract(cfg, meta) == doc["raw_source"],
+        "shared_fitted_state": _fitted_state(meta) == doc["shared_fitted_state"],
+    }
+    differences = [key for key, matches in checks.items() if not matches]
+    if compatibility != doc["compatibility"] and not _legacy_sampling_metadata_matches(doc, contracts, cfg):
+        differences.extend(key for key in sorted(set(compatibility) | set(doc["compatibility"]))
+                           if key not in compatibility or key not in doc["compatibility"]
+                           or compatibility[key] != doc["compatibility"][key])
+    if differences:
+        raise ValueError("reloaded model, data, or task interface differs from frozen family: "
+                         + ", ".join(differences))
 
 
 def _legacy_sampling_metadata_matches(doc, contracts, cfg):
@@ -350,6 +357,8 @@ def prepare(config, *, load_dataset=None, build_model=None, selection_configs=No
         if doc:
             cfg.update(_shared_fitted_state=doc["shared_fitted_state"]["transforms"],
                        _expected_raw_source=doc["raw_source"])
+            if config.get("_recorded_model_source"):
+                cfg["_recorded_model_source"] = config["_recorded_model_source"]
         cfg.update(device=config.get("device", "auto"), db_path=config.get("db_path"),
                    provenance_artifact_dir=str(root))
         if cfg.get("dataset") == "hf" and not doc:

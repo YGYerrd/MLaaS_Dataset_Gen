@@ -67,6 +67,14 @@ class CompositionWriter(SQLiteWriter):
         return {r[0] for r in self.conn.execute(
             "SELECT combination_id FROM compositions WHERE run_id=? AND status='completed'", (run_id,))}
 
+    def completed_without_client_losses(self, run_id, version):
+        return self.conn.execute("""SELECT COUNT(*) FROM compositions c
+            WHERE c.run_id=? AND c.status='completed' AND EXISTS (
+                SELECT 1 FROM composition_members m
+                WHERE m.run_id=c.run_id AND m.combination_id=c.combination_id
+                AND COALESCE(json_extract(m.evidence_json, '$.client_loss_statistics.version'), '') != ?)
+            """, (run_id, version)).fetchone()[0]
+
     def begin_composition(self, run_id, cid, worker):
         with self.conn:
             self.conn.execute("""UPDATE compositions SET status='running', attempt_count=attempt_count+1,

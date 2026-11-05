@@ -20,6 +20,7 @@ import pandas as pd
 
 from mlaas_data_generator.diagnostic_json import bounded_text
 from mlaas_data_generator.provenance import sha256_json
+from mlaas_data_generator.client_losses import VERSION as CLIENT_LOSS_VERSION
 from mlaas_data_generator.artifact_paths import (
     artifact_path_scope, current_artifact_prefixes, load_artifact_path_map)
 from .manifest import _digest
@@ -29,6 +30,8 @@ from .storage import CompositionWriter
 from .validation import measure_model_outputs, measured_recipe_quality, supported_composition_reason
 
 
+# Loss telemetry is additive and separately versioned on each member. Keep the
+# training identity stable so existing completed compositions still resume.
 EXECUTOR_VERSION = "composition_batch_v1"
 MIN_AUDIT_SAMPLES = 64
 
@@ -188,7 +191,8 @@ def execute_job(source_db, entry, expected_sources, *, device, on_progress=None)
         members, plan, labels, selected, snapshots = _prepare_composition(source_db, entry, cache={})
         if {sid: sha256_json(value) for sid, value in snapshots.items()} != expected_sources:
             raise ValueError("source service evidence changed after batch preflight")
-        execution = execute_composition(source_db, members, plan, device=device, replay=True, on_progress=progress)
+        execution = execute_composition(source_db, members, plan, device=device, replay=True, on_progress=progress,
+                                        capture_client_losses=True)
         stage = "evaluation"
         if execution.task_family != members[0].row["task_family"] or execution.label_hash != plan.label_hash:
             raise ValueError("global model outputs disagree with the frozen audit contract")
@@ -200,6 +204,7 @@ def execute_job(source_db, entry, expected_sources, *, device, on_progress=None)
                    "inference_latency_s_per_example": execution.inference_latency_s / len(plan.audit_ids),
                    "audit_examples": len(plan.audit_ids), "aggregation_wall_s": execution.aggregation_wall_s,
                    "training_wall_s": provenance["reconstruction_wall_s"],
+                   "client_loss_measurement_wall_s": provenance["client_loss_measurement_wall_s"],
                    "evaluation_wall_s": provenance["evaluation_wall_s"],
                    "total_wall_s": time.perf_counter() - started,
                    "local_example_exposures": provenance["local_example_exposures"],
@@ -381,9 +386,14 @@ def _run_composition_manifest(file, source_db, db, *, device="auto", workers=Non
         writer.start()
         try:
             writer.register(run_id, fingerprint=fingerprint, manifest=manifest, source_db=source_db,
-                            version=EXECUTOR_VERSION, settings={"device": device, "workers": workers},
+                            version=EXECUTOR_VERSION, settings={"device": device, "workers": workers,
+                                "client_loss_statistics_version": CLIENT_LOSS_VERSION},
                             entries=entries, sources=sources)
             completed = writer.completed(run_id)
+            without_losses = writer.completed_without_client_losses(run_id, CLIENT_LOSS_VERSION)
+            if without_losses:
+                print(f"Skipping {without_losses} completed compositions without current client loss statistics; "
+                      "their original results are preserved. New compositions will capture client losses.", flush=True)
             pending = [entry for entry in entries if entry["combination_id"] not in completed]
 
             def begin(entry, worker):
@@ -416,6 +426,7 @@ def _run_composition_manifest(file, source_db, db, *, device="auto", workers=Non
                             {sid: sha256_json(sources[sid]) for sid in entry["service_ids"]}, device="cpu",
                             on_progress=lambda event: progress(entry, "cpu", event))
                         finish(entry, result)
-            return {**writer.summary(run_id), "skipped": len(completed)}
+            return {**writer.summary(run_id), "skipped": len(completed),
+                    "completed_without_client_losses": writer.completed_without_client_losses(run_id, CLIENT_LOSS_VERSION)}
         finally:
             writer.finish()

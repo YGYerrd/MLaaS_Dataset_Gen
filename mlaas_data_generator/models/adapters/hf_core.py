@@ -129,7 +129,7 @@ class HFCore:
         device = self.device
         if hasattr(device, "type"):
             return str(device.type).lower()
-        return str(device).lower()
+        return str(device).lower().split(":", 1)[0]
 
     def _task_name(self):
         return str(getattr(self.task_spec, "name", "") or "").strip().lower()

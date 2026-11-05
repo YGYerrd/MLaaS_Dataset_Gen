@@ -189,6 +189,7 @@ def execute_raw_family_state(member, runtime_id, plan, state, *, device="cpu"):
     doc, recipe = member["parent_document"], member["recipe"]
     config = {**doc["config"], "service_id": member["service_id"], "device": device,
               "provenance_artifact_dir": doc["store_root"], "_family_reference": recipe["family"],
+              "_recorded_model_source": recipe["training"]["observations"].get("hf_model_id"),
               "_recorded_source_ids": recipe["selection"]["ordered_source_row_ids"]}
     _, _, cfg, prepared, _, _ = prepare(config, allow_legacy_evaluation=True)
     train, test, meta, task, model, _, test_ids = prepared
