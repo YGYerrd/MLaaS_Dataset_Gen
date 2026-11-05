@@ -1,0 +1,442 @@
+{
+  "audit_version": 1,
+  "created_at_utc": "2026-09-21T12:26:24.458699+00:00",
+  "scope": "Read-only inventory of explicitly named local databases. No archive expansion, artifact checksum audit, model replay, benchmark execution or release freeze.",
+  "databases": [
+    {
+      "database": "outputs/services.db",
+      "captured_at_utc": "2026-09-21T12:26:24.458699+00:00",
+      "size_bytes_before": 1281863680,
+      "source_modified_at_utc_before": "2026-09-09T11:59:41.621424+00:00",
+      "queries": {
+        "status_counts": [
+          {
+            "status": "completed",
+            "n": 19406
+          }
+        ],
+        "completed_task_counts": [
+          {
+            "task_family": "classification",
+            "task_type": "classification",
+            "n": 5120
+          },
+          {
+            "task_family": "clustering",
+            "task_type": "clustering",
+            "n": 1000
+          },
+          {
+            "task_family": "detection",
+            "task_type": "detection",
+            "n": 2521
+          },
+          {
+            "task_family": "fill_mask",
+            "task_type": "classification",
+            "n": 3288
+          },
+          {
+            "task_family": "generation",
+            "task_type": "text2text_generation",
+            "n": 7
+          },
+          {
+            "task_family": "generation",
+            "task_type": "text_generation",
+            "n": 446
+          },
+          {
+            "task_family": "regression",
+            "task_type": "regression",
+            "n": 3805
+          },
+          {
+            "task_family": "segmentation",
+            "task_type": "segmentation",
+            "n": 1174
+          },
+          {
+            "task_family": "token_classification",
+            "task_type": "classification",
+            "n": 2045
+          }
+        ],
+        "completed_source_counts": [
+          {
+            "model_ids": 52,
+            "dataset_names": 35
+          }
+        ],
+        "completed_provenance_counts": [
+          {
+            "generation_mode": null,
+            "family_contract_version": null,
+            "n": 12,
+            "family_ids": 0
+          }
+        ],
+        "completed_family_sizes": [],
+        "completed_evidence_status": []
+      },
+      "errors": {},
+      "tables": [
+        "cohort_clients",
+        "composition_validation_candidates",
+        "composition_validation_runs",
+        "fedavg_client_partitions",
+        "fedavg_client_rounds",
+        "fedavg_global_states",
+        "fedavg_round_metrics",
+        "fedavg_rounds",
+        "fedavg_runs",
+        "lineage_checkpoint_storage",
+        "model_lineages",
+        "parent_checkpoints",
+        "service_artifacts",
+        "service_checkpoint_storage",
+        "service_cohorts",
+        "service_failures",
+        "service_generation_provenance",
+        "service_metrics",
+        "service_regenerations",
+        "service_split_provenance",
+        "services",
+        "sqlite_sequence"
+      ],
+      "service_id_status_sha256": "763799c615a6d8f5b2dab63f88807569ef90814dc7088e24279e0e084b4e031c",
+      "identity_digest_scope": "Ordered service IDs and statuses only; not a content hash of database rows or artifact files.",
+      "source_stat_changed_during_read": false,
+      "snapshot_scope": "Single read transaction within this database; databases are not synchronized with one another."
+    },
+    {
+      "database": "outputs/services_merged.db",
+      "captured_at_utc": "2026-09-21T12:26:30.259448+00:00",
+      "size_bytes_before": 746577920,
+      "source_modified_at_utc_before": "2026-09-14T02:14:11.895899+00:00",
+      "queries": {
+        "status_counts": [
+          {
+            "status": "completed",
+            "n": 3656
+          },
+          {
+            "status": "failed",
+            "n": 601
+          }
+        ],
+        "completed_task_counts": [
+          {
+            "task_family": "classification",
+            "task_type": "classification",
+            "n": 2559
+          },
+          {
+            "task_family": "clustering",
+            "task_type": "clustering",
+            "n": 1
+          },
+          {
+            "task_family": "detection",
+            "task_type": "detection",
+            "n": 24
+          },
+          {
+            "task_family": "fill_mask",
+            "task_type": "classification",
+            "n": 90
+          },
+          {
+            "task_family": "generation",
+            "task_type": "image_captioning",
+            "n": 1
+          },
+          {
+            "task_family": "generation",
+            "task_type": "text2text_generation",
+            "n": 90
+          },
+          {
+            "task_family": "generation",
+            "task_type": "text_generation",
+            "n": 100
+          },
+          {
+            "task_family": "regression",
+            "task_type": "regression",
+            "n": 681
+          },
+          {
+            "task_family": "retrieval",
+            "task_type": "text_image_retrieval",
+            "n": 4
+          },
+          {
+            "task_family": "segmentation",
+            "task_type": "segmentation",
+            "n": 63
+          },
+          {
+            "task_family": "token_classification",
+            "task_type": "classification",
+            "n": 42
+          },
+          {
+            "task_family": "vqa",
+            "task_type": "visual_question_answering",
+            "n": 1
+          }
+        ],
+        "completed_source_counts": [
+          {
+            "model_ids": 67,
+            "dataset_names": 45
+          }
+        ],
+        "completed_provenance_counts": [
+          {
+            "generation_mode": "debug_no_weights",
+            "family_contract_version": null,
+            "n": 713,
+            "family_ids": 0
+          },
+          {
+            "generation_mode": "independent",
+            "family_contract_version": null,
+            "n": 300,
+            "family_ids": 0
+          },
+          {
+            "generation_mode": "independent",
+            "family_contract_version": "independent_family_v1",
+            "n": 2643,
+            "family_ids": 33
+          }
+        ],
+        "completed_family_sizes": [
+          {
+            "members": 43,
+            "families": 1
+          },
+          {
+            "members": 50,
+            "families": 12
+          },
+          {
+            "members": 100,
+            "families": 20
+          }
+        ],
+        "completed_evidence_status": []
+      },
+      "errors": {},
+      "tables": [
+        "cohort_clients",
+        "composition_validation_candidates",
+        "composition_validation_runs",
+        "fedavg_client_partitions",
+        "fedavg_client_rounds",
+        "fedavg_global_states",
+        "fedavg_round_metrics",
+        "fedavg_rounds",
+        "fedavg_runs",
+        "lineage_checkpoint_storage",
+        "manifest_service_runs",
+        "merge_conflicts",
+        "merge_service_sources",
+        "merge_sources",
+        "model_lineages",
+        "parent_checkpoints",
+        "service_artifacts",
+        "service_checkpoint_storage",
+        "service_cohorts",
+        "service_execution_provenance",
+        "service_failures",
+        "service_generation_provenance",
+        "service_metrics",
+        "service_regenerations",
+        "service_split_provenance",
+        "services",
+        "sqlite_sequence"
+      ],
+      "service_id_status_sha256": "6271e2f27c25354c0a51fe6a09f6f26194c33e6a21ca28bfb49c0925c1ddcef7",
+      "identity_digest_scope": "Ordered service IDs and statuses only; not a content hash of database rows or artifact files.",
+      "source_stat_changed_during_read": false,
+      "snapshot_scope": "Single read transaction within this database; databases are not synchronized with one another."
+    },
+    {
+      "database": "outputs/production/validation.db",
+      "captured_at_utc": "2026-09-21T12:26:30.373435+00:00",
+      "size_bytes_before": 20093886464,
+      "source_modified_at_utc_before": "2026-09-20T12:50:04.707553+00:00",
+      "queries": {
+        "status_counts": [
+          {
+            "status": "completed",
+            "n": 7291
+          },
+          {
+            "status": "failed",
+            "n": 1032
+          }
+        ],
+        "completed_task_counts": [
+          {
+            "task_family": "fill_mask",
+            "task_type": "fill_mask",
+            "n": 7291
+          }
+        ],
+        "completed_source_counts": [
+          {
+            "model_ids": 9,
+            "dataset_names": 9
+          }
+        ],
+        "completed_provenance_counts": [
+          {
+            "generation_mode": "independent",
+            "family_contract_version": "raw_source_family_v4",
+            "n": 7291,
+            "family_ids": 75
+          }
+        ],
+        "completed_family_sizes": [
+          {
+            "members": 23,
+            "families": 1
+          },
+          {
+            "members": 89,
+            "families": 1
+          },
+          {
+            "members": 90,
+            "families": 1
+          },
+          {
+            "members": 91,
+            "families": 3
+          },
+          {
+            "members": 93,
+            "families": 1
+          },
+          {
+            "members": 95,
+            "families": 3
+          },
+          {
+            "members": 96,
+            "families": 5
+          },
+          {
+            "members": 97,
+            "families": 5
+          },
+          {
+            "members": 98,
+            "families": 7
+          },
+          {
+            "members": 99,
+            "families": 13
+          },
+          {
+            "members": 100,
+            "families": 35
+          }
+        ],
+        "completed_evidence_status": [
+          {
+            "metric_name": "evaluation_protocol_version",
+            "value": "benchmark_evaluation_v1",
+            "n": 7291
+          },
+          {
+            "metric_name": "explainability_evidence_sufficient",
+            "value": 0,
+            "n": 7291
+          },
+          {
+            "metric_name": "explainability_status",
+            "value": "unsupported",
+            "n": 7291
+          },
+          {
+            "metric_name": "trust_evidence_sufficient",
+            "value": 0,
+            "n": 7291
+          },
+          {
+            "metric_name": "trust_status",
+            "value": "unsupported",
+            "n": 7291
+          }
+        ]
+      },
+      "errors": {},
+      "tables": [
+        "cohort_clients",
+        "composition_validation_candidates",
+        "composition_validation_runs",
+        "fedavg_client_partitions",
+        "fedavg_client_rounds",
+        "fedavg_global_states",
+        "fedavg_round_metrics",
+        "fedavg_rounds",
+        "fedavg_runs",
+        "lineage_checkpoint_storage",
+        "model_lineages",
+        "parent_checkpoints",
+        "service_artifacts",
+        "service_checkpoint_storage",
+        "service_cohorts",
+        "service_execution_provenance",
+        "service_failures",
+        "service_generation_provenance",
+        "service_metrics",
+        "service_regenerations",
+        "service_split_provenance",
+        "services",
+        "sqlite_sequence"
+      ],
+      "service_id_status_sha256": "eba4f53ab3fe3eb134074e15d46a7850c516ce5444da9c2cc34dd42be4da26c6",
+      "identity_digest_scope": "Ordered service IDs and statuses only; not a content hash of database rows or artifact files.",
+      "source_stat_changed_during_read": false,
+      "snapshot_scope": "Single read transaction within this database; databases are not synchronized with one another."
+    }
+  ],
+  "shared_service_ids": [
+    {
+      "left": "outputs/services.db",
+      "right": "outputs/services_merged.db",
+      "shared_ids": 0,
+      "interpretation": "Identity overlap only; content equality and scientific independence have not been established."
+    },
+    {
+      "left": "outputs/services.db",
+      "right": "outputs/production/validation.db",
+      "shared_ids": 0,
+      "interpretation": "Identity overlap only; content equality and scientific independence have not been established."
+    },
+    {
+      "left": "outputs/services_merged.db",
+      "right": "outputs/production/validation.db",
+      "shared_ids": 0,
+      "interpretation": "Identity overlap only; content equality and scientific independence have not been established."
+    }
+  ],
+  "source_file_sha256": {
+    "docs/reference/A_Collaborative_AIaaS_Composition_Dataset_1.pdf": "dcda113ad45bc47f205b59659f97d2fd6eda7678f9fb937614420c5a3da5ec6e",
+    "mlaas_data_generator/storage/schema.sql": "8632a994abd5a093f72c6b75ad6bcdb2f9885871a9a0b6028bce7763833a554f",
+    "mlaas_composition/assets/objective.v3.json": "e00280ac580b46e23c835e5cf21d49498b4fdce199c5b0ab4720ba1b1e84f096",
+    "mlaas_composition/search.py": "ad145dd9175738848352207cc7920d90d582631c2d637aee53a3f58d98889bbd",
+    "docs/journal/audit_dataset.py": "0d591dd7b3a1b4037bc660f1f064af5365fed63ae18d0ef58a298f108b2b23e4"
+  },
+  "unexamined_archive": {
+    "path": "outputs_ml_lambda.tar.gz",
+    "size_bytes": 18402609152,
+    "status": "Only initial archive member names inspected separately; database contents not audited or included in counts."
+  }
+}

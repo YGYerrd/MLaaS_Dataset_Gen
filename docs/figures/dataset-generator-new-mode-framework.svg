@@ -1,0 +1,195 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2160" height="1970" viewBox="0 0 2160 1970" role="img" aria-labelledby="title desc">
+<title id="title">Dataset generator: independent recipe-only generation</title>
+<desc id="desc">Eight stages: source catalogue, family preparation, controlled recipes, independent client training and evaluation, metadata and QoS, provenance and reconstruction, benchmark database, and downstream tasks. A separate audit-data route bypasses catalogue selection.</desc>
+<rect x="0" y="0" width="2160" height="1970" rx="0" fill="#F7F9FB" stroke="#F7F9FB" stroke-width="1.5"/>
+<text x="80" y="64" fill="#2E5D97" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="700" text-anchor="start">DATASET GENERATOR</text>
+<text x="80" y="112" fill="#172D43" font-family="Arial, Helvetica, sans-serif" font-size="43" font-weight="700" text-anchor="start">Framework for independent service generation</text>
+<rect x="1560" y="43" width="520" height="34" rx="7" fill="#E4F2F0" stroke="#E4F2F0" stroke-width="1.5"/>
+<text x="1572" y="66" fill="#007C83" font-family="Arial, Helvetica, sans-serif" font-size="17" font-weight="700" text-anchor="start">NEW MODE  /  INDEPENDENT + RECIPE-ONLY</text>
+<text x="2080" y="111" fill="#566D80" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" text-anchor="end">One shared initial state. Many controlled service variants.</text>
+<rect x="80" y="160" width="600" height="430" rx="14" fill="#FFFFFF" stroke="#CAD5DE" stroke-width="1.5"/>
+<rect x="80" y="160" width="600" height="7" rx="2" fill="#2E5D97" stroke="#2E5D97" stroke-width="1.5"/>
+<rect x="104" y="184" width="43" height="43" rx="10" fill="#2E5D97" stroke="#2E5D97" stroke-width="1.5"/>
+<text x="125.5" y="214" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="25" font-weight="700" text-anchor="middle">01</text>
+<text x="162" y="209" fill="#172D43" font-family="Arial, Helvetica, sans-serif" font-size="27" font-weight="700" text-anchor="start">Source model / dataset catalogue</text>
+<text x="162" y="238" fill="#566D80" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="400" text-anchor="start">Select compatible model-dataset-task contracts</text>
+<text x="105" y="277" fill="#2E5D97" font-family="Arial, Helvetica, sans-serif" font-size="19" font-weight="700" text-anchor="start">MODEL SOURCES</text>
+<text x="105" y="307" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="400" text-anchor="start">Hugging Face models and local neural baselines</text>
+<text x="105" y="336" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="400" text-anchor="start">Architecture, task head and parameter schema</text>
+<text x="105" y="369" fill="#2E5D97" font-family="Arial, Helvetica, sans-serif" font-size="19" font-weight="700" text-anchor="start">DATASET SOURCES</text>
+<text x="105" y="399" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="400" text-anchor="start">Dataset/configuration and source revisions</text>
+<text x="105" y="428" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="400" text-anchor="start">Official training and separate evaluation splits</text>
+<text x="105" y="461" fill="#2E5D97" font-family="Arial, Helvetica, sans-serif" font-size="19" font-weight="700" text-anchor="start">CONTRACT PREFLIGHT</text>
+<text x="105" y="491" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="400" text-anchor="start">Task, modality, labels and split compatibility</text>
+<text x="105" y="520" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="400" text-anchor="start">Record excluded or unsupported candidates</text>
+<rect x="105" y="541" width="549" height="34" rx="7" fill="#EEF3F8" stroke="#EEF3F8" stroke-width="1.5"/>
+<text x="117" y="564" fill="#2E5D97" font-family="Arial, Helvetica, sans-serif" font-size="17" font-weight="700" text-anchor="start">Output: compatible source contracts + preflight report</text>
+<rect x="780" y="160" width="600" height="430" rx="14" fill="#FFFFFF" stroke="#CAD5DE" stroke-width="1.5"/>
+<rect x="780" y="160" width="600" height="7" rx="2" fill="#007C83" stroke="#007C83" stroke-width="1.5"/>
+<rect x="804" y="184" width="43" height="43" rx="10" fill="#007C83" stroke="#007C83" stroke-width="1.5"/>
+<text x="825.5" y="214" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="25" font-weight="700" text-anchor="middle">02</text>
+<text x="862" y="209" fill="#172D43" font-family="Arial, Helvetica, sans-serif" font-size="27" font-weight="700" text-anchor="start">Family preparation</text>
+<text x="862" y="238" fill="#566D80" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="400" text-anchor="start">Pin and freeze shared dependencies</text>
+<text x="805" y="277" fill="#007C83" font-family="Arial, Helvetica, sans-serif" font-size="19" font-weight="700" text-anchor="start">SEMANTIC FAMILY CONTRACT</text>
+<text x="805" y="307" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="400" text-anchor="start">Pinned sources; task, label and preprocessing rules</text>
+<text x="805" y="336" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="400" text-anchor="start">Shared fitted transforms and parameter contract</text>
+<text x="805" y="369" fill="#007C83" font-family="Arial, Helvetica, sans-serif" font-size="19" font-weight="700" text-anchor="start">COMMON INITIAL STATE</text>
+<text x="805" y="399" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="400" text-anchor="start">Initialise the model / task head once; retain w0</text>
+<text x="805" y="428" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="400" text-anchor="start">Every client resets to this same frozen state</text>
+<text x="805" y="461" fill="#007C83" font-family="Arial, Helvetica, sans-serif" font-size="19" font-weight="700" text-anchor="start">FROZEN DATA RESERVATIONS</text>
+<text x="805" y="491" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="400" text-anchor="start">Full training source; common catalogue subset</text>
+<text x="805" y="520" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="400" text-anchor="start">Separate saved audit rows for downstream checks</text>
+<rect x="805" y="541" width="550" height="34" rx="7" fill="#E4F2F0" stroke="#E4F2F0" stroke-width="1.5"/>
+<text x="817" y="564" fill="#007C83" font-family="Arial, Helvetica, sans-serif" font-size="17" font-weight="700" text-anchor="start">Output: family ID + contract + w0 + reservation</text>
+<rect x="1480" y="160" width="600" height="430" rx="14" fill="#FFFFFF" stroke="#CAD5DE" stroke-width="1.5"/>
+<rect x="1480" y="160" width="600" height="7" rx="2" fill="#2E5D97" stroke="#2E5D97" stroke-width="1.5"/>
+<rect x="1504" y="184" width="43" height="43" rx="10" fill="#2E5D97" stroke="#2E5D97" stroke-width="1.5"/>
+<text x="1525.5" y="214" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="25" font-weight="700" text-anchor="middle">03</text>
+<text x="1562" y="209" fill="#172D43" font-family="Arial, Helvetica, sans-serif" font-size="27" font-weight="700" text-anchor="start">Controlled service recipes</text>
+<text x="1562" y="238" fill="#566D80" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="400" text-anchor="start">Versioned policies with seeded coverage</text>
+<text x="1505" y="277" fill="#2E5D97" font-family="Arial, Helvetica, sans-serif" font-size="19" font-weight="700" text-anchor="start">CLIENT DATA VARIATION</text>
+<text x="1505" y="307" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="400" text-anchor="start">Quantity, sampling seed and distribution intensity</text>
+<text x="1505" y="336" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="400" text-anchor="start">IID / Dirichlet / shard on supported sampling axes</text>
+<text x="1505" y="369" fill="#2E5D97" font-family="Arial, Helvetica, sans-serif" font-size="19" font-weight="700" text-anchor="start">TRAINING VARIATION</text>
+<text x="1505" y="399" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="400" text-anchor="start">Optimizer, learning rate, batch size and epochs</text>
+<text x="1505" y="428" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="400" text-anchor="start">Accumulation, weight decay, warmup; feasibility</text>
+<text x="1505" y="461" fill="#2E5D97" font-family="Arial, Helvetica, sans-serif" font-size="19" font-weight="700" text-anchor="start">CATALOGUE-INFORMED POLICIES, WHERE ELIGIBLE</text>
+<text x="1505" y="491" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" text-anchor="start">70% supported / 20% challenging / 10% stress</text>
+<text x="1505" y="520" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" text-anchor="start">Frozen historical evidence; explicit fallback policies</text>
+<rect x="1505" y="541" width="550" height="34" rx="7" fill="#EEF3F8" stroke="#EEF3F8" stroke-width="1.5"/>
+<text x="1517" y="564" fill="#2E5D97" font-family="Arial, Helvetica, sans-serif" font-size="17" font-weight="700" text-anchor="start">Output: planned manifest + policy hashes + coverage</text>
+<polyline points="680,361 780,361" fill="none" stroke="#2E5D97" stroke-width="3"/>
+<polygon points="780.00,361.00 765.00,355.00 765.00,367.00" fill="#2E5D97"/>
+<polyline points="1380,361 1480,361" fill="none" stroke="#2E5D97" stroke-width="3"/>
+<polygon points="1480.00,361.00 1465.00,355.00 1465.00,367.00" fill="#2E5D97"/>
+<polyline points="960,590 960,622 420,622 420,690" fill="none" stroke="#007C83" stroke-width="3" stroke-dasharray="9 7"/>
+<polygon points="420.00,690.00 426.00,675.00 414.00,675.00" fill="#007C83"/>
+<text x="480" y="613" fill="#007C83" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="400" text-anchor="start">shared state + training source + catalogue rows</text>
+<polyline points="1280,590 1280,651 2120,651 2120,1750" fill="none" stroke="#007C83" stroke-width="3" stroke-dasharray="9 7"/>
+<text x="1475" y="641" fill="#007C83" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="400" text-anchor="start">saved audit rows: reserved for downstream validation</text>
+<polyline points="1770,590 1770,614 2050,614 2050,690" fill="none" stroke="#2E5D97" stroke-width="3"/>
+<polygon points="2050.00,690.00 2056.00,675.00 2044.00,675.00" fill="#2E5D97"/>
+<rect x="80" y="690" width="2000" height="330" rx="14" fill="#FFFFFF" stroke="#CAD5DE" stroke-width="1.5"/>
+<rect x="80" y="690" width="2000" height="7" rx="2" fill="#2E5D97" stroke="#2E5D97" stroke-width="1.5"/>
+<rect x="104" y="714" width="43" height="43" rx="10" fill="#2E5D97" stroke="#2E5D97" stroke-width="1.5"/>
+<text x="125.5" y="744" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="25" font-weight="700" text-anchor="middle">04</text>
+<text x="162" y="739" fill="#172D43" font-family="Arial, Helvetica, sans-serif" font-size="27" font-weight="700" text-anchor="start">Heterogeneous client training and evaluation</text>
+<text x="162" y="768" fill="#566D80" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="400" text-anchor="start">Repeat across compatible families; clients are independent experiments</text>
+<rect x="105" y="792" width="545" height="202" rx="14" fill="#F3F7FC" stroke="#F3F7FC" stroke-width="1.5"/>
+<text x="125" y="825" fill="#2E5D97" font-family="Arial, Helvetica, sans-serif" font-size="19" font-weight="700" text-anchor="start">SELECT RAW ROWS, THEN PREPARE</text>
+<text x="125" y="855" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" text-anchor="start">Sample without replacement within each client</text>
+<text x="125" y="884" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" text-anchor="start">Allow overlap across clients; record realised counts</text>
+<text x="125" y="913" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" text-anchor="start">Prepare selected rows; replace rejected candidates</text>
+<text x="125" y="942" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" text-anchor="start">Reuse shared preparation while preserving row order</text>
+<polyline points="650,888 720,888" fill="none" stroke="#2E5D97" stroke-width="3"/>
+<polygon points="720.00,888.00 705.00,882.00 705.00,894.00" fill="#2E5D97"/>
+<rect x="720" y="792" width="650" height="202" rx="14" fill="#ECF5F4" stroke="#ECF5F4" stroke-width="1.5"/>
+<text x="742" y="825" fill="#007C83" font-family="Arial, Helvetica, sans-serif" font-size="19" font-weight="700" text-anchor="start">RESET w0 + OPTIMIZER / RNG STATE FOR EACH CLIENT</text>
+<rect x="742" y="844" width="186" height="78" rx="9" fill="#FFFFFF" stroke="#A9D1CE" stroke-width="1.5"/>
+<text x="835" y="873" fill="#172D43" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="700" text-anchor="middle">Client 1</text>
+<text x="835" y="903" fill="#007C83" font-family="Arial, Helvetica, sans-serif" font-size="17" font-weight="400" text-anchor="middle">w0 + data + recipe</text>
+<rect x="949" y="844" width="186" height="78" rx="9" fill="#FFFFFF" stroke="#A9D1CE" stroke-width="1.5"/>
+<text x="1042" y="873" fill="#172D43" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="700" text-anchor="middle">Client 2</text>
+<text x="1042" y="903" fill="#007C83" font-family="Arial, Helvetica, sans-serif" font-size="17" font-weight="400" text-anchor="middle">w0 + data + recipe</text>
+<rect x="1156" y="844" width="186" height="78" rx="9" fill="#FFFFFF" stroke="#A9D1CE" stroke-width="1.5"/>
+<text x="1249" y="873" fill="#172D43" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="700" text-anchor="middle">Client N</text>
+<text x="1249" y="903" fill="#007C83" font-family="Arial, Helvetica, sans-serif" font-size="17" font-weight="400" text-anchor="middle">w0 + data + recipe</text>
+<text x="742" y="950" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" text-anchor="start">Train separately; capture actual settings and updates</text>
+<text x="742" y="979" fill="#566D80" font-family="Arial, Helvetica, sans-serif" font-size="19" font-weight="400" text-anchor="start">No client-to-client model transfer or generation aggregation</text>
+<polyline points="1370,888 1440,888" fill="none" stroke="#2E5D97" stroke-width="3"/>
+<polygon points="1440.00,888.00 1425.00,882.00 1425.00,894.00" fill="#2E5D97"/>
+<rect x="1440" y="792" width="615" height="202" rx="14" fill="#F3F7FC" stroke="#F3F7FC" stroke-width="1.5"/>
+<text x="1462" y="825" fill="#2E5D97" font-family="Arial, Helvetica, sans-serif" font-size="19" font-weight="700" text-anchor="start">COMMON CATALOGUE EVALUATION</text>
+<text x="1462" y="855" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" text-anchor="start">Evaluate every client on the same frozen subset</text>
+<text x="1462" y="884" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" text-anchor="start">Task-specific quality, timing and resource measures</text>
+<text x="1462" y="913" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" text-anchor="start">Trust / explanation protocols where supported</text>
+<text x="1462" y="942" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" text-anchor="start">Capture completion, failures and evidence status</text>
+<polyline points="1985,1020 1985,1060 380,1060 380,1110" fill="none" stroke="#2E5D97" stroke-width="3"/>
+<polygon points="380.00,1110.00 386.00,1095.00 374.00,1095.00" fill="#2E5D97"/>
+<text x="1040" y="1050" fill="#2E5D97" font-family="Arial, Helvetica, sans-serif" font-size="19" font-weight="400" text-anchor="start">per-service measurements + effective execution observations</text>
+<rect x="80" y="1110" width="600" height="400" rx="14" fill="#FFFFFF" stroke="#CAD5DE" stroke-width="1.5"/>
+<rect x="80" y="1110" width="600" height="7" rx="2" fill="#2E5D97" stroke="#2E5D97" stroke-width="1.5"/>
+<rect x="104" y="1134" width="43" height="43" rx="10" fill="#2E5D97" stroke="#2E5D97" stroke-width="1.5"/>
+<text x="125.5" y="1164" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="25" font-weight="700" text-anchor="middle">05</text>
+<text x="162" y="1159" fill="#172D43" font-family="Arial, Helvetica, sans-serif" font-size="27" font-weight="700" text-anchor="start">Service metadata / QoS</text>
+<text x="162" y="1188" fill="#566D80" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="400" text-anchor="start">Extract typed observations and measurement context</text>
+<text x="105" y="1235" fill="#2E5D97" font-family="Arial, Helvetica, sans-serif" font-size="19" font-weight="700" text-anchor="start">FUNCTIONAL DESCRIPTION</text>
+<text x="105" y="1265" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" text-anchor="start">Task, modality, model, data and interface schemas</text>
+<text x="105" y="1294" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" text-anchor="start">Family membership and realised training distribution</text>
+<text x="105" y="1330" fill="#2E5D97" font-family="Arial, Helvetica, sans-serif" font-size="19" font-weight="700" text-anchor="start">QUALITY + QOS + RESOURCES</text>
+<text x="105" y="1360" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" text-anchor="start">Named task metric, loss and normalised quality score</text>
+<text x="105" y="1389" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" text-anchor="start">Runtime / inference timing, memory and model size</text>
+<text x="105" y="1418" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" text-anchor="start">Reliability indicators and modelled resource cost</text>
+<text x="105" y="1454" fill="#2E5D97" font-family="Arial, Helvetica, sans-serif" font-size="19" font-weight="700" text-anchor="start">EVIDENCE SEMANTICS</text>
+<text x="105" y="1484" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" text-anchor="start">Units, direction, protocol, counts, intervals and status</text>
+<rect x="780" y="1110" width="600" height="400" rx="14" fill="#FFFFFF" stroke="#CAD5DE" stroke-width="1.5"/>
+<rect x="780" y="1110" width="600" height="7" rx="2" fill="#7251A1" stroke="#7251A1" stroke-width="1.5"/>
+<rect x="804" y="1134" width="43" height="43" rx="10" fill="#7251A1" stroke="#7251A1" stroke-width="1.5"/>
+<text x="825.5" y="1164" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="25" font-weight="700" text-anchor="middle">06</text>
+<text x="862" y="1159" fill="#172D43" font-family="Arial, Helvetica, sans-serif" font-size="27" font-weight="700" text-anchor="start">Provenance / reconstruction</text>
+<text x="862" y="1188" fill="#566D80" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="400" text-anchor="start">Persist authoritative recipes after execution</text>
+<text x="805" y="1235" fill="#7251A1" font-family="Arial, Helvetica, sans-serif" font-size="19" font-weight="700" text-anchor="start">PER-CLIENT RECONSTRUCTION RECIPE</text>
+<text x="805" y="1265" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" text-anchor="start">Family / initial-state hashes; ordered accepted row IDs</text>
+<text x="805" y="1294" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" text-anchor="start">Effective settings, seeds, updates and stopping reason</text>
+<text x="805" y="1323" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" text-anchor="start">Prepared-content hashes, metrics and runtime versions</text>
+<text x="805" y="1352" fill="#7251A1" font-family="Arial, Helvetica, sans-serif" font-size="19" font-weight="700" text-anchor="start">EXECUTION EVIDENCE</text>
+<text x="805" y="1382" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" text-anchor="start">Requested-to-effective settings and runtime changes</text>
+<text x="805" y="1411" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" text-anchor="start">Hashed append-only execution records + artifact links</text>
+<rect x="805" y="1417" width="550" height="70" rx="9" fill="#F0EBF7" stroke="#F0EBF7" stroke-width="1.5"/>
+<text x="820" y="1444" fill="#7251A1" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" text-anchor="start">Default: retain shared w0 + recipes; release client weights</text>
+<text x="820" y="1471" fill="#7251A1" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" text-anchor="start">Optional: retain checkpoints / validation references</text>
+<rect x="1480" y="1110" width="600" height="400" rx="14" fill="#FFFFFF" stroke="#CAD5DE" stroke-width="1.5"/>
+<rect x="1480" y="1110" width="600" height="7" rx="2" fill="#7251A1" stroke="#7251A1" stroke-width="1.5"/>
+<rect x="1504" y="1134" width="43" height="43" rx="10" fill="#7251A1" stroke="#7251A1" stroke-width="1.5"/>
+<text x="1525.5" y="1164" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="25" font-weight="700" text-anchor="middle">07</text>
+<text x="1562" y="1159" fill="#172D43" font-family="Arial, Helvetica, sans-serif" font-size="27" font-weight="700" text-anchor="start">Benchmark database</text>
+<text x="1562" y="1188" fill="#566D80" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="400" text-anchor="start">SQLite catalogue linked to durable artifacts</text>
+<text x="1505" y="1235" fill="#7251A1" font-family="Arial, Helvetica, sans-serif" font-size="19" font-weight="700" text-anchor="start">QUERYABLE RECORDS</text>
+<text x="1505" y="1265" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" text-anchor="start">services  |  service_metrics  |  service_artifacts</text>
+<text x="1505" y="1294" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" text-anchor="start">Generation, split and execution provenance</text>
+<text x="1505" y="1323" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" text-anchor="start">Lineage / retention records; explicit failure evidence</text>
+<text x="1505" y="1352" fill="#7251A1" font-family="Arial, Helvetica, sans-serif" font-size="19" font-weight="700" text-anchor="start">CONTENT-ADDRESSED ARTIFACT STORE</text>
+<text x="1505" y="1382" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" text-anchor="start">Family documents, common initial checkpoints</text>
+<text x="1505" y="1411" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" text-anchor="start">Recipes, audit reservations and evaluation evidence</text>
+<rect x="1505" y="1417" width="550" height="70" rx="9" fill="#F0EBF7" stroke="#F0EBF7" stroke-width="1.5"/>
+<text x="1520" y="1444" fill="#7251A1" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" text-anchor="start">Join by service / family IDs; verify references and hashes</text>
+<text x="1520" y="1471" fill="#7251A1" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" text-anchor="start">Resume skips verified completed services</text>
+<polyline points="680,1320 780,1320" fill="none" stroke="#2E5D97" stroke-width="3"/>
+<polygon points="780.00,1320.00 765.00,1314.00 765.00,1326.00" fill="#2E5D97"/>
+<polyline points="1380,1320 1480,1320" fill="none" stroke="#2E5D97" stroke-width="3"/>
+<polygon points="1480.00,1320.00 1465.00,1314.00 1465.00,1326.00" fill="#2E5D97"/>
+<polyline points="1775,1510 1775,1580" fill="none" stroke="#2E5D97" stroke-width="3"/>
+<polygon points="1775.00,1580.00 1781.00,1565.00 1769.00,1565.00" fill="#2E5D97"/>
+<text x="1810" y="1552" fill="#7251A1" font-family="Arial, Helvetica, sans-serif" font-size="17" font-weight="400" text-anchor="start">catalogue + verified artifact links</text>
+<rect x="80" y="1580" width="2000" height="277" rx="14" fill="#FFFFFF" stroke="#CAD5DE" stroke-width="1.5"/>
+<rect x="80" y="1580" width="2000" height="7" rx="2" fill="#A55C14" stroke="#A55C14" stroke-width="1.5"/>
+<rect x="104" y="1604" width="43" height="43" rx="10" fill="#A55C14" stroke="#A55C14" stroke-width="1.5"/>
+<text x="125.5" y="1634" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="25" font-weight="700" text-anchor="middle">08</text>
+<text x="162" y="1629" fill="#172D43" font-family="Arial, Helvetica, sans-serif" font-size="27" font-weight="700" text-anchor="start">Downstream benchmark tasks</text>
+<text x="162" y="1658" fill="#566D80" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="400" text-anchor="start">Supported workflows and proposed reuse protocols; experiments require their own evaluation</text>
+<rect x="105" y="1681" width="626" height="151" rx="10" fill="#FCF5EC" stroke="#FCF5EC" stroke-width="1.5"/>
+<rect x="767" y="1681" width="626" height="151" rx="10" fill="#FCF5EC" stroke="#FCF5EC" stroke-width="1.5"/>
+<rect x="1429" y="1681" width="626" height="151" rx="10" fill="#FCF5EC" stroke="#FCF5EC" stroke-width="1.5"/>
+<text x="124" y="1711" fill="#A55C14" font-family="Arial, Helvetica, sans-serif" font-size="19" font-weight="700" text-anchor="start">CATALOGUE ANALYSIS</text>
+<text x="124" y="1741" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" text-anchor="start">Service filtering / ranking and QoS prediction</text>
+<text x="124" y="1770" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" text-anchor="start">Evidence coverage, failure and diversity analysis</text>
+<text x="124" y="1799" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" text-anchor="start">Use held-out families and prevent target leakage</text>
+<text x="786" y="1711" fill="#A55C14" font-family="Arial, Helvetica, sans-serif" font-size="19" font-weight="700" text-anchor="start">RECONSTRUCTION BENCHMARKS</text>
+<text x="786" y="1741" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" text-anchor="start">Verify dependencies; replay selected client recipes</text>
+<text x="786" y="1770" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" text-anchor="start">Measure fidelity against a retained reference / twin</text>
+<text x="786" y="1799" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="400" text-anchor="start">Report storage, replay cost and functional agreement</text>
+<text x="1448" y="1711" fill="#A55C14" font-family="Arial, Helvetica, sans-serif" font-size="19" font-weight="700" text-anchor="start">COMPATIBLE COLLABORATIVE COMPOSITION</text>
+<text x="1448" y="1741" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" text-anchor="start">Freeze requests / candidates; MAB, GA, greedy, random</text>
+<text x="1448" y="1770" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" text-anchor="start">Replay members; sample-weighted parameter averaging</text>
+<text x="1448" y="1799" fill="#344B60" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" text-anchor="start">Measure aggregate quality / latency on saved audit rows</text>
+<polyline points="2120,1750 2046,1750" fill="none" stroke="#007C83" stroke-width="3" stroke-dasharray="9 7"/>
+<polygon points="2046.00,1750.00 2061.00,1756.00 2061.00,1744.00" fill="#007C83"/>
+<polyline points="80,1896 145,1896" fill="none" stroke="#2E5D97" stroke-width="2.5"/>
+<polygon points="145.00,1896.00 130.00,1890.00 130.00,1902.00" fill="#2E5D97"/>
+<text x="158" y="1903" fill="#566D80" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="400" text-anchor="start">Primary data flow</text>
+<polyline points="360,1896 425,1896" fill="none" stroke="#007C83" stroke-width="2.5" stroke-dasharray="9 7"/>
+<polygon points="425.00,1896.00 410.00,1890.00 410.00,1902.00" fill="#007C83"/>
+<text x="438" y="1903" fill="#566D80" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="400" text-anchor="start">Shared dependencies / reserved audit data</text>
+<text x="950" y="1903" fill="#566D80" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="400" text-anchor="start">Recipe bands describe planned conditions; observed quality can be weak.</text>
+<text x="80" y="1941" fill="#566D80" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="400" text-anchor="start">Logical framework: hf-manifest plans contracts and recipes; run-manifest freezes durable families and executes clients. Replay fidelity is evaluated separately.</text>
+</svg>

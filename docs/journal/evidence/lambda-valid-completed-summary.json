@@ -1,0 +1,125 @@
+{
+  "audit_version": "lambda_completed_record_audit_v1",
+  "captured_at_utc": "2026-09-21T12:51:07.817113+00:00",
+  "selected_root": "outputs_ml_lambda/outputs",
+  "original_path_prefix": "/home/joshua/MLaaS_Dataset_Gen/outputs/",
+  "validity_definition": "Completed status; finite named primary score, metric_score and train/evaluation loss consistent with recipe; authoritative recipe/family/reservation hashes and identities; unique selected training rows disjoint from saved evaluation; supported completed-epoch optimizer history; recipe-only retention; shared base payload and reconstruction-support file checksums. No minimum accuracy threshold.",
+  "limitations": "No model loading/retraining, tensor-state decoding, raw-source retrieval/content verification, measured composition, all-metric-trial validation or whole-database integrity_check. Stored-byte integrity is not model fidelity or downstream capability. Linux paths mapped in memory; source files unchanged.",
+  "sources": [
+    {
+      "database": "outputs_ml_lambda/outputs/validation.db",
+      "status_counts": {
+        "failed": 700
+      },
+      "source_stat_changed_during_read": false
+    },
+    {
+      "database": "outputs_ml_lambda/outputs/validation.gpu0.db",
+      "status_counts": {
+        "failed": 7711,
+        "completed": 6174
+      },
+      "source_stat_changed_during_read": false
+    },
+    {
+      "database": "outputs_ml_lambda/outputs/validation.gpu1.db",
+      "status_counts": {
+        "failed": 5614,
+        "completed": 5733
+      },
+      "source_stat_changed_during_read": false
+    }
+  ],
+  "source_record_count": 25932,
+  "distinct_service_ids_all_statuses": 24532,
+  "completed_rows": 11907,
+  "distinct_completed_ids": 11907,
+  "valid_completed_services": 11907,
+  "invalid_completed_rows": 0,
+  "invalid_completed_reasons": {},
+  "noncompleted_source_rows": 14025,
+  "distinct_ids_without_completed_record": 12625,
+  "mixed_status_ids": 700,
+  "valid_task_counts": {
+    "fill_mask": 4500,
+    "classification": 6975,
+    "token_classification": 432
+  },
+  "valid_hf_task_counts": {
+    "fill_mask": 4500,
+    "image_classification": 4175,
+    "sequence_classification": 2800,
+    "token_classification": 432
+  },
+  "valid_model_ids": [
+    "albert/albert-base-v2",
+    "bert-base-cased",
+    "bert-base-uncased",
+    "distilbert-base-uncased",
+    "distilroberta-base",
+    "facebook/levit-128S",
+    "google/mobilenet_v2_1.0_224",
+    "google/vit-base-patch16-224",
+    "microsoft/resnet-50",
+    "microsoft/swin-tiny-patch4-window7-224",
+    "roberta-base"
+  ],
+  "valid_dataset_names": [
+    "BramVanroy/conll2002",
+    "EdinburghNLP/xsum",
+    "ag_news",
+    "beans",
+    "cifar10",
+    "cnn_dailymail",
+    "cornell-movie-review-data/rotten_tomatoes",
+    "dair-ai/emotion",
+    "ethz/food101",
+    "glue",
+    "imdb",
+    "knkarthick/samsum",
+    "roneneldan/TinyStories",
+    "timm/oxford-iiit-pet",
+    "ufldl-stanford/svhn",
+    "unimelb-nlp/wikiann",
+    "uoft-cs/cifar100",
+    "wikitext",
+    "ylecun/mnist",
+    "zalando-datasets/fashion_mnist",
+    "zh-plus/tiny-imagenet"
+  ],
+  "valid_family_count": 123,
+  "valid_family_size_distribution": {
+    "100": 112,
+    "20": 1,
+    "48": 1,
+    "97": 1,
+    "15": 1,
+    "96": 1,
+    "94": 1,
+    "98": 1,
+    "17": 1,
+    "90": 1,
+    "52": 1,
+    "80": 1
+  },
+  "valid_trust_status_counts": {
+    "unsupported": 11907
+  },
+  "valid_explanation_status_counts": {
+    "insufficient_evidence": 345,
+    "unsupported": 10279,
+    "complete": 1283
+  },
+  "valid_explanation_usable": 1283,
+  "valid_created_at_range": [
+    "2026-09-18 09:30:45",
+    "2026-09-20 01:18:00"
+  ],
+  "verified_unique_files": 12434,
+  "verified_base_manifests": 123,
+  "verified_families": 123,
+  "verified_support_artifacts": 54,
+  "roster_sha256": "e274611059a9cd7d744c143b5dd7ef6ecae6607d8d0cb0dce2bebbb795e50b11",
+  "audit_script_sha256": "d9bc916a9fcd308c018041944989f68acfb884e3438a5eb2eaacd35ff9aeed2b",
+  "output_directory": "outputs_ml_lambda/journal_audit"
+}

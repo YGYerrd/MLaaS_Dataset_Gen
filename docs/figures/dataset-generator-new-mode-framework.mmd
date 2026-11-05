@@ -1,0 +1,51 @@
+%% Scope: current independent recipe-only generation; logical data flow.
+%% hf-manifest plans recipes before run-manifest freezes the durable family.
+flowchart TB
+    subgraph PLAN[Source contracts and controlled experimental design]
+        direction LR
+        S["01 Source model / dataset catalogue<br/>HF models + local neural baselines<br/>Compatible task, model, dataset and split contracts<br/>Preflight exclusions recorded"]
+        F["02 Family preparation<br/>Pinned revisions + raw-source fingerprints<br/>Task / labels / preprocessing / parameter contract<br/>Common initial state w0 + frozen evaluation reservation"]
+        R["03 Controlled service recipes<br/>Seeded sample quantities + supported IID / Dirichlet / shard axes<br/>Optimizer, LR, batch, epochs, accumulation, decay, warmup<br/>Eligible policies: 70% supported / 20% challenging / 10% stress<br/>Frozen policy hashes + manifest + coverage"]
+        S --> F --> R
+    end
+    subgraph EXEC[04 Heterogeneous client training and evaluation]
+        direction LR
+        D["Select raw rows before preparation<br/>Unique rows within client; overlap across clients allowed<br/>Prepare selected rows and replacements<br/>Record ordered accepted IDs + realised counts"]
+        W["Reset to common w0<br/>Reset optimizer and RNG state<br/>Independent client experiments"]
+        C1["Client 1<br/>data + recipe"]
+        C2["Client 2<br/>data + recipe"]
+        CN["Client N<br/>data + recipe"]
+        E["Common frozen catalogue evaluation<br/>Task quality + timing + resources<br/>Trust / explanation where supported<br/>Completion and evidence status"]
+        D --> W
+        W --> C1 & C2 & CN
+        C1 & C2 & CN --> E
+    end
+    R --> D
+    F -. "shared state / source / catalogue rows" .-> W
+    F -. "same catalogue subset" .-> E
+    A["Separate frozen audit reservation<br/>Bypasses catalogue selection"]
+    F -.-> A
+    subgraph STORE[Service observations and durable benchmark records]
+        direction LR
+        M["05 Service metadata / QoS extraction<br/>Functional attributes + realised data distribution<br/>Named metrics, units, direction, hardware and timing scope<br/>Protocol, counts, intervals, support / sufficiency status"]
+        P["06 Provenance and reconstruction records<br/>Family + initial-state hashes + ordered source IDs<br/>Effective settings, seeds, updates, stopping and runtime<br/>Content hashes + append-only execution evidence<br/>Default: shared w0 + recipes; optional client checkpoints"]
+        B[("07 Benchmark database<br/>SQLite services / metrics / provenance / failures<br/>Linked content-addressed family, recipe,<br/>reservation and checkpoint artifacts")]
+        M --> P --> B
+    end
+    E --> M
+    subgraph TASKS[08 Downstream benchmark tasks - supported workflows and proposed reuse]
+        direction LR
+        T["Catalogue analysis<br/>Filtering / ranking; QoS prediction<br/>Evidence / failures / diversity<br/>Held-out family splits; leakage controls"]
+        V["Reconstruction benchmarks<br/>Verify dependencies; replay recipes<br/>Compare to retained reference / twin<br/>Functional fidelity, storage and replay cost"]
+        Q["Compatible collaborative composition<br/>Freeze requests and candidate membership<br/>Catalogue-only search: MAB / GA / greedy / random<br/>Replay selected members; sample-weighted parameter averaging<br/>Measure quality and latency on saved audit rows"]
+    end
+    B --> T & V & Q
+    A -. "exact saved audit rows" .-> Q
+    classDef source fill:#eef3f8,stroke:#2e5d97,color:#172d43
+    classDef family fill:#e4f2f0,stroke:#007c83,color:#172d43
+    classDef record fill:#f0ebf7,stroke:#7251a1,color:#172d43
+    classDef task fill:#fcf5ec,stroke:#a55c14,color:#172d43
+    class S,R,D,W,C1,C2,CN,E,M source
+    class F,A family
+    class P,B record
+    class T,V,Q task

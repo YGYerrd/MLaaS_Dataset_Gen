@@ -1,0 +1,392 @@
+{
+  "audit_version": 1,
+  "created_at_utc": "2026-09-21T12:40:27.305147+00:00",
+  "scope": "Read-only inventory of explicitly named local databases. No archive expansion, artifact checksum audit, model replay, benchmark execution or release freeze.",
+  "databases": [
+    {
+      "database": "outputs_ml_lambda/outputs/validation.db",
+      "captured_at_utc": "2026-09-21T12:40:27.305147+00:00",
+      "size_bytes_before": 32940032,
+      "source_modified_at_utc_before": "2026-09-20T01:18:37+00:00",
+      "queries": {
+        "status_counts": [
+          {
+            "status": "failed",
+            "n": 700
+          }
+        ],
+        "completed_task_counts": [],
+        "completed_source_counts": [
+          {
+            "model_ids": 0,
+            "dataset_names": 0
+          }
+        ],
+        "completed_provenance_counts": [],
+        "completed_family_sizes": [],
+        "completed_evidence_status": []
+      },
+      "errors": {},
+      "tables": [
+        "cohort_clients",
+        "composition_validation_candidates",
+        "composition_validation_runs",
+        "fedavg_client_partitions",
+        "fedavg_client_rounds",
+        "fedavg_global_states",
+        "fedavg_round_metrics",
+        "fedavg_rounds",
+        "fedavg_runs",
+        "lineage_checkpoint_storage",
+        "manifest_service_runs",
+        "model_lineages",
+        "parent_checkpoints",
+        "service_artifacts",
+        "service_checkpoint_storage",
+        "service_cohorts",
+        "service_execution_provenance",
+        "service_failures",
+        "service_generation_provenance",
+        "service_metrics",
+        "service_regenerations",
+        "service_split_provenance",
+        "services",
+        "sqlite_sequence"
+      ],
+      "service_id_status_sha256": "3a029e53f48fc2bda5822e385a2f1231d860831a3cf8258024d0a64f4441c412",
+      "identity_digest_scope": "Ordered service IDs and statuses only; not a content hash of database rows or artifact files.",
+      "source_stat_changed_during_read": false,
+      "snapshot_scope": "Single read transaction within this database; databases are not synchronized with one another."
+    },
+    {
+      "database": "outputs_ml_lambda/outputs/validation.gpu0.db",
+      "captured_at_utc": "2026-09-21T12:40:27.459986+00:00",
+      "size_bytes_before": 13648277504,
+      "source_modified_at_utc_before": "2026-09-20T01:18:00+00:00",
+      "queries": {
+        "status_counts": [
+          {
+            "status": "completed",
+            "n": 6174
+          },
+          {
+            "status": "failed",
+            "n": 7711
+          }
+        ],
+        "completed_task_counts": [
+          {
+            "task_family": "classification",
+            "task_type": "classification",
+            "n": 3589
+          },
+          {
+            "task_family": "fill_mask",
+            "task_type": "fill_mask",
+            "n": 2368
+          },
+          {
+            "task_family": "token_classification",
+            "task_type": "token_classification",
+            "n": 217
+          }
+        ],
+        "completed_source_counts": [
+          {
+            "model_ids": 11,
+            "dataset_names": 19
+          }
+        ],
+        "completed_provenance_counts": [
+          {
+            "generation_mode": "independent",
+            "family_contract_version": "raw_source_family_v4",
+            "n": 6174,
+            "family_ids": 64
+          }
+        ],
+        "completed_family_sizes": [
+          {
+            "members": 17,
+            "families": 1
+          },
+          {
+            "members": 20,
+            "families": 1
+          },
+          {
+            "members": 48,
+            "families": 1
+          },
+          {
+            "members": 94,
+            "families": 1
+          },
+          {
+            "members": 97,
+            "families": 1
+          },
+          {
+            "members": 98,
+            "families": 1
+          },
+          {
+            "members": 100,
+            "families": 58
+          }
+        ],
+        "completed_evidence_status": [
+          {
+            "metric_name": "evaluation_protocol_version",
+            "value": "benchmark_evaluation_v1",
+            "n": 6174
+          },
+          {
+            "metric_name": "explainability_evidence_sufficient",
+            "value": 0,
+            "n": 5553
+          },
+          {
+            "metric_name": "explainability_evidence_sufficient",
+            "value": 1,
+            "n": 621
+          },
+          {
+            "metric_name": "explainability_status",
+            "value": "complete",
+            "n": 621
+          },
+          {
+            "metric_name": "explainability_status",
+            "value": "insufficient_evidence",
+            "n": 227
+          },
+          {
+            "metric_name": "explainability_status",
+            "value": "unsupported",
+            "n": 5326
+          },
+          {
+            "metric_name": "trust_evidence_sufficient",
+            "value": 0,
+            "n": 6174
+          },
+          {
+            "metric_name": "trust_status",
+            "value": "unsupported",
+            "n": 6174
+          }
+        ]
+      },
+      "errors": {},
+      "tables": [
+        "cohort_clients",
+        "composition_validation_candidates",
+        "composition_validation_runs",
+        "fedavg_client_partitions",
+        "fedavg_client_rounds",
+        "fedavg_global_states",
+        "fedavg_round_metrics",
+        "fedavg_rounds",
+        "fedavg_runs",
+        "lineage_checkpoint_storage",
+        "model_lineages",
+        "parent_checkpoints",
+        "service_artifacts",
+        "service_checkpoint_storage",
+        "service_cohorts",
+        "service_execution_provenance",
+        "service_failures",
+        "service_generation_provenance",
+        "service_metrics",
+        "service_regenerations",
+        "service_split_provenance",
+        "services",
+        "sqlite_sequence"
+      ],
+      "service_id_status_sha256": "ef7742d8baf7e1852307f16dee975e4529d7d83e1cbbb75c7649e55293a9f46c",
+      "identity_digest_scope": "Ordered service IDs and statuses only; not a content hash of database rows or artifact files.",
+      "source_stat_changed_during_read": false,
+      "snapshot_scope": "Single read transaction within this database; databases are not synchronized with one another."
+    },
+    {
+      "database": "outputs_ml_lambda/outputs/validation.gpu1.db",
+      "captured_at_utc": "2026-09-21T12:40:34.863201+00:00",
+      "size_bytes_before": 13996355584,
+      "source_modified_at_utc_before": "2026-09-20T01:17:58+00:00",
+      "queries": {
+        "status_counts": [
+          {
+            "status": "completed",
+            "n": 5733
+          },
+          {
+            "status": "failed",
+            "n": 5614
+          }
+        ],
+        "completed_task_counts": [
+          {
+            "task_family": "classification",
+            "task_type": "classification",
+            "n": 3386
+          },
+          {
+            "task_family": "fill_mask",
+            "task_type": "fill_mask",
+            "n": 2132
+          },
+          {
+            "task_family": "token_classification",
+            "task_type": "token_classification",
+            "n": 215
+          }
+        ],
+        "completed_source_counts": [
+          {
+            "model_ids": 11,
+            "dataset_names": 20
+          }
+        ],
+        "completed_provenance_counts": [
+          {
+            "generation_mode": "independent",
+            "family_contract_version": "raw_source_family_v4",
+            "n": 5733,
+            "family_ids": 59
+          }
+        ],
+        "completed_family_sizes": [
+          {
+            "members": 15,
+            "families": 1
+          },
+          {
+            "members": 52,
+            "families": 1
+          },
+          {
+            "members": 80,
+            "families": 1
+          },
+          {
+            "members": 90,
+            "families": 1
+          },
+          {
+            "members": 96,
+            "families": 1
+          },
+          {
+            "members": 100,
+            "families": 54
+          }
+        ],
+        "completed_evidence_status": [
+          {
+            "metric_name": "evaluation_protocol_version",
+            "value": "benchmark_evaluation_v1",
+            "n": 5733
+          },
+          {
+            "metric_name": "explainability_evidence_sufficient",
+            "value": 0,
+            "n": 5071
+          },
+          {
+            "metric_name": "explainability_evidence_sufficient",
+            "value": 1,
+            "n": 662
+          },
+          {
+            "metric_name": "explainability_status",
+            "value": "complete",
+            "n": 662
+          },
+          {
+            "metric_name": "explainability_status",
+            "value": "insufficient_evidence",
+            "n": 118
+          },
+          {
+            "metric_name": "explainability_status",
+            "value": "unsupported",
+            "n": 4953
+          },
+          {
+            "metric_name": "trust_evidence_sufficient",
+            "value": 0,
+            "n": 5733
+          },
+          {
+            "metric_name": "trust_status",
+            "value": "unsupported",
+            "n": 5733
+          }
+        ]
+      },
+      "errors": {},
+      "tables": [
+        "cohort_clients",
+        "composition_validation_candidates",
+        "composition_validation_runs",
+        "fedavg_client_partitions",
+        "fedavg_client_rounds",
+        "fedavg_global_states",
+        "fedavg_round_metrics",
+        "fedavg_rounds",
+        "fedavg_runs",
+        "lineage_checkpoint_storage",
+        "model_lineages",
+        "parent_checkpoints",
+        "service_artifacts",
+        "service_checkpoint_storage",
+        "service_cohorts",
+        "service_execution_provenance",
+        "service_failures",
+        "service_generation_provenance",
+        "service_metrics",
+        "service_regenerations",
+        "service_split_provenance",
+        "services",
+        "sqlite_sequence"
+      ],
+      "service_id_status_sha256": "4973d9047fb4c6da8d9ba664c8b8e48a70253691123c2c62226a973c2c03c9da",
+      "identity_digest_scope": "Ordered service IDs and statuses only; not a content hash of database rows or artifact files.",
+      "source_stat_changed_during_read": false,
+      "snapshot_scope": "Single read transaction within this database; databases are not synchronized with one another."
+    }
+  ],
+  "shared_service_ids": [
+    {
+      "left": "outputs_ml_lambda/outputs/validation.db",
+      "right": "outputs_ml_lambda/outputs/validation.gpu0.db",
+      "shared_ids": 400,
+      "interpretation": "Identity overlap only; content equality and scientific independence have not been established."
+    },
+    {
+      "left": "outputs_ml_lambda/outputs/validation.db",
+      "right": "outputs_ml_lambda/outputs/validation.gpu1.db",
+      "shared_ids": 300,
+      "interpretation": "Identity overlap only; content equality and scientific independence have not been established."
+    },
+    {
+      "left": "outputs_ml_lambda/outputs/validation.gpu0.db",
+      "right": "outputs_ml_lambda/outputs/validation.gpu1.db",
+      "shared_ids": 700,
+      "interpretation": "Identity overlap only; content equality and scientific independence have not been established."
+    }
+  ],
+  "source_file_sha256": {
+    "docs/reference/A_Collaborative_AIaaS_Composition_Dataset_1.pdf": "dcda113ad45bc47f205b59659f97d2fd6eda7678f9fb937614420c5a3da5ec6e",
+    "mlaas_data_generator/storage/schema.sql": "8632a994abd5a093f72c6b75ad6bcdb2f9885871a9a0b6028bce7763833a554f",
+    "mlaas_composition/assets/objective.v3.json": "e00280ac580b46e23c835e5cf21d49498b4fdce199c5b0ab4720ba1b1e84f096",
+    "mlaas_composition/search.py": "ad145dd9175738848352207cc7920d90d582631c2d637aee53a3f58d98889bbd",
+    "docs/journal/audit_dataset.py": "0d591dd7b3a1b4037bc660f1f064af5365fed63ae18d0ef58a298f108b2b23e4"
+  },
+  "unexamined_archive": {
+    "path": "outputs_ml_lambda.tar.gz",
+    "size_bytes": 18402609152,
+    "status": "Only initial archive member names inspected separately; database contents not audited or included in counts."
+  }
+}

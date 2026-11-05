@@ -1,0 +1,249 @@
+% From the repository root:
+% tectonic --outdir output/pdf docs/artifact/mlaas_execution_guide.tex
+\documentclass[10pt,a4paper]{article}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[a4paper,margin=16mm,headheight=13pt,headsep=6mm,footskip=8mm]{geometry}
+\usepackage{microtype,booktabs,tabularx,array,enumitem}
+\usepackage{xcolor,listings,fancyhdr}
+\usepackage[hyphens,spaces,obeyspaces]{url}
+\usepackage[colorlinks=true,linkcolor=teal!50!black,urlcolor=teal!50!black]{hyperref}
+\hypersetup{pdftitle={MLaaS Installation, Execution and Configuration Guide},pdfauthor={MLaaS Project}}
+\definecolor{ink}{HTML}{203E50}
+\definecolor{codebg}{HTML}{F3F6F8}
+\definecolor{rulegray}{HTML}{CDD6DE}
+\lstdefinestyle{shell}{basicstyle=\ttfamily\fontsize{8.2}{9.6}\selectfont,backgroundcolor=\color{codebg},frame=single,rulecolor=\color{rulegray},framerule=.3pt,framesep=4pt,xleftmargin=4pt,xrightmargin=4pt,breaklines=true,breakatwhitespace=true,columns=fullflexible,keepspaces=true,showstringspaces=false,upquote=true,aboveskip=5pt,belowskip=5pt}
+\lstset{style=shell}
+\newcommand{\code}[1]{\nolinkurl{#1}}
+\pdfstringdefDisableCommands{\def\code#1{#1}}
+\newcommand{\lead}[1]{\par\smallskip\noindent\textbf{#1}\enspace}
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+\newenvironment{args}{\par\smallskip\begingroup\fontsize{8.4}{9.6}\selectfont\setlength{\tabcolsep}{3pt}\renewcommand{\arraystretch}{1.04}\tabularx{\linewidth}{@{}L{49mm}L{25mm}L{37mm}Y@{}}\toprule\textbf{Argument} & \textbf{Purpose} & \textbf{Values/defaults} & \textbf{Effect on execution}\\\midrule}{\\\bottomrule\endtabularx\endgroup\par\smallskip}
+\newenvironment{compacttable}[1]{\par\smallskip\begingroup\fontsize{9}{10}\selectfont\setlength{\tabcolsep}{4pt}\renewcommand{\arraystretch}{1.04}\tabularx{\linewidth}{@{}L{#1}Y@{}}\toprule}{\\\bottomrule\endtabularx\endgroup\par\smallskip}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{3pt}
+\setlist{nosep,leftmargin=1.3em}
+\makeatletter
+\renewcommand\section{\@startsection{section}{1}{0pt}{-1.8ex plus -.2ex}{.7ex}{\normalfont\large\bfseries\color{ink}}}
+\renewcommand\subsection{\@startsection{subsection}{2}{0pt}{-1.3ex plus -.2ex}{.5ex}{\normalfont\normalsize\bfseries\color{ink}}}
+\makeatother
+\pagestyle{fancy}\fancyhf{}
+\fancyhead[L]{\small\textsc{MLaaS user guide}}
+\fancyhead[R]{\small Installation, execution and configuration}
+\fancyfoot[C]{\small\thepage\ / 5}
+\renewcommand{\headrulewidth}{.3pt}
+\raggedbottom\emergencystretch=2em
+\begin{document}
+\fontsize{9.5}{10.8}\selectfont
+\begin{center}
+{\LARGE\bfseries\color{ink} MLaaS Execution Guide}\\[3pt]
+{\normalsize Installation, configuration and collaborative composition}\par
+{\small Repository guide \enspace$\cdot$\enspace 3 November 2026}
+\end{center}
+
+\textbf{Introduction.} MLaaS creates datasets of machine-learning services: independently trained clients, their configurations, measured quality-of-service (QoS) metrics and reconstruction evidence. You can analyse this catalogue, select compatible clients and evaluate a model formed by averaging their parameters. Generation does not perform federated aggregation rounds.
+
+\section{Quick Start}
+\textbf{Terminal: Windows PowerShell.} Run commands from the repository root. Backticks continue a command onto the next line; do not add spaces after them. Install \href{https://www.python.org/downloads/windows/}{Python 3.12} (including the \code{py} launcher) and Git first. The package declares Python \code{>=3.11}; 3.12 is the repository's setup baseline. Download and extract the repository ZIP, or clone it:
+\begin{lstlisting}
+git clone https://github.com/YGYerrd/MLaaS_Dataset_Gen.git
+cd MLaaS_Dataset_Gen
+py -3.12 -m venv .venv
+. .\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+python -m pip install -r requirements.txt
+python -m pip install --no-deps -e .
+\end{lstlisting}
+This installs a CPU environment. For NVIDIA or Linux ROCm, replace the PyTorch line with the matching command from the \href{https://pytorch.org/get-started/locally/}{official PyTorch installation selector} before installing requirements. Windows AMD users should use the alternative setup on page~5. Requirements alone do not select the right GPU wheels. Initial execution downloads model and dataset sources; retain network access and any required Hugging Face access credentials.
+
+\lead{1. Generate ten client configurations.} This creates a plan for one text-classification model/dataset contract. The seed fixes registry selection and recipe draws; this checkout selects RoBERTa and AG News.
+\begin{lstlisting}
+python -m mlaas_data_generator.cli.main hf-manifest `
+  --task-keys text_classification --training-regimes finetune_transfer `
+  --models-per-task 1 --datasets-per-model 1 --clients-per-family 10 `
+  --average-samples 128 --heterogeneity-intensity 0.5 `
+  --seed 42 --evaluation-seed 42 --metric-evaluation-profile benchmark `
+  --max-train-time-s 3600 --max-eval-time-s 600 --timeout-s 7200 `
+  --output outputs/clients.csv
+\end{lstlisting}
+This creates \code{outputs/clients.csv} and \code{outputs/clients.families.json}. Keep them together. Output directories are created automatically; no workspace variables or directory setup are needed.
+
+\lead{2. Train and evaluate the clients.} Execute the plan to produce the service dataset:
+\begin{lstlisting}
+python -m mlaas_data_generator.cli.main run-manifest `
+  --file outputs/clients.csv --db outputs/services.db
+\end{lstlisting}
+SQLite records completed services and measured evidence, with recipes and shared model/data artifacts referenced on disk. Runtime depends on hardware, downloads and evaluation work; budgets are limits, not a runtime estimate. Generation is now complete. Use the catalogue for analysis, or continue with composition on page~3.
+
+Defaults come from \code{mlaas_data_generator/config.py}; no environment variables are required. Optional \code{MLAAS_OUTDIR} changes the output root. \code{MLAAS_SQL_DB_PATH} (then \code{MLAAS_DB_PATH}) sets the database default; \code{--db} overrides it. Compact manifests freeze generation-time defaults.
+
+\section{Packages and execution workflow}
+\code{mlaas_data_generator} creates configurations, trains and evaluates clients, and saves metrics, recipes and provenance. \code{mlaas_composition} finds compatible services, generates requests, searches subsets, reconstructs models and evaluates aggregates. A \emph{family} shares an initial checkpoint, tensor structure, labels, preprocessing and evaluation contract.
+\begin{compacttable}{40mm}
+\textbf{Command, in order} & \textbf{Output and next use}\\\midrule
+\code{hf-manifest} $\rightarrow$ \code{run-manifest} & Required for a new dataset: manifest + companion $\rightarrow$ SQLite catalogue and service artifacts.\\
+\code{list-families} $\rightarrow$ \code{generate-requests} & Optional composition: eligible family IDs $\rightarrow$ frozen requests.\\
+\code{evaluate} $\rightarrow$ \code{validate-search} & Search selections $\rightarrow$ reconstructed aggregate measurements.\\
+\code{validate} / \code{client_reconstruction} & Optional: validate one selection / reconstruct one client separately.
+\end{compacttable}
+
+\clearpage
+\section{Dataset generation}
+\textbf{Choose scope first.} Task/model/dataset limits select compatible registry pairs; the console and companion identify them. There are no model-ID, dataset-ID or family-count flags. For one regime, approximate size is tasks $\times$ models $\times$ datasets $\times$ clients, reduced by compatibility filtering. Generic tasks use predefined pairs.
+
+Quantities span approximately 25--175\% of \code{--average-samples}, adjusted for capacity/task policies. The framework assigns IID, Dirichlet and shard distributions and samples optimizer, learning rate, batch size and epochs. Intensity controls distribution skew, not quantity spread. These generated settings are review CSV columns, not CLI flags. Edit supported columns before first execution or disable rows with \code{enabled}. Changed shared contracts need a new manifest; do not edit the hashed companion.
+
+\section{CLI arguments and configuration}
+Tables give current effective defaults. Options are optional unless marked \textbf{required}; page~1 overrides defaults. Append \code{--help} to any command for syntax.
+
+\subsection{\code{hf-manifest}: common options}
+\begin{args}
+\code{--task-keys} & Select tasks & Space/comma-separated keys; all if omitted & Restricts registry candidates; keys below.\\
+\code{--training-regimes} & Select HF execution & \code{finetune_transfer} (default), \code{inference_only} & Fine-tune pretrained weights, or evaluate an existing task model. Inference creates no trained client family.\\
+\code{--models-per-task}; \code{--datasets-per-model} & Control breadth & Integers; 10 and 1 & Up to these counts per eligible HF task/model. Values below 1 become 1.\\
+\code{--clients-per-family} & Service variants & Positive integer; 100 & Independent recipes per compatible contract.\\
+\code{--average-samples} & Training quantity & Positive integer; 768 with balanced profile & Quantity centre; alias \code{--avg-sample-size}. Not evaluation sample count.\\
+\code{--heterogeneity-intensity} & Distribution skew & Number in [0,1]; 0.5 & Higher strengthens non-IID skew; IID clients remain IID.\\
+\code{--seed}; \code{--initialization-seed}; \code{--evaluation-seed} & Reproduce choices & Integers; fresh recorded seed; inherits seed; 42 & Global drives selection/recipes; initialization fixes shared starting state; evaluation seed is independent (nonnegative).\\
+\code{--manifest-profile} & Quantity preset & \code{test}, \code{balanced} (default), \code{benchmark} & Averages 128, 768, 1600; explicit average overrides. Separate from metric profiles.\\
+\code{--metric-evaluation-profile} & Behavioural metrics & \code{benchmark} (default), \code{diagnostic}, \code{pilot}, \code{production} & Sets trust/explanation budgets (page~3). Task contracts select quality metrics.\\
+\code{--max-train-time-s}; \code{--max-eval-time-s} & Stage budgets & Positive integer seconds; 120 each & Training cutoff / primary evaluation limit where backend supports it. Behavioural budgets are separate.\\
+\code{--timeout-s} & Nominal service budget & Positive integer seconds; 1800 & Recorded in configuration; current runner has no whole-service watchdog.\\
+\code{--output}; \code{--sheet}; \code{--manifest-format} & Save the plan & \code{outputs/service_manifest.xlsx}; \code{services}; \code{review} & CSV/XLSX output. \code{expanded} is the alternative format; review needs its companion.
+\end{args}
+{\small\raggedright\textbf{Task keys.} \code{text_classification}, \code{token_classification}, \code{sentence_similarity}, \code{fill_mask}, \code{text_generation}, \code{text2text_generation}, \code{image_classification}, \code{object_detection}, \code{image_segmentation}, \code{image_captioning}, \code{text_image_retrieval}, \code{visual_question_answering}; generic: \code{keras_image_classification}, \code{sklearn_image_classification}, \code{tabular_regression}, \code{clustering}. For backend support: \code{python -m mlaas_data_generator.cli.main task-capabilities}.\par}
+
+\subsection{\code{hf-manifest}: advanced options}
+\begin{args}
+\code{--total-services}; \code{--max-models-per-family} & Cap output/diversify models & Integers; no caps & Nonnegative total caps rows (can truncate a family); positive model cap limits each architecture per task.\\
+\code{--dataset-variants-per-pair}; \code{--split-variants-per-pair}; \code{--knob-variants-per-pair} & Legacy variant grid & Integers; unset & Explicit grid replaces client sampling; unset dimensions become 1. Incompatible with \code{--clients-per-family}.\\
+\code{--regression-support-policy}; \code{--min-target-bin-fraction} & Regression coverage & \code{general} / \code{specialist}; 0.6 in [0.6,1] & General (default) covers outer target bins; specialist permits restricted support.\\
+\code{--exclude-failures-csv} & Exclude combinations & CSV path; none & Matches model type/ID, dataset and HF task; can reduce output.\\
+\code{--generation-mode}; \code{--input-json} & Mode / legacy input & Only \code{independent}; optional path & Independent is default. Input JSON is currently ignored by the builder; it does not select models.
+\end{args}
+
+\clearpage
+\subsection{\code{run-manifest}: execution and retention}
+\begin{args}
+\code{--file}; \code{--sheet}; \code{--db} & Inputs and catalogue & File \textbf{required}; \code{services}; configured DB & CSV/XLSX plus companion; DB defaults to \code{outputs/services.db}. Alias \code{--db-path}.\\
+\code{--workers} & GPU concurrency & Integer; 1 (minimum 1) & At most one worker per visible GPU. CPU stays serial; grouped mode needs multiple model groups to parallelize.\\
+\code{--weight-retention} & Weights or recipes & \code{recipe_only} for supported independent clients; otherwise \code{checkpoint} & Recipe-only saves no completed client weights; reconstruction replays training. Shared initial weights remain necessary.\\
+\code{--retain-validation-checkpoint} & Fidelity reference & Inherit config; false normally & Retains reference alongside recipe-only output. \code{--no-retain-validation-checkpoint} disables it.\\
+\code{--metric-evaluation-profile}; \code{--no-trust-explainability} & Evaluation override & Inherit manifest; disable flag off & Same four profiles; changes unfinished rows' metric budgets, not training/IDs. Disable flag removes both scores.\\
+\code{--log-mode}; \code{--dry-run} & Diagnose settings & \code{concise} (default) / \code{debug}; off & Debug adds detail; dry run resolves rows without training and writes reports. Alias \code{--dry_run}.\\
+\code{--rerun-existing}; \code{--no-grouped-hf} & Advanced execution & Both off & Deliberately rerun completed IDs / disable shared HF loading. Default skips completed services.\\
+\code{--no-save-weights}; \code{--smoke-test} & Diagnostic runs & Both off & Separate diagnostic IDs; suppress checkpoints / behavioural metrics and update signatures. Not for the main catalogue.
+\end{args}
+\textbf{Metric budgets.} Benchmark uses 32 trust inputs and 16 explanation inputs, with 600\,s and 1800\,s limits. Diagnostic uses 8/4 inputs and 30/30\,s; pilot and production both use 512/128 and 3600/7200\,s. Completion, coverage and uncertainty gates determine sufficiency. Primary quality metrics (e.g. accuracy), sample caps and lower-level settings come from task/configuration contracts; there is no general \code{--metrics} flag. Time-limited incomplete training may be ineligible for recipe-only replay.
+
+\section{Collaborative composition and evaluation}
+This workflow is optional. Use the same catalogue and unchanged source artifacts throughout. A matching task name alone does not establish compatibility.
+
+\lead{3. Find a completed family.} The terminal prints \code{family_id}, eligible counts and exclusion reasons; the CSV includes service IDs. Choose at least four eligible services to support the profile's possible subset sizes of 2--4.
+\begin{lstlisting}
+python -m mlaas_composition list-families `
+  --db outputs/services.db --output outputs/family_services.csv
+\end{lstlisting}
+Replace \code{FAMILY_ID} below with that printed ID (not the manifest's \code{family_ref}).
+
+\lead{4. Freeze a request.} Save a request with family membership, subset size, QoS requirements and preferences. Keep it unchanged once search starts.
+\begin{lstlisting}
+python -m mlaas_composition generate-requests `
+  --db outputs/services.db --family-id "FAMILY_ID" `
+  --profile recipe_composition_v6 --compatibility-mode strict `
+  --requests 1 --seed 42 --output outputs/requests.json
+\end{lstlisting}
+
+\lead{5. Search compatible subsets.} All four methods (\code{mab}, \code{ga}, \code{greedy}, \code{random_search}) run automatically. They score catalogue evidence without retraining, using the same evaluator-call budget per method.
+\begin{lstlisting}
+python -m mlaas_composition evaluate `
+  --db outputs/services.db --requests-file outputs/requests.json `
+  --output-dir outputs/search --search-budget 100 --seed 42
+\end{lstlisting}
+This writes \code{search_results.csv}, candidate/reference tables and a run manifest in \code{outputs/search}. Next, measure the saved selections:
+
+\lead{6. Reconstruct and evaluate selections.} Raw families supply the audit reservation. Replay retrains clients sequentially without the original training cutoff; parameter averaging weights them by realized training counts. The resulting model is measured on reserved audit examples, separately from catalogue scoring. Results are explained on page~4.
+\begin{lstlisting}
+python -m mlaas_composition validate-search `
+  --db outputs/services.db --requests-file outputs/requests.json `
+  --evaluation-dir outputs/search --output-dir outputs/validation `
+  --device auto --min-audit-samples 64
+\end{lstlisting}
+
+\clearpage
+\subsection{Composition CLI reference}
+All composition commands require \code{--db}. Options apply to the named command(s).
+\begin{args}
+\code{list-families}: \code{--db}; \code{--output} & Identify families & DB \textbf{required}; CSV path optional & Prints counts/reasons; optional service inventory CSV.\\
+\code{generate-requests}: \code{--output}; \code{--requests}; \code{--seed} & Save/repeat requests & CSV/JSON \textbf{required}; positive count 25; integer 42 & More requests sample more scenarios from the same catalogue.\\
+\code{--family-id}; \code{--compatibility-mode} & Eligible pool & No family filter; \code{functional} (default) / \code{strict} & Use explicit family and strict mode for recipe composition.\\
+\code{--profile}; \code{--principle} & Request policy & \code{controlled_collaborative_v3}; \code{feasible_reference_bounds_v1} & Use \code{recipe_composition_v6} here. Profile defines subset sizes; principle derives bounds from feasible groups.\\
+\code{--overwrite} & Replace requests & Flag; off & Permits replacing an existing file. Use a new file for a new experiment.\\
+\code{evaluate}: \code{--requests-file}; \code{--output-dir} & Search input/results & Both \textbf{required} & Reads frozen CSV/JSON; creates result directory. Use a fresh path per experiment.\\
+\code{--search-budget}; \code{--seed} & Search effort/repeatability & Positive integer 100; integer 42 & Evaluator calls per method, not seconds or epochs; all four methods run.\\
+\code{--candidates-per-request}; \code{--reference-max-candidates} & Baseline candidates & Integers; 10 and 10000 & Samples groups; exhaustive surrogate reference only if space fits cap. Not audit-optimality evidence.\\
+\code{generate-requests}/\code{evaluate}: \code{--include-legacy-fedavg-partitions} & Historical support & Flag; off & Includes legacy sequential-depletion observations; unnecessary here.\\
+\code{validate-search}/\code{validate}: \code{--requests-file}; \code{--evaluation-dir}; \code{--output-dir} & Frozen inputs/results & All \textbf{required} & Exact requests and saved search directory; creates validation output.\\
+\code{--device} & Replay/evaluation hardware & \code{cpu} (default), \code{cuda}, \code{auto} & Auto selects available GPU or CPU; ROCm also uses \code{cuda}. No validation worker flag.\\
+\code{--audit-samples}; \code{--audit-seed}; \code{--min-audit-samples} & Audit size/evidence floor & Integers; 512, 42, 64 & Size/seed apply when constructing plans; cannot change raw-family reservation. Minimum is enforced.\\
+\code{--cohort-file}; \code{--request-id} & Scope/reservation & No override; ID optional in batch, \textbf{required} in \code{validate} & Raw families infer reservation. Checkpoint cohorts need saved cohort document. Batch defaults to all requests.\\
+\code{validate}: \code{--selection-source}; \code{--search-method}; \code{--candidate-id} & Pick saved selection & \code{evaluator} (default) / \code{search}; IDs unset & Search requires a saved method. Evaluator uses \code{compositions.csv}; candidate ID optional. Candidate ID cannot accompany search selection.
+\end{args}
+\textbf{Customize requests before search.} In a separate JSON, \code{functional_requirements} defines the task, \code{hard_constraints} filters members, \code{qos_requirements} sets aggregate targets, and \code{preference_weights}/\code{constraint_penalties} sets trade-offs. Preserve compatibility fields and membership hashes. The loader validates requests; behavioural requirements need sufficient evidence in every member. These are fields, not flags. Other versioned profile IDs live in \code{mlaas_composition/assets/request_profiles*.json}; the table names the sole principle.
+
+\section{Understanding the results}
+Paths below are relative to \code{outputs/}. Completed database records form the measured service dataset.
+\begin{compacttable}{65mm}
+\textbf{Artifact} & \textbf{Contents and use}\\\midrule
+\code{clients.csv}, \code{clients.families.json} & Recipes and shared settings; both needed for compact-manifest execution/resume. Optional \code{clients.preflight.json}: exclusions.\\
+\code{services.db} & \code{services}: model/task/configuration/status; \code{service_metrics}: quality, QoS, timings/resources with units; provenance: sources, splits, effective execution.\\
+\code{service_artifacts/}, \code{update_signatures/} & Families, initial states, recipes, provenance, update summaries. Keep pinned model/data sources; SQLite alone is insufficient.\\
+\code{service_manifest_results.csv}, \code{service_manifest_failed.csv}, \code{service_failures.log} & Attempt outcomes, retry rows, errors. Stored under the output root, independent of \code{--db}; archive between experiments.\\
+\code{search/} & CSV snapshots: services, requests, compositions, references, search\_results. \code{run_manifest.json} and \code{evidence_hashes.json}: frozen inputs/evidence.\\
+\code{validation/} & \code{validation_comparison.csv}: measured results/errors; \code{algorithm_summary.csv}, \code{validation_summary.json}: summaries; per-selection metrics and \code{aggregation_provenance.json}.
+\end{compacttable}
+\textbf{Research use.} Rank services, analyse QoS by configuration (\code{sql/flatten_services.sql}), or compare compositions. Missing metrics are not zero. Predicted quality is a sample-weighted heuristic; errors are \emph{measured minus predicted}. Measured utility updates quality/latency; other dimensions retain catalogue evidence. Report failures; separate replay/aggregation costs from inference latency. Aggregates may lose quality; replay does not prove fidelity.
+
+\clearpage
+\section{Advanced usage}
+\lead{Reuse and resume.} Start at \code{list-families} with an existing DB; restore family artifacts, shared initial checkpoints, recipes and source dependencies. To retry an interrupted/failed run, repeat the Quick Start's \code{run-manifest}: completed IDs skip. Changed model/data contracts need a new manifest and experiment directory. Retain weights with \code{--weight-retention checkpoint}, or add \code{--retain-validation-checkpoint} for fidelity comparison; neither retroactively saves weights for skipped services.
+
+\lead{Devices and multiple GPUs.} Generation defaults to \code{device=auto}; neither generator command exposes \code{--device}. To choose explicitly, generate with \code{--manifest-format expanded}, edit the \code{device} column (\code{cpu}, \code{cuda}, \code{auto}) before execution, and use a separate experiment. The compact companion is immutable. Add \code{--workers 2} for two visible GPUs; one model group stays serial with default grouped loading. Multi-GPU runs can create \code{services.gpu0.db}, \code{services.gpu1.db}, etc. Preserve all shards; composition reads only the supplied DB. Use a complete family in one shard or a verified consolidated catalogue.
+
+\lead{Windows AMD/ROCm alternative.} Check GPU/driver support in \href{https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/compatibility/compatibilityrad/windows/windows_compatibility.html}{AMD's compatibility matrix}. The helper installs pinned Python 3.12 / ROCm 7.2 / PyTorch 2.9.1; it does not support every AMD GPU. In a fresh checkout, replace page~1's environment/dependency steps with:
+\begin{lstlisting}
+powershell -ExecutionPolicy Bypass -File .\scripts\setup_windows_rocm_venv.ps1
+. .\scripts\Activate-ROCm-Venv.ps1
+python -m pip install --no-deps -e .
+\end{lstlisting}
+Activate with the helper in every terminal; it sets the ROCm environment before imports. Optional \code{-SkipTensorFlow} omits TensorFlow/Keras for HF-only work. On Linux, use \code{python3.12 -m venv .venv} and \code{source .venv/bin/activate} in Bash, then matching PyTorch wheels and pip commands. Join the guide's continued Python commands into single lines for Bash.
+
+\lead{7. Validate one selection.} Copy \code{request_id} from \code{outputs/requests.json} or \code{outputs/search/search_results.csv} into \code{REQUEST_ID}. This writes measurements and provenance for the saved greedy selection without repeating search:
+\begin{lstlisting}
+python -m mlaas_composition validate `
+  --db outputs/services.db --requests-file outputs/requests.json `
+  --evaluation-dir outputs/search --request-id "REQUEST_ID" `
+  --selection-source search --search-method greedy `
+  --output-dir outputs/greedy_validation --device auto
+\end{lstlisting}
+
+\lead{Optional: reconstruct a client.} Copy \code{service_id} from \code{outputs/family_services.csv} (or SQLite) into \code{SERVICE_ID}. This replays training and exports a model plus a materialization report for inference/analysis:
+\begin{lstlisting}
+python -m mlaas_data_generator.client_reconstruction `
+  --db outputs/services.db --service-id "SERVICE_ID" `
+  --output-dir outputs/materialized --device auto --materialize-only
+\end{lstlisting}
+\begin{args}
+\code{--db}; \code{--service-id}; \code{--output-dir} & Locate/export client & All \textbf{required} & Catalogue, recorded ID and destination directory.\\
+\code{--device}; \code{--materialize-only} & Hardware / operation & \code{cpu} default (also \code{cuda}, \code{auto}); flag off & Flag exports model/report. Omit for fidelity comparison, which needs a retained reference; replay alone is not fidelity evidence.
+\end{args}
+
+\lead{Shared-parent generation.} Train parents selected from historical recipes, then independent clients from completed parents: \code{select-parent-configs} $\rightarrow$ \code{train-parents} $\rightarrow$ \code{cohort-manifest} $\rightarrow$ \code{run-manifest}. Use a separate DB and checkpoint retention. Parent \code{reservation_ref} supplies the validation cohort file. Commands/settings: \href{../../docs/shared_parent_generation.md}{\code{docs/shared_parent_generation.md}}.
+
+\section{Troubleshooting and reproducibility}
+\textbf{Imports/activation:} activate the installed environment; if PowerShell blocks activation, replace \code{python} with \code{.venv/Scripts/python.exe}. \textbf{Downloads:} restore access, credentials or pinned caches. \textbf{Missing companion:} restore the matching file. \textbf{Memory/time limits:} reduce concurrency or choose a smaller/new experiment; replay may need complete training. \textbf{No eligible family:} read exclusions and execution reports. \textbf{Validation failures:} read the saved reason; restore frozen inputs/reservations. Raising \code{--audit-samples} cannot enlarge a reservation.
+
+\textbf{Advanced Verification and Reproducibility.} Preserve source revision/local changes, dependencies, hardware, seeds, manifests, catalogue/shards, source revisions, family/recipe artifacts, requests and results. Keep audit outcomes separate from search; do not retune the same evaluation requests on them. Retain \code{mechanical_validation_only} labels when historical/pretraining exposure is unknown. Seeds/hashes do not guarantee bitwise replay across hardware. Detailed protocols: \href{../../docs/client-reconstruction.md}{client reconstruction}, \href{../../docs/recipe-composition.md}{recipe composition}, \href{../../docs/metric-evaluation-protocol.md}{metric evaluation} and \href{../../docs/usage.md}{full usage}. Interfaces were checked against local parsers/configuration; the Quick Start generated ten rows and passed dry-run validation. Training, reconstruction and audit experiments were not executed for this guide.
+\end{document}
