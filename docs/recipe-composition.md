@@ -201,9 +201,11 @@ the usual runtime environment separately. A verified preparation roster does
 not establish that local replay will succeed; use dry-run before a long batch.
 
 Historical Hugging Face architecture hashes include the original snapshot cache
-path. During member replay and global evaluation, the verified recipe's recorded
-model source is used for that identity field while the pinned model loads from
-the local cache. The complete original architecture hash must still match; model
+path. During member replay and global evaluation, the source path in the service's
+identity provenance is used after verifying its full hash against the frozen family.
+Older records without that path fall back to the verified recipe's model source.
+This handles image recipes that recorded only a repository ID. The pinned model
+still loads from the local cache. The complete original architecture hash must still match; model
 settings, tensor schemas and data checks remain enforced. Family mismatch errors
 name the differing fields, such as `architecture_id` or `evaluation_data_hash`.
 

@@ -1,5 +1,6 @@
 from copy import deepcopy
 from types import SimpleNamespace
+import json
 import sqlite3
 
 import pytest
@@ -61,12 +62,16 @@ def test_relocated_family_still_rejects_architecture_drift(relocated_family, cha
 
 
 @pytest.mark.parametrize("consumer", ["member_replay", "aggregate_evaluation"])
-def test_recipe_source_reaches_member_and_aggregate_preparation(relocated_family, monkeypatch, consumer):
+@pytest.mark.parametrize("source", ["recipe", "provenance"])
+def test_recipe_source_reaches_member_and_aggregate_preparation(relocated_family, monkeypatch, consumer, source):
     cfg, model, _, doc = relocated_family
+    identity = model_identity(model, {**cfg, "_recorded_model_source": ORIGINAL_SOURCE})
+    provenance = json.dumps({"identity": identity} if source == "provenance" else {})
     family = {**cfg["_family_reference"], "family_id": doc["family_id"],
               "initial_state_hash": doc["initial_state_hash"]}
     recipe = {"family": family, "training": {"observations": {
-        "hf_model_id": ORIGINAL_SOURCE, "train_stopping_reason": "epochs_completed", "optimizer_step_count": 1}},
+        "hf_model_id": cfg["hf_model_id"] if source == "provenance" else ORIGINAL_SOURCE,
+        "train_stopping_reason": "epochs_completed", "optimizer_step_count": 1}},
         "selection": {"ordered_source_row_ids": ["train:0", "train:1"]},
         "fingerprints": {"source": sha256_json(doc["raw_source"])}}
     original_prepare = preparation.prepare
@@ -85,10 +90,28 @@ def test_recipe_source_reaches_member_and_aggregate_preparation(relocated_family
             with sqlite3.connect(cfg["db_path"]) as conn:
                 conn.execute("CREATE TABLE services(service_id, status)")
                 conn.execute("INSERT INTO services VALUES (?, 'completed')", (cfg["service_id"],))
+                conn.execute("CREATE TABLE service_generation_provenance(service_id, provenance_json)")
+                conn.execute("INSERT INTO service_generation_provenance VALUES (?, ?)", (cfg["service_id"], provenance))
             monkeypatch.setattr(replay, "read_recipe", lambda *a: recipe)
             with replay.materialize_service(cfg["db_path"], cfg["service_id"]):
                 pytest.fail("should stop before training")
         else:
             from mlaas_composition.regeneration import execute_raw_family_state
-            member = {"parent_document": doc, "recipe": recipe, "service_id": cfg["service_id"]}
+            member = {"parent_document": doc, "recipe": recipe, "service_id": cfg["service_id"],
+                      "provenance_json": provenance}
             execute_raw_family_state(member, "aggregate", None, None)
+
+
+@pytest.mark.parametrize("change", ["source", "architecture_id", "other_family"])
+def test_recorded_model_source_rejects_unbound_identity(relocated_family, change):
+    cfg, model, _, doc = relocated_family
+    identity = model_identity(model, {**cfg, "_recorded_model_source": ORIGINAL_SOURCE})
+    if change == "source":
+        identity["model_config"]["_name_or_path"] = "wrong/path"
+    elif change == "architecture_id":
+        identity["architecture_id"] = "wrong"
+    else:
+        identity["model_config"]["hidden_size"] = 1024
+        identity["architecture_id"] = sha256_json({k: v for k, v in identity.items() if k != "architecture_id"})
+    with pytest.raises(ValueError, match="recorded model identity differs from frozen family"):
+        replay.recorded_model_source(doc, {}, json.dumps({"identity": identity}))

@@ -204,9 +204,28 @@ def read_recipe(db, service_id):
     return recipe
 
 
+def recorded_model_source(doc, recipe, provenance_json=None):
+    """Recover the original HF path from identity bound to the frozen family.
+
+    Image recipes can record a repository ID rather than the snapshot path
+    included in the architecture hash. Service provenance retains that path.
+    Only this location field is reused; the loaded model is still verified.
+    """
+    provenance = json.loads(provenance_json) if isinstance(provenance_json, str) else (provenance_json or {})
+    identity = provenance.get("identity") or {}
+    source = identity.get("model_config", {}).get("_name_or_path")
+    if isinstance(source, str) and source:
+        expected = doc["compatibility"]["architecture_id"]
+        if (identity.get("architecture_id") != expected
+                or sha256_json({k: v for k, v in identity.items() if k != "architecture_id"}) != expected):
+            raise ValueError("recorded model identity differs from frozen family")
+        return source
+    return recipe["training"]["observations"].get("hf_model_id")
+
+
 @contextmanager
 def materialize_service(db, service_id, *, device="cpu", capture_client_losses=False):
-    """Yield a representative trained model using only family + recipe.
+    """Yield a trained representative from family, recipe and identity provenance.
 
     No client checkpoint is read or written. The caller owns the yielded model;
     prepared dataset resources are closed on leaving the context. Interrupted
@@ -223,7 +242,9 @@ def materialize_service(db, service_id, *, device="cpu", capture_client_losses=F
     from .checkpoint_store import restore_model_tensor_state
     from .services.runner import ServiceRunner, prepare_model_for_local_update
     with sqlite3.connect(Path(db).resolve().as_uri() + "?mode=ro", uri=True) as conn:
-        status = conn.execute("SELECT status FROM services WHERE service_id=?", (service_id,)).fetchone()
+        status = conn.execute("""SELECT s.status, g.provenance_json FROM services s
+            LEFT JOIN service_generation_provenance g USING(service_id)
+            WHERE s.service_id=?""", (service_id,)).fetchone()
     if status is None or status[0] != "completed":
         raise ValueError("materialisation requires a completed service")
     recipe = read_recipe(db, service_id)
@@ -239,7 +260,7 @@ def materialize_service(db, service_id, *, device="cpu", capture_client_losses=F
         raise ValueError("recipe source disagrees with family")
     config = {**doc["config"], "service_id": service_id, "db_path": str(db), "device": device,
         "provenance_artifact_dir": doc["store_root"], "_family_reference": family,
-        "_recorded_model_source": recipe["training"]["observations"].get("hf_model_id"),
+        "_recorded_model_source": recorded_model_source(doc, recipe, status[1]),
         "_recorded_source_ids": recipe["selection"]["ordered_source_row_ids"]}
     with training_row_selection([config]) as selection:
         _, _, cfg, prepared, initial, _ = preparation.prepare(config, allow_legacy_evaluation=True)

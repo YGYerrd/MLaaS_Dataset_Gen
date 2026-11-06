@@ -184,12 +184,13 @@ def _execute_independent_family_state(evidence, runtime_id, plan, state):
 def execute_raw_family_state(member, runtime_id, plan, state, *, device="cpu"):
     """Build the frozen raw-source interface without training another provider."""
     from mlaas_data_generator.cli.manifest.preparation import prepare
+    from mlaas_data_generator.client_reconstruction import recorded_model_source
     from mlaas_data_generator.checkpoint_store import restore_model_tensor_state
     from mlaas_data_generator.data.image_store import close_image_stores
     doc, recipe = member["parent_document"], member["recipe"]
     config = {**doc["config"], "service_id": member["service_id"], "device": device,
               "provenance_artifact_dir": doc["store_root"], "_family_reference": recipe["family"],
-              "_recorded_model_source": recipe["training"]["observations"].get("hf_model_id"),
+              "_recorded_model_source": recorded_model_source(doc, recipe, member.get("provenance_json")),
               "_recorded_source_ids": recipe["selection"]["ordered_source_row_ids"]}
     _, _, cfg, prepared, _, _ = prepare(config, allow_legacy_evaluation=True)
     train, test, meta, task, model, _, test_ids = prepared
