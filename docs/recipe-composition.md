@@ -78,6 +78,11 @@ read-only. Generation performs no training, scoring, artifact replay, or
 aggregation. This selection manifest does not certify aggregation success and
 is not an input to the existing `evaluate` or `validate` commands.
 
+For sequential local federated rounds, use `generate-manifest --rounds N
+--timing-db outputs/compositions.db`. This restricts compositions to sizes 2, 3
+and 5 and adds a frozen availability schedule and deadline baseline. See
+[local round experiments](composition-rounds.md) for execution and export commands.
+
 ## Execute a composition manifest
 
 Run the generated CSV directly with one complete composition per GPU worker:

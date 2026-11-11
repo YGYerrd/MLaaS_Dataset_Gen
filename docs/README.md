@@ -10,6 +10,8 @@ Start with the [project README](../README.md) for the main workflow and key file
 | [Generation policies](generation-policies.md) | Client recipes, training policies and reproducibility |
 | [Client reconstruction](client-reconstruction.md) | Raw-source durable families, authoritative recipes and checkpoint comparison |
 | [Recipe-backed composition](recipe-composition.md) | Composition manifest batches, GPU replay, separate result storage, schema v6 search and audit validation |
+| [Local round experiments](composition-rounds.md) | Configurable rounds, sizes up to 5, availability schedules, evidence-based deadlines and per-round measurements |
+| [FLaaS flat export](flaas-export.md) | Completed composition/client CSV export, attribute contract, calculations and missing-value reasons |
 | [Shared-parent generation](shared_parent_generation.md) | Optional parent selection, training and cohort workflow |
 | [Checkpoint formats](checkpoint_formats.md) | INT8, FP16 and exact storage settings |
 | [Checkpoint storage](checkpoint_storage.md) | Integrity, reconstruction, migration and storage contracts |

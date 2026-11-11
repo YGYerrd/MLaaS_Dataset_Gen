@@ -224,7 +224,7 @@ def recorded_model_source(doc, recipe, provenance_json=None):
 
 
 @contextmanager
-def materialize_service(db, service_id, *, device="cpu", capture_client_losses=False):
+def materialize_service(db, service_id, *, device="cpu", capture_client_losses=False, initial_state=None):
     """Yield a trained representative from family, recipe and identity provenance.
 
     No client checkpoint is read or written. The caller owns the yielded model;
@@ -233,6 +233,9 @@ def materialize_service(db, service_id, *, device="cpu", capture_client_losses=F
     Original and reconstructed runs may skip different updates within the 20% limit.
     Optional client losses evaluate the initial and final models on the exact
     selected training rows, without using the catalogue/audit partition.
+    ``initial_state`` continues a local federated round from the preceding
+    global model. The original family and data recipe are still verified, and
+    the supplied state must have exactly the family's tensor schema.
     """
     from .cli.manifest import preparation
     from .data.tokenization_selection import training_row_selection
@@ -280,6 +283,10 @@ def materialize_service(db, service_id, *, device="cpu", capture_client_losses=F
                      "_family_document": doc, "max_train_time_s": None}
         service = ServiceRunner(effective)
         # Optimizer, scheduler and RNG are reset exactly as in the generator.
+        if initial_state is not None:
+            if [e.descriptor() for e in initial_state.entries] != [e.descriptor() for e in initial.entries]:
+                raise ValueError("round initial state differs from the family tensor schema")
+            initial = initial_state
         restore_model_tensor_state(model, initial, verify=True)
         if capture_client_losses:
             from .client_losses import measure_client_losses, client_loss_evidence

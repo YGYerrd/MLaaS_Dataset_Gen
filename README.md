@@ -43,6 +43,21 @@ references and global results separately. See the
 [batch executor guide](docs/recipe-composition.md#execute-a-composition-manifest)
 for dry-run, resume, CPU execution and source artifact requirements.
 
+For local multi-round experiments, add `--rounds N --timing-db outputs/compositions.db`
+to `generate-manifest`. This limits compositions to sizes 2, 3 and 5 and derives
+tight/moderate/relaxed deadlines from completed runs. Use `export-rounds` for the
+per-client availability, measured round duration and global accuracy history.
+See the [round experiment guide](docs/composition-rounds.md) for complete commands.
+
+Export completed composition members to one Excel-compatible CSV:
+
+```powershell
+python -m mlaas_composition export-flaas --db outputs/compositions.db --source-db outputs/pooled/services.db --output outputs/flaas_flat.csv
+```
+
+See the [FLaaS export contract](docs/flaas-export.md) for column definitions,
+calculated values, missing-data reasons and interpretation limits.
+
 ## Key files
 
 | File or folder | Purpose |

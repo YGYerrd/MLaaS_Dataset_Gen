@@ -38,6 +38,12 @@ def build_parser() -> argparse.ArgumentParser:
     manifest.add_argument("--seed", type=int, default=42, help="Composition sampling seed")
     manifest.add_argument("--output", required=True, help="Output .csv; a companion .metadata.json is also written")
     manifest.add_argument("--overwrite", action="store_true", help="Explicitly replace existing manifest output files")
+    manifest.add_argument("--rounds", type=_positive_count, help="Local federated rounds; limits composition sizes to 2, 3 and 5")
+    manifest.add_argument("--timing-db", help="Completed composition results used to estimate local round deadlines")
+    manifest.add_argument("--deadline-profile", choices=("tight", "moderate", "relaxed"), default="moderate")
+    manifest.add_argument("--availability-probability", type=float, default=1.0,
+                          help="Seeded per-client availability probability per round (default: all available)")
+    manifest.add_argument("--family-id", action="append", help="Restrict sampling to this family; repeat for multiple families")
     manifest.set_defaults(handler=_generate_manifest)
 
     run = subparsers.add_parser("run-manifest", help="Retrain and measure every composition, one job per GPU")
@@ -49,6 +55,20 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--dry-run", action="store_true", help="Verify metadata without training or writing results")
     run.add_argument("--path-map", help="Artifact relocation JSON; defaults to path_map.json beside --source-db")
     run.set_defaults(handler=_run_manifest)
+
+    export = subparsers.add_parser("export-flaas", help="Export completed composition members as a flat FLaaS CSV")
+    export.add_argument("--db", required=True, help="Read-only composition results database")
+    export.add_argument("--source-db", required=True, help="Read-only source service catalogue")
+    export.add_argument("--output", required=True, help="Excel-compatible UTF-8 CSV destination")
+    export.add_argument("--path-map", help="Artifact relocation JSON; defaults to path_map.json beside --source-db")
+    export.add_argument("--overwrite", action="store_true", help="Replace an existing export after validation")
+    export.set_defaults(handler=_export_flaas)
+
+    round_export = subparsers.add_parser("export-rounds", help="Export measured local rounds, one row per client and round")
+    round_export.add_argument("--db", required=True, help="Composition results database containing round executions")
+    round_export.add_argument("--output", required=True, help="Output CSV")
+    round_export.add_argument("--overwrite", action="store_true")
+    round_export.set_defaults(handler=_export_rounds)
 
     generate = subparsers.add_parser("generate-requests", help="Generate and save versioned synthetic requests")
     generate.add_argument("--db", required=True, help="SQLite database produced by mlaas_data_generator")
@@ -150,6 +170,13 @@ def _run_manifest(args: argparse.Namespace, *, argv: Sequence[str]) -> None:
         raise SystemExit(1)
 
 
+def _export_flaas(args: argparse.Namespace, *, argv: Sequence[str]) -> None:
+    from .flaas_export import export_flaas
+    summary = export_flaas(args.db, args.source_db, args.output,
+                          overwrite=args.overwrite, path_map=args.path_map)
+    print(json.dumps(summary, indent=2, sort_keys=True))
+
+
 def _positive_count(value: str) -> int:
     try:
         count = int(value)
@@ -160,10 +187,17 @@ def _positive_count(value: str) -> int:
     return count
 
 
+def _export_rounds(args: argparse.Namespace, *, argv: Sequence[str]) -> None:
+    from .round_execution import export_rounds
+    print(json.dumps(export_rounds(args.db, args.output, overwrite=args.overwrite), indent=2))
+
+
 def _generate_manifest(args: argparse.Namespace, *, argv: Sequence[str]) -> None:
     metadata = generate_composition_manifest(
         args.prepared_dir, args.output, compositions=args.compositions,
         seed=args.seed, overwrite=args.overwrite,
+        rounds=args.rounds, timing_db=args.timing_db, deadline_profile=args.deadline_profile,
+        availability_probability=args.availability_probability, family_ids=args.family_id,
     )
     print(f"Wrote {metadata['actual_count']} compositions (requested approximately {metadata['requested_count']}; "
           f"quota {metadata['per_pair_quota']} per eligible pool/size pair) to {args.output}")

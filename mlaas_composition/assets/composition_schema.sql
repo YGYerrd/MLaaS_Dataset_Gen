@@ -68,3 +68,15 @@ CREATE TABLE IF NOT EXISTS composition_metrics (
 );
 CREATE INDEX IF NOT EXISTS idx_composition_status ON compositions(run_id, status);
 CREATE INDEX IF NOT EXISTS idx_composition_member_service ON composition_members(run_id, service_id);
+
+CREATE TABLE IF NOT EXISTS composition_rounds (
+  run_id TEXT NOT NULL,
+  combination_id TEXT NOT NULL,
+  communication_round INTEGER NOT NULL CHECK (communication_round >= 1),
+  round_deadline_s REAL NOT NULL CHECK (round_deadline_s > 0),
+  round_completion_time_s REAL NOT NULL CHECK (round_completion_time_s >= 0),
+  global_accuracy_per_round REAL NOT NULL CHECK (global_accuracy_per_round BETWEEN 0 AND 1),
+  result_json TEXT NOT NULL,
+  PRIMARY KEY (run_id, combination_id, communication_round),
+  FOREIGN KEY (run_id, combination_id) REFERENCES compositions(run_id, combination_id)
+);

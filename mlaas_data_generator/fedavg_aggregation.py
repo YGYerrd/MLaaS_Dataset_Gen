@@ -67,11 +67,15 @@ def aggregate_fedavg_states(
     *,
     compatibility_contract_hash: str,
     non_aggregatable_indices: Iterable[int] = (),
+    minimum_contributors: int = 2,
 ) -> FedAvgAggregationResult:
     """Aggregate exact client states as weighted deltas from one parent state."""
     ordered = sorted(list(contributors), key=lambda item: item.client_id)
-    if len(ordered) < 2:
-        raise FedAvgAggregationError("FedAvg requires at least two successful contributors")
+    if type(minimum_contributors) is not int or minimum_contributors not in (1, 2):
+        raise FedAvgAggregationError("minimum_contributors must be 1 or 2")
+    if len(ordered) < minimum_contributors:
+        count = "two" if minimum_contributors == 2 else "one"
+        raise FedAvgAggregationError(f"FedAvg requires at least {count} successful contributors")
     if len({item.client_id for item in ordered}) != len(ordered):
         raise FedAvgAggregationError("FedAvg contributors contain duplicate client IDs")
     if len({item.service_id for item in ordered}) != len(ordered):

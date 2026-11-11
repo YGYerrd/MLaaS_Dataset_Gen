@@ -23,7 +23,8 @@ class CompositionWriter(SQLiteWriter):
         self.conn = sqlite3.connect(self.db_path)
         try:
             tables = {r[0] for r in self.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-            expected = {"composition_runs", "source_services", "compositions", "composition_members", "composition_metrics"}
+            expected = {"composition_runs", "source_services", "compositions", "composition_members", "composition_metrics",
+                        "composition_rounds"}
             if tables - expected:
                 raise ValueError("Destination is not a composition results database")
             version = self.conn.execute("PRAGMA user_version").fetchone()[0]
@@ -82,10 +83,15 @@ class CompositionWriter(SQLiteWriter):
                 failure_stage=NULL, failure_service_id=NULL, error_message=NULL WHERE run_id=? AND combination_id=?""",
                 (worker, now(), run_id, cid))
             self.conn.execute("DELETE FROM composition_metrics WHERE run_id=? AND combination_id=?", (run_id, cid))
+            self.conn.execute("DELETE FROM composition_rounds WHERE run_id=? AND combination_id=?", (run_id, cid))
             self.conn.execute("""UPDATE composition_members SET status='pending', training_wall_s=NULL,
                 state_hash=NULL,evidence_json=NULL WHERE run_id=? AND combination_id=?""", (run_id, cid))
 
     def progress(self, run_id, cid, event):
+        if event["stage"] == "round_completed":
+            with self.conn:
+                self._round_result(run_id, cid, event["result"])
+            return
         sid = event.get("service_id")
         if not sid:
             return
@@ -102,9 +108,27 @@ class CompositionWriter(SQLiteWriter):
             (evidence.get("reconstruction_wall_s"), evidence.get("materialized_state_hash"),
              json.dumps(_clean(evidence), allow_nan=False), run_id, cid, evidence["service_id"]))
 
+    def _round_result(self, run_id, cid, result):
+        self.conn.execute("""INSERT OR REPLACE INTO composition_rounds VALUES (?,?,?,?,?,?,?)""",
+            (run_id, cid, result["communication_round"], result["round_deadline_s"],
+             result["round_completion_time_s"], result["global_accuracy_per_round"],
+             json.dumps(_clean(result), allow_nan=False)))
+        # Membership reflects the latest completed round; complete history lives
+        # in composition_rounds, including unavailable and late clients.
+        for client in result["clients"]:
+            evidence = {**client, "service_id": client["client_id"],
+                        "communication_round": result["communication_round"]}
+            self.conn.execute("""UPDATE composition_members SET status=?,training_wall_s=?,state_hash=?,
+                aggregation_weight=?,evidence_json=? WHERE run_id=? AND combination_id=? AND service_id=?""",
+                (client["status"], client["training_wall_s"], client["materialized_state_hash"],
+                 client["aggregation_weight"], json.dumps(_clean(evidence), allow_nan=False),
+                 run_id, cid, client["client_id"]))
+
     def finish_composition(self, run_id, cid, result):
         # Metrics, membership evidence and completion become visible together.
         with self.conn:
+            for result_round in result.get("rounds", []):
+                self._round_result(run_id, cid, result_round)
             for evidence in result.get("members", []):
                 self._member_evidence(run_id, cid, evidence)
             provenance = result.get("provenance")

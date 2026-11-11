@@ -51,7 +51,7 @@ def _runtime(value: Any) -> float | None:
     return (result or 0.0) if math.isfinite(result) and result >= 0 else None
 
 
-def _load_pools(prepared_dir: Path) -> tuple[dict[str, list[tuple[str, float | None]]], list[dict]]:
+def _load_pools(prepared_dir: Path, sizes=COMPOSITION_SIZES) -> tuple[dict[str, list[tuple[str, float | None]]], list[dict]]:
     families = _read_roster(prepared_dir / "pools.csv", "family_id", {"family_id", "dependency_status"})
     roster = _read_roster(prepared_dir / "services.csv", "service_id", {"service_id", "family_id", "status"})
     pools: dict[str, list[tuple[str, float | None]]] = {
@@ -60,7 +60,7 @@ def _load_pools(prepared_dir: Path) -> tuple[dict[str, list[tuple[str, float | N
     skipped = [
         {"family_id": fid, "composition_size": size, "reason": "pool_not_verified"}
         for fid in sorted(families) if fid not in pools
-        for size in COMPOSITION_SIZES
+        for size in sizes
     ]
     # Read only the small identity/timing projection, never model artifacts or
     # the catalogue loader's recipe validation and scoring fields.
@@ -118,11 +118,15 @@ def _draw_members(rng: random.Random, ids: list[str], weights: list[float], size
     return tuple(sorted(selected))
 
 
-def _sample_compositions(pools: dict, skipped: list[dict], compositions: int, seed: int) -> tuple[list[dict], dict]:
+def _sample_compositions(pools: dict, skipped: list[dict], compositions: int, seed: int,
+                         *, sizes=COMPOSITION_SIZES, eligible_pairs=None) -> tuple[list[dict], dict]:
     skipped = list(skipped)
     pairs = []
     for family, members in sorted(pools.items()):
-        for size in COMPOSITION_SIZES:
+        for size in sizes:
+            if eligible_pairs is not None and (family, size) not in eligible_pairs:
+                skipped.append({"family_id": family, "composition_size": size, "reason": "no_round_timing_baseline"})
+                continue
             if len(members) >= size:
                 pairs.append((family, size))
             else:
@@ -164,7 +168,7 @@ def _sample_compositions(pools: dict, skipped: list[dict], compositions: int, se
         "seed": seed,
         "requested_count": compositions,
         "actual_count": len(rows),
-        "composition_sizes": list(COMPOSITION_SIZES),
+        "composition_sizes": list(sizes),
         "eligible_pair_count": len(pairs),
         "per_pair_quota": quota,
         "selection_inputs_sha256": _digest({"pools": pools, "skipped_pairs": skipped}),
@@ -180,6 +184,11 @@ def generate_composition_manifest(
     compositions: int,
     seed: int = 42,
     overwrite: bool = False,
+    rounds: int | None = None,
+    timing_db: str | Path | None = None,
+    deadline_profile: str = "moderate",
+    availability_probability: float = 1.0,
+    family_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     """Write a CSV and deterministic metadata JSON; return the saved metadata.
 
@@ -191,11 +200,18 @@ def generate_composition_manifest(
         raise ValueError("compositions must be a positive integer")
     if isinstance(seed, bool) or not isinstance(seed, int):
         raise ValueError("seed must be an integer")
+    if rounds is not None:
+        from .round_manifest import validate_options
+        validate_options(rounds, timing_db, deadline_profile, availability_probability)
+    elif timing_db is not None or deadline_profile != "moderate" or availability_probability != 1.0:
+        raise ValueError("Round timing and availability options require --rounds")
     prepared_dir, output = Path(prepared_dir), Path(output)
     if output.suffix.lower() != ".csv":
         raise ValueError("Manifest output must be .csv")
     metadata_path = output.with_suffix(".metadata.json")
     sources = {(prepared_dir / name).resolve() for name in ("pools.csv", "services.csv", "services.db")}
+    if timing_db is not None:
+        sources.add(Path(timing_db).resolve())
     for destination in (output, metadata_path):
         if destination.resolve() in sources or any(
             destination.exists() and source.exists() and destination.samefile(source) for source in sources
@@ -205,10 +221,27 @@ def generate_composition_manifest(
             raise FileExistsError(f"Refusing to replace '{destination}'. Pass --overwrite to replace it.")
         if destination.is_dir():
             raise IsADirectoryError(destination)
-    pools, skipped = _load_pools(prepared_dir)
-    rows, metadata = _sample_compositions(pools, skipped, compositions, seed)
+    sizes = (2, 3, 5) if rounds is not None else COMPOSITION_SIZES
+    pools, skipped = _load_pools(prepared_dir, sizes)
+    if family_ids:
+        unknown = set(family_ids) - set(pools)
+        if unknown:
+            raise ValueError(f"Unknown or unverified family IDs: {sorted(unknown)}")
+        pools = {fid: members for fid, members in pools.items() if fid in family_ids}
+        skipped = [row for row in skipped if row["family_id"] in family_ids]
+    baselines = None
+    if rounds is not None:
+        from .round_manifest import load_baselines, extend_manifest
+        baselines = load_baselines(timing_db)
+    rows, metadata = _sample_compositions(pools, skipped, compositions, seed, sizes=sizes,
+                                          eligible_pairs=baselines)
+    columns = _COLUMNS
+    if rounds is not None:
+        extend_manifest(rows, metadata, baselines, rounds=rounds, seed=seed,
+                        deadline_profile=deadline_profile, availability_probability=availability_probability)
+        columns = (*columns, "rounds", "round_config")
     csv_text = io.StringIO(newline="")
-    writer = csv.DictWriter(csv_text, fieldnames=_COLUMNS, lineterminator="\n")
+    writer = csv.DictWriter(csv_text, fieldnames=columns, lineterminator="\n")
     writer.writeheader()
     writer.writerows(rows)
     metadata_text = json.dumps(metadata, indent=2, sort_keys=True, allow_nan=False) + "\n"

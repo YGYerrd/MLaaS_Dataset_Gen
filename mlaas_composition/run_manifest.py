@@ -42,6 +42,9 @@ def load_composition_manifest(path):
         required = {"combination_id", "family_id", "composition_size", "service_ids"}
         if not required <= set(reader.fieldnames or ()):
             raise ValueError(f"Composition manifest requires columns {sorted(required)}")
+        round_columns = {"rounds", "round_config"}.intersection(reader.fieldnames)
+        if round_columns and round_columns != {"rounds", "round_config"}:
+            raise ValueError("Round manifests require both rounds and round_config columns")
         entries, seen = [], set()
         for line, row in enumerate(reader, 2):
             try:
@@ -58,7 +61,15 @@ def load_composition_manifest(path):
                 if cid in seen:
                     raise ValueError("duplicate combination_id")
                 seen.add(cid)
-                entries.append(dict(combination_id=cid, family_id=family, composition_size=size, service_ids=ids))
+                entry = dict(combination_id=cid, family_id=family, composition_size=size, service_ids=ids)
+                if round_columns:
+                    from .round_manifest import validate_config
+                    rounds = int(row["rounds"])
+                    config = json.loads(row["round_config"])
+                    if not isinstance(config, dict):
+                        raise ValueError("round_config must be a JSON object")
+                    entry.update(rounds=rounds, round_config=validate_config(config, rounds, size, ids))
+                entries.append(entry)
             except (ValueError, TypeError, AttributeError) as error:
                 raise ValueError(f"Invalid composition manifest line {line}: {error}") from error
     if not entries:
@@ -131,6 +142,9 @@ def _prepare_composition(source_db, entry, *, metadata_only=False, cache=None, m
                               "auxiliary_metric_name": snapshots[r["service_id"]]["auxiliary_metric_name"]} for r in rows])
     if selected.primary_metric_name.nunique() != 1:
         raise ValueError("composition members disagree on primary metric")
+    if "rounds" in entry and (set(selected.task_family) != {"classification"}
+                               or set(selected.primary_metric_name) != {"accuracy"}):
+        raise ValueError("round experiments require classification clients with measured accuracy")
     path = rows[0]["parent_document"]["reservation_ref"]
     plan = read_cohort(path, seed=42, audit_samples=512, minimum=MIN_AUDIT_SAMPLES,
                         task_family=rows[0]["task_family"],
@@ -191,6 +205,10 @@ def execute_job(source_db, entry, expected_sources, *, device, on_progress=None)
         members, plan, labels, selected, snapshots = _prepare_composition(source_db, entry, cache={})
         if {sid: sha256_json(value) for sid, value in snapshots.items()} != expected_sources:
             raise ValueError("source service evidence changed after batch preflight")
+        if "rounds" in entry:
+            from .round_execution import execute_rounds
+            return execute_rounds(source_db, entry, members, plan, labels, selected,
+                                  device=device, on_progress=progress)
         execution = execute_composition(source_db, members, plan, device=device, replay=True, on_progress=progress,
                                         capture_client_losses=True)
         stage = "evaluation"
@@ -371,9 +389,11 @@ def _run_composition_manifest(file, source_db, db, *, device="auto", workers=Non
     with closing(sqlite3.connect(source_db.as_uri() + "?mode=ro", uri=True)) as conn:
         conn.execute("SELECT service_id FROM services LIMIT 1").fetchall()
     entries = load_composition_manifest(manifest)
+    from .round_manifest import VERSION as ROUND_EXECUTOR_VERSION
+    version = ROUND_EXECUTOR_VERSION if "rounds" in entries[0] else EXECUTOR_VERSION
     print(f"Preflighting {len(entries)} compositions (metadata only)", flush=True)
     sources, errors = preflight(source_db, entries)
-    fingerprint = sha256_json({"version": EXECUTOR_VERSION, "entries": entries, "sources": sources,
+    fingerprint = sha256_json({"version": version, "entries": entries, "sources": sources,
                                "preflight_errors": errors})
     run_id = "batch_" + fingerprint
     if dry_run:
@@ -386,11 +406,12 @@ def _run_composition_manifest(file, source_db, db, *, device="auto", workers=Non
         writer.start()
         try:
             writer.register(run_id, fingerprint=fingerprint, manifest=manifest, source_db=source_db,
-                            version=EXECUTOR_VERSION, settings={"device": device, "workers": workers,
+                            version=version, settings={"device": device, "workers": workers,
                                 "client_loss_statistics_version": CLIENT_LOSS_VERSION},
                             entries=entries, sources=sources)
             completed = writer.completed(run_id)
-            without_losses = writer.completed_without_client_losses(run_id, CLIENT_LOSS_VERSION)
+            without_losses = (writer.completed_without_client_losses(run_id, CLIENT_LOSS_VERSION)
+                              if version == EXECUTOR_VERSION else 0)
             if without_losses:
                 print(f"Skipping {without_losses} completed compositions without current client loss statistics; "
                       "their original results are preserved. New compositions will capture client losses.", flush=True)
@@ -398,11 +419,13 @@ def _run_composition_manifest(file, source_db, db, *, device="auto", workers=Non
 
             def begin(entry, worker):
                 writer.begin_composition(run_id, entry["combination_id"], worker)
-                print(f"[{worker}] {entry['combination_id']}: starting {entry['composition_size']} members", flush=True)
+                rounds = f", {entry['rounds']} rounds" if "rounds" in entry else ""
+                print(f"[{worker}] {entry['combination_id']}: starting {entry['composition_size']} members{rounds}", flush=True)
 
             def progress(entry, worker, event):
                 writer.progress(run_id, entry["combination_id"], event)
-                print(f"[{worker}] {entry['combination_id']}: {event['stage']} {event.get('service_id', '')}", flush=True)
+                round_label = f"round {event['communication_round']} " if "communication_round" in event else ""
+                print(f"[{worker}] {entry['combination_id']}: {round_label}{event['stage']} {event.get('service_id', '')}", flush=True)
 
             def finish(entry, result):
                 writer.finish_composition(run_id, entry["combination_id"], result)
@@ -427,6 +450,7 @@ def _run_composition_manifest(file, source_db, db, *, device="auto", workers=Non
                             on_progress=lambda event: progress(entry, "cpu", event))
                         finish(entry, result)
             return {**writer.summary(run_id), "skipped": len(completed),
-                    "completed_without_client_losses": writer.completed_without_client_losses(run_id, CLIENT_LOSS_VERSION)}
+                    "completed_without_client_losses": (writer.completed_without_client_losses(run_id, CLIENT_LOSS_VERSION)
+                                                        if version == EXECUTOR_VERSION else 0)}
         finally:
             writer.finish()
